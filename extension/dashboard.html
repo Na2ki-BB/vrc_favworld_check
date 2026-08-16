@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VRC Favorite World History</title>
+    <link rel="stylesheet" href="styles/dashboard.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <img src="icons/icon48.png" width="42" height="42" alt="">
+          <div>
+            <p>VRC FAVORITE WORLD HISTORY</p>
+            <h1>お気に入りワールド記録</h1>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span id="connection-badge" class="badge">状態確認中</span>
+          <button id="open-vrchat-button" class="button button-ghost" type="button">VRChat公式サイト</button>
+          <button id="sync-now-button" class="button button-primary" type="button">今すぐ確認</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="notice-panel" class="notice-panel" aria-live="polite" hidden>
+          <div>
+            <strong id="notice-title"></strong>
+            <p id="notice-detail"></p>
+          </div>
+          <button id="notice-action" class="button button-secondary" type="button" hidden></button>
+        </section>
+
+        <section id="onboarding" class="onboarding" hidden>
+          <div class="onboarding-copy">
+            <p class="section-label">はじめに</p>
+            <h2>消える前の名前を、今から残します。</h2>
+            <p>VRChat公式サイトへいつも通りログインしたあと、この画面で一度確認するだけです。パスワードや2FAコードを、この拡張へ入力することはありません。</p>
+          </div>
+          <ol class="steps">
+            <li><span>1</span><div><strong>公式サイトでログイン</strong><small>VRChatが開きます</small></div></li>
+            <li><span>2</span><div><strong>「今すぐ確認」を押す</strong><small>初回の一覧を端末内へ保存します</small></div></li>
+            <li><span>3</span><div><strong>あとは自動で記録</strong><small>ブラウザ起動中に定期確認します</small></div></li>
+          </ol>
+        </section>
+
+        <section class="summary-grid" aria-label="記録の概要">
+          <article class="summary-card accent-teal">
+            <span>記録中</span>
+            <strong id="summary-total">—</strong>
+            <small>ワールド</small>
+          </article>
+          <article class="summary-card accent-coral">
+            <span>現在アクセス不可</span>
+            <strong id="summary-unavailable">—</strong>
+            <small>削除・非公開の区別はしません</small>
+          </article>
+          <article class="summary-card accent-gold">
+            <span>お気に入り一覧にない</span>
+            <strong id="summary-missing">—</strong>
+            <small>2回確認済み</small>
+          </article>
+          <article class="summary-card accent-violet">
+            <span>名前変更</span>
+            <strong id="summary-renamed">—</strong>
+            <small>記録した履歴</small>
+          </article>
+        </section>
+
+        <nav class="tabs" aria-label="表示内容">
+          <button class="tab is-active" type="button" data-tab="worlds">ワールド</button>
+          <button class="tab" type="button" data-tab="events">変更履歴</button>
+          <button class="tab" type="button" data-tab="settings">設定とバックアップ</button>
+        </nav>
+
+        <section id="worlds-panel" class="tab-panel">
+          <div class="toolbar">
+            <label class="search-field">
+              <span class="sr-only">ワールドを検索</span>
+              <input id="world-search" type="search" placeholder="現在名・過去名・作者名・World IDで検索">
+            </label>
+            <label class="select-field">
+              <span class="sr-only">状態で絞り込み</span>
+              <select id="world-filter">
+                <option value="all">すべての状態</option>
+                <option value="favorite">お気に入り中</option>
+                <option value="missing">お気に入り一覧にない</option>
+                <option value="unavailable">現在アクセス不可</option>
+                <option value="pending">確認中</option>
+              </select>
+            </label>
+          </div>
+          <p id="world-result-count" class="result-count"></p>
+          <div id="world-list" class="world-list" aria-live="polite"></div>
+          <div id="world-empty" class="empty-state" hidden>
+            <strong>該当するワールドはありません</strong>
+            <p>検索語や状態の絞り込みを変えてください。</p>
+          </div>
+        </section>
+
+        <section id="events-panel" class="tab-panel" hidden>
+          <div class="section-heading">
+            <div>
+              <p class="section-label">HISTORY</p>
+              <h2>変更履歴</h2>
+            </div>
+            <p>「削除」「非公開」「手動解除」はAPIだけで断定できません。ここでは観測できた事実を表示します。</p>
+          </div>
+          <div class="toolbar">
+            <label class="select-field">
+              <span class="sr-only">変更の種類で絞り込み</span>
+              <select id="event-filter">
+                <option value="all">すべての変更</option>
+                <option value="renamed">名前変更</option>
+                <option value="missing">お気に入り一覧にない</option>
+                <option value="unavailable">現在アクセスできない</option>
+                <option value="restored">復帰</option>
+              </select>
+            </label>
+          </div>
+          <p id="event-result-count" class="result-count"></p>
+          <div id="event-list" class="event-list" aria-live="polite"></div>
+          <div id="event-empty" class="empty-state" hidden>
+            <strong>該当する変更履歴はありません</strong>
+            <p>絞り込みを変えてください。初回確認は基準を保存するだけなので、変更履歴は作りません。</p>
+          </div>
+        </section>
+
+        <section id="settings-panel" class="tab-panel" hidden>
+          <div class="settings-grid">
+            <article class="settings-card">
+              <p class="section-label">AUTOMATION</p>
+              <h2>自動確認と通知</h2>
+              <label class="toggle-row">
+                <span><strong>自動で確認する</strong><small>約12時間ごと。ブラウザ終了中は次回起動後に確認します。</small></span>
+                <input id="auto-sync-toggle" type="checkbox" role="switch">
+              </label>
+              <label class="toggle-row">
+                <span><strong>デスクトップ通知</strong><small>名前変更や確定した状態変化をまとめて通知します。</small></span>
+                <input id="notification-toggle" type="checkbox" role="switch">
+              </label>
+              <dl class="sync-details">
+                <div><dt>最終成功</dt><dd id="settings-last-sync">—</dd></div>
+                <div><dt>次回予定</dt><dd id="settings-next-sync">—</dd></div>
+                <div><dt>保存先</dt><dd>このブラウザのIndexedDB</dd></div>
+              </dl>
+            </article>
+
+            <article class="settings-card">
+              <p class="section-label">BACKUP</p>
+              <h2>記録をバックアップ</h2>
+              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。</p>
+              <div class="stacked-actions">
+                <button id="export-button" class="button button-secondary" type="button">バックアップを書き出す</button>
+                <label class="button button-ghost file-button">
+                  バックアップを復元する
+                  <input id="import-input" type="file" accept="application/json,.json">
+                </label>
+              </div>
+              <p id="backup-message" class="form-message" role="status"></p>
+            </article>
+
+            <article class="settings-card privacy-card">
+              <p class="section-label">PRIVACY</p>
+              <h2>認証情報は扱いません</h2>
+              <ul>
+                <li>VRChat公式サイトの既存ログインだけを利用</li>
+                <li>パスワード・2FA・Cookie値を取得しない</li>
+                <li>開発者サーバー、広告、分析通信なし</li>
+                <li>VRChat APIへの読み取り専用GETだけ</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="dashboard.js"></script>
+  </body>
+</html>

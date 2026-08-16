@@ -1,0 +1,193 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, "Noto Sans JP", "Yu Gothic UI", system-ui, sans-serif;
+  background: #17162b;
+  color: #f7f7fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 370px;
+  min-height: 470px;
+  margin: 0;
+  background:
+    radial-gradient(circle at 10% 0%, rgb(82 75 157 / 35%), transparent 42%),
+    #17162b;
+}
+
+button {
+  font: inherit;
+}
+
+.popup-shell {
+  display: grid;
+  gap: 14px;
+  padding: 22px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand img {
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+}
+
+.eyebrow {
+  margin: 0 0 3px;
+  color: #8de8dc;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.02em;
+}
+
+.status-card {
+  min-height: 132px;
+  padding: 17px;
+  border: 1px solid rgb(255 255 255 / 9%);
+  border-radius: 18px;
+  background: rgb(255 255 255 / 6%);
+  box-shadow: inset 0 1px rgb(255 255 255 / 5%);
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #9ca3af;
+  box-shadow: 0 0 0 4px rgb(156 163 175 / 13%);
+}
+
+.status-dot.is-ready {
+  background: #5bdecc;
+  box-shadow: 0 0 0 4px rgb(91 222 204 / 14%);
+}
+
+.status-dot.is-working {
+  background: #f7c76f;
+  box-shadow: 0 0 0 4px rgb(247 199 111 / 14%);
+  animation: pulse 1.35s ease-in-out infinite;
+}
+
+.status-dot.is-error {
+  background: #ff846a;
+  box-shadow: 0 0 0 4px rgb(255 132 106 / 14%);
+}
+
+.status-card p {
+  margin: 10px 0 0;
+  color: #d5d4e3;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.status-card .muted {
+  color: #9c9aaf;
+  font-size: 11px;
+}
+
+.button {
+  width: 100%;
+  min-height: 46px;
+  border: 0;
+  border-radius: 13px;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: transform 120ms ease, filter 120ms ease;
+}
+
+.button:hover:not(:disabled) {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+}
+
+.button:focus-visible,
+.text-button:focus-visible {
+  outline: 3px solid rgb(91 222 204 / 46%);
+  outline-offset: 2px;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.button-primary {
+  color: #15142a;
+  background: linear-gradient(135deg, #65e1d1, #89efe3);
+  box-shadow: 0 10px 25px rgb(50 193 177 / 15%);
+}
+
+.button-secondary {
+  border: 1px solid rgb(255 255 255 / 10%);
+  color: #efeff7;
+  background: rgb(255 255 255 / 7%);
+}
+
+.text-button {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  color: #bdbbd2;
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.action-message {
+  min-height: 18px;
+  margin: -5px 0 0;
+  color: #ffc4b7;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 7px;
+  padding-top: 3px;
+  color: #858398;
+  font-size: 10px;
+}
+
+.privacy-mark {
+  color: #5bdecc;
+  font-size: 7px;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

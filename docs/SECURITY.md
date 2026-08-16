@@ -161,10 +161,12 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - 個別 probe は 1 同期最大 20 件。
 - 定期同期は 12 時間 + 0〜60 分 jitter。起動直後も 1〜10 分 jitter。
 - 手動同期は 5 分 cooldown、実行中は単一 flight を共有する。
+- 同期中だけ 25 秒間隔の限定 keep-alive を使い、同期 promise の `finally` で必ず解除する。常時 keep-alive やバックグラウンド常駐には使わない。
 - 429 では同期全体を即時停止し、同じ同期内で再試行しない。`consecutiveRateLimits` を飽和増加させ、妥当な `Retry-After` と指数 delay の遅い方から `backoffUntil` を保存する。
 - `backoffUntil` 後は認証確認から新しい完全同期を開始する。完全同期成功時だけ連続 429 カウンターをリセットする。
 - 5xx / network error だけ短い jitter 付きで最大 2 回再試行し、上限後は既存ワールド状態を変えず停止する。
 - 自動同期が有効なら、同期のアプリケーション制御下にある全終了経路の `finally` で固定名の one-shot alarm を置換する。成功は 12 時間 + 0〜60 分 jitter、429 は `backoffUntil`、offline / 5xx 上限後は 30〜60 分後、401 / schema 不正 / その他は 12 時間 + 0〜60 分 jitter とする。無効なら既存 alarm を解除する。
+- 自動同期中は同じ固定名 alarm を復旧 watchdog として先に登録する。正常終了時は通常の次回時刻へ置換し、Service Worker が強制終了した場合は watchdog から認証確認を含む完全同期を再開する。
 - ブラウザ強制終了で `finally` を実行できなかった場合に備え、install / startup 時は永続化した `nextSyncAt` と alarm の有無を照合して欠けた 1 件を修復する。保存時刻が過去なら現在から 1〜10 分 jitter 後とする。複数 alarm による要求増幅を避けるため、既存の同名 alarm は必ず置換する。
 
 ## 9. 入力検証と表示
@@ -199,6 +201,7 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - HTML や JavaScript として解釈しない。
 - 全検証完了前に IndexedDB を変更しない。
 - 復元 transaction は対象 `userId` の profile/worlds/events だけを key range で置換し、他 user の record を削除しない。global settings は allowlist 済み preferences だけを同じ transaction で merge する。
+- profile ごとの単調増加 generation を復元 transaction で更新し、復元前の snapshot から作られた同期 plan が同じ world revision を偶然持っていても commit できないようにする。generation は端末内の競合検知専用で export しない。
 - event の `notificationClaimedAt`、`notifiedAt`、固定 enum の `notificationError` を検証して復元し、未 claim の import event には `notificationClaimedAt = restoredAt` を設定して再通知しない。
 - 復元 transaction が失敗した場合は対象 user、他 user、settings の処理前状態を保持する。
 

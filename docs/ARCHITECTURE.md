@@ -46,6 +46,7 @@
 - VRChat API adapter、差分検知、IndexedDB transaction、通知を順に呼び、同期のアプリケーション制御下にある全終了経路の `finally` で次回 alarm を置換する。
 - install / startup 時に User-Agent 用の動的 Declarative Net Request ルールを再登録する。
 - install / startup 時に自動同期が有効なのに次回 alarm がなければ、永続化した `nextSyncAt` と直近結果から 1 件を修復登録する。
+- 数十秒を超え得る同期イベントだけは、Chrome 公式資料の `waitUntil` 例に従い `chrome.runtime.getPlatformInfo()` を 25 秒間隔で呼んで idle timer を更新する。同期 promise の `finally` で interval を必ず破棄し、常時稼働には使わない。
 - DOM や画面状態を持たない。プロセス内変数はキャッシュとしてだけ扱う。
 
 ### 3.2 Extension UI
@@ -56,7 +57,7 @@
 - **履歴**: 検索、状態フィルター、イベント一覧、各ワールドの詳細。
 - **設定**: 定期同期、通知、エクスポート、復元。
 
-UI は Service Worker と `chrome.runtime.sendMessage` で通信する。UI から API や DB を直接更新せず、照会用 repository と command handler を介する。
+UI は同期、外部ページを開く操作、通常設定を Service Worker の閉じた `chrome.runtime.sendMessage` command で行い、API を直接呼ばない。大量になり得る一覧照会とバックアップ入出力だけは共有 repository を直接使う。復元は全検証後の単一 transaction とし、profile 世代番号を増加させて進行中の古い同期 plan を必ず競合 abort させる。
 
 ### 3.3 API Adapter
 
@@ -139,16 +140,17 @@ JavaScript の `fetch` から `User-Agent` を直接設定することはでき�
 1. 単一 flight lock を取得する。すでに実行中ならその状態を返す。
 2. 永続化された `backoffUntil` と手動クールダウンを検査する。
 3. `GET /auth/user` でセッションを確認する。raw `CurrentUser` に credential / token / Cookie / session data の field がないことを検査し、新しい object へ `id` と `displayName` だけをコピーして raw 応答を破棄する。禁止 field があれば fail closed にする。
-4. `GET /favorites?type=world&n=100&offset=k` を空ページが返るまで取得する。短い非空ページでも止めず、`k` は直前ページの実取得件数だけ増やす。
-5. `GET /worlds/favorites?n=100&offset=k&releaseStatus=all` を同じ終端規則で取得する。
-6. 両一覧の ID、型、ページ進行、要求数、総データ件数を検証する。各 endpoint で 10,000 データ件または 100 非空要求を上限とし、その後の空終端確認 1 要求を含む最大 101 要求とする。不完全なら本体を更新しない。
-7. 既知ワールドと今回一覧を比較し、個別再確認候補を優先度順に最大 20 件選ぶ。
-8. 候補だけ `GET /worlds/{worldId}` で再確認する。20 件を超える候補は `probeState: "pending"` として次回へ送る。
-9. Domain Reconciler を実行し、IndexedDB の 1 transaction でワールド、イベント、同期結果を反映する。
-10. 未 claim イベントを transaction で永久 claim してから集約通知を 1 回だけ attempt する。成功した event に `notifiedAt`、明示的に失敗した event に固定 `notificationError` を設定する。いずれの結果でも claim は解除しない。
-11. 成否や例外にかかわらず `finally` で lock を解放し、自動同期が有効なら終了結果に対応する次回の名前付き one-shot alarm へ置換する。無効なら既存 alarm を解除する。
+4. 同一 read-only transaction で profile、worlds、profile 世代番号を同期計画用 snapshot として読む。
+5. `GET /favorites?type=world&n=100&offset=k` を空ページが返るまで取得する。短い非空ページでも止めず、`k` は直前ページの実取得件数だけ増やす。
+6. `GET /worlds/favorites?n=100&offset=k&releaseStatus=all` を同じ終端規則で取得する。
+7. 両一覧の ID、型、ページ進行、要求数、総データ件数を検証する。各 endpoint で 10,000 データ件または 100 非空要求を上限とし、その後の空終端確認 1 要求を含む最大 101 要求とする。不完全なら本体を更新しない。
+8. 既知ワールドと今回一覧を比較し、個別再確認候補を優先度順に最大 20 件選ぶ。
+9. 候補だけ `GET /worlds/{worldId}` で再確認する。20 件を超える候補は `probeState: "pending"` として次回へ送る。
+10. Domain Reconciler を実行する。IndexedDB の 1 transaction で世代番号と world revision を再検査し、ワールド、イベント、同期結果、成功時の必須 settings を反映して世代番号を増やす。
+11. 未 claim イベントを transaction で永久 claim してから集約通知を 1 回だけ attempt する。今回の event に加え、前回 commit 後に通知処理へ進めなかった event もここで回収する。成功した event に `notifiedAt`、明示的に失敗した event に固定 `notificationError` を設定する。いずれの結果でも claim は解除しない。
+12. 成否や例外にかかわらず `finally` で lock を解放し、自動同期が有効なら終了結果に対応する次回の名前付き one-shot alarm へ置換する。無効なら既存 alarm を解除する。
 
-ページング結果は手順 9 までメモリ上にだけ置く。Service Worker 中断時は結果を捨て、確定データは変更しない。通常 run は 5 分以内を上限とし、候補上限によって個別 API の増加を抑える。
+ページング結果は手順 10 の commit 完了までメモリ上にだけ置く。Service Worker 中断時は結果を捨て、確定データは変更しない。同期中だけ25秒間隔の限定 keep-alive を使い、開始時には同じ名前の復旧用 one-shot alarm を先に登録する。正常終了時は通常の次回時刻へ置換し、中断時は復旧 alarm から認証確認を含む完全同期をやり直す。
 
 ### 5.2 ページングの完全性
 
@@ -362,7 +364,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 ### 8.5 `settings` と `meta`
 
 - `settings`: 定期同期、通知、直近手動同期時刻、`nextSyncAt`、`backoffUntil`、飽和カウンター `consecutiveRateLimits`、最後に選択した profile。
-- `meta`: schema version、最終 migration、バックアップ形式 version。
+- `meta`: schema version、最終 migration、バックアップ形式 version、profile ごとの単調増加 `dataGeneration`。`dataGeneration` は端末内の競合検知専用でバックアップへ含めない。
 
 同期 lock は Service Worker の単一 flight promise で管理する。イベントが重なった場合は既存 promise を共有する。Service Worker 終了で lock も消えるため、永続データの commit は短い 1 transaction に限定し、未完了 fetch は状態を変えない。
 
@@ -372,8 +374,8 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 
 1. ページングと probe を transaction 外で完了する。
 2. read-only snapshot を読み、pure transition plan を作る。
-3. `worlds`、`events`、`profiles`、`syncRuns` を 1 read-write transaction で再読込・検証して更新する。
-4. revision が計画時と異なる場合は競合として abort する。
+3. `worlds`、`events`、`profiles`、`syncRuns`、成功に必須の `settings`、profile 世代を 1 read-write transaction で再読込・検証して更新する。
+4. profile 世代または world revision が計画時と異なる場合は競合として abort する。取得済みの完全 API snapshot を使って新しい DB snapshot から計画・commit だけを最大1回やり直し、再競合時は利用者の復元等を優先して同期状態を変更しない。
 5. commit 後、未 claim event を別の短い transaction で永久 claim してから通知 API を 1 回だけ呼ぶ。成功時は `notifiedAt`、明示的失敗時は allowlist 済みの固定 `notificationError` を更新する。結果不明を含む全結果で claim を解除せず、履歴 commit は通知結果にかかわらず戻さない。
 
 ### 9.2 Service Worker 中断
@@ -384,7 +386,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - claim commit 後・通知 API 前: 再起動後も claim を維持するため通知は欠落し得るが、同じ event を再 attempt せず、履歴は残る。
 - 通知 API 成功後・`notifiedAt` 前: claim が残るため再通知しない。UI では履歴を正とし、OS 通知の exactly-once を主張しない。
 - 通知 API の明示的失敗: claim を維持して再 attempt しない。書込み可能なら固定 `notificationError` を残す。失敗コード保存前に中断しても claim だけが残り、履歴 event は UI で確認できる。
-- alarm 再登録前の強制終了: `finally` を実行できないため、次回 install / startup handler が永続状態から名前付き alarm を修復する。
+- alarm 再登録前の強制終了: 同期開始時に先置きした復旧 alarm が完全同期を再開する。ブラウザ自体の終了などでそれも失われた場合は、次回 install / startup handler が永続状態から名前付き alarm を修復する。
 
 ## 10. バックアップ形式
 
@@ -406,9 +408,9 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - 1 ファイルは `profile` 1 件と、その `userId` に属する `worlds`、`events` だけを含む。複数 profile を含めない。
 - `syncRuns`、lock、backoff、認証応答は含めない。event の `notificationClaimedAt`、`notifiedAt`、`notificationError` は at-most-once 状態を保つため event とともに含める。未 claim の import event は復元時に `notificationClaimedAt = restoredAt` とし、復元を過去通知の起点にしない。
 - `preferences` は定期同期と通知の有効・無効など明示した安全な利用者設定だけを含め、端末固有時刻、選択 profile、`backoffUntil`、`consecutiveRateLimits` は除外する。
-- エクスポートは安定した key 順、world ID / event ID 順に並べ、テスト可能にする。
+- エクスポートは profile、worlds、events、安全な preferences を同一 read-only transaction で snapshot として読み、安定した key 順、world ID / event ID 順に並べる。
 - 復元は JSON parse 後に prototype を持たない値へ正規化し、件数、文字列長、ID、日時、enum、参照を検証する。
-- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds` key range、`events` key range だけを削除・再作成し、他 user の record を触らない。同じ transaction で allowlist 済み global preferences だけを既存 settings へ merge する。失敗時は全 profile と settings の処理前状態を維持する。
+- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds` key range、`events` key range だけを削除・再作成し、profile 世代番号を増やす。他 user の record を触らず、同じ transaction で allowlist 済み global preferences だけを既存 settings へ merge する。失敗時は全 profile、世代、settings の処理前状態を維持する。
 
 ## 11. UI 状態設計
 

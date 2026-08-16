@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VRC Favorite World History</title>
+    <link rel="stylesheet" href="styles/popup.css">
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="brand">
+        <img src="icons/icon48.png" width="44" height="44" alt="">
+        <div>
+          <p class="eyebrow">VRC FAVORITE WORLD HISTORY</p>
+          <h1>お気に入り記録</h1>
+        </div>
+      </header>
+
+      <section class="status-card" aria-live="polite">
+        <div class="status-line">
+          <span id="status-dot" class="status-dot is-idle" aria-hidden="true"></span>
+          <strong id="status-title">状態を確認しています</strong>
+        </div>
+        <p id="status-detail">しばらくお待ちください。</p>
+        <p id="last-sync" class="muted">最終確認: まだありません</p>
+      </section>
+
+      <button id="sync-button" class="button button-primary" type="button">
+        今すぐお気に入りを確認
+      </button>
+      <button id="login-button" class="button button-secondary" type="button">
+        VRChat公式サイトを開く
+      </button>
+      <button id="dashboard-button" class="text-button" type="button">
+        記録と設定を詳しく見る
+        <span aria-hidden="true">→</span>
+      </button>
+
+      <p id="action-message" class="action-message" role="status"></p>
+
+      <footer>
+        <span class="privacy-mark" aria-hidden="true">●</span>
+        記録はこのブラウザ内だけに保存されます
+      </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

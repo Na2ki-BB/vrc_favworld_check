@@ -1,0 +1,31 @@
+{
+  "name": "vrc_favworld_check",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first VRChat favorite world history for Chrome and Edge",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "icons": "node scripts/generate-icons.mjs",
+    "lint": "eslint .",
+    "typecheck": "tsc -p jsconfig.json",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "build": "node scripts/build.mjs",
+    "package": "npm run build && node scripts/package.mjs",
+    "verify": "npm run lint && npm run typecheck && npm run test:coverage && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/chrome": "^0.2.6",
+    "@types/node": "^26.2.0",
+    "@types/punycode": "^2.1.4",
+    "eslint": "^10.8.1",
+    "fake-indexeddb": "^6.2.5",
+    "fflate": "^0.8.3",
+    "globals": "^17.11.0",
+    "typescript": "^7.0.2"
+  }
+}

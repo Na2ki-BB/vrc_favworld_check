@@ -67,6 +67,7 @@
 - **FR-SYNC-07** 同期の多重実行を禁止する。実行中の手動要求は新しい同期を開始せず、現在の進捗を表示する。
 - **FR-SYNC-08** 2 系統のページング結果は同期中だけメモリに保持し、両方の全ページが完走した場合だけ 1 トランザクションで反映する。中断または未完了なら本体データを変更しない。
 - **FR-SYNC-09** 個別ワールドの再確認は 1 同期につき最大 20 件とする。上限を超えた候補は `pending` として保存し、次回以降の同期で順番に再確認する。
+- **FR-SYNC-10** 2 秒間隔の直列取得が Manifest V3 Service Worker の idle 終了を超える場合に備え、同期 promise の実行中だけ Chrome 公式推奨の 25 秒間隔 keep-alive を使い、同期の `finally` で必ず停止する。常駐目的では使用しない。
 
 ### 5.4 差分検知と状態表現
 
@@ -128,6 +129,7 @@
 - **FR-BACKUP-06** 未知の将来スキーマは書き込まず、対応版への更新を案内する。
 - **FR-BACKUP-07** global settings は全置換せず、定期同期と通知の有効・無効など明示的に安全と定義した preferences だけを merge する。`backoffUntil`、同期 lock、直近実行時刻、選択中 profile など端末・実行状態は import しない。
 - **FR-BACKUP-08** event の `notificationClaimedAt`、`notifiedAt`、`notificationError` は履歴の配信状態としてバックアップ・復元する。未 claim の過去 event は復元 transaction 内で `notificationClaimedAt = restoredAt` とし、復元によって通知 attempt を新規発生させない。
+- **FR-BACKUP-09** エクスポート対象の profile、worlds、events、安全な preferences は同一 read-only transaction の一貫した snapshot から取得する。復元は profile 世代番号を同じ transaction で増やし、復元前に計画された同期の遅延 commit を拒否する。
 
 ## 6. 非機能要件
 
@@ -145,6 +147,7 @@
 - **NFR-REL-02** API 取得中の不完全なページング結果を永続化済みワールドへ反映せず、完全スナップショットの検証後にだけ反映する。
 - **NFR-REL-03** イベント ID、ワールド改訂番号、`notificationClaimedAt` により差分処理を冪等（同じ入力を何度処理しても同じ結果）にし、同一イベントの OS 通知 attempt を最大 1 回にする。
 - **NFR-REL-04** 各一覧 endpoint について最大 10,000 データ件に加えて空終端確認 1 要求、すなわち `n=100` で最大 101 要求までを防御的に扱う。同一非空ページ fingerprint の反復、offset 停滞、10,000 件超過時は状態更新を中止する。
+- **NFR-REL-05** 同期計画は profile、worlds、単調増加 generation を同一 snapshot で読み、成功 commit は generation と各 world revision の双方を同一 transaction で比較する。復元・初期化との競合では古い計画を反映しない。
 
 ### 6.3 性能と操作性
 
@@ -192,3 +195,5 @@
 17. **redirect 拒否**: 3xx fixture に対する fetch は `redirect: "manual"` で追従せず、redirect 先へ要求を送らず、既存履歴を変更しない。
 18. **通知の明示的失敗**: notification API が明示的失敗を返しても claim は解除されず、固定 `notificationError` が残る。成功、明示的失敗、claim 後 crash のすべてで、Service Worker 再起動後も同じ event の通知 attempt は 1 回を超えず、履歴は表示できる。
 19. **alarm 再登録**: 自動同期を有効にした各終了 fixture で、既存の名前付き alarm がちょうど 1 件へ置換される。予定時刻は success=12時間+jitter、429=`backoffUntil`、offline/5xx上限=30〜60分後、401/schema/other=12時間+jitter と一致し、自動同期無効時は alarm が残らない。
+20. **復元との競合**: 同期 snapshot 後に同じ revision を持つ別内容のバックアップを復元しても、古い同期 plan は generation 不一致で commit できない。取得済みAPI snapshotから計画だけを最大1回作り直すか、安全に中止し、復元済みデータをstale内容で上書きしない。
+21. **Service Worker復旧**: 長時間同期中だけ25秒keep-aliveが動作して完了時に解除される。同期開始時の復旧alarmが強制終了後も残り、次回は認証確認から完全同期を再開する。

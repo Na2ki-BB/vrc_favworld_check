@@ -231,6 +231,8 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 これらは VRChat の公表 rate limit ではない。実運用で 429 が発生する場合は要求を減らす方向にだけ調整する。
 
+Chrome 公式の [Migrate to a service worker: Keep the service worker alive](https://developer.chrome.com/docs/extensions/develop/migrate/to-service-workers#keep-sw-alive) は、30 秒を超える長時間処理について、処理中だけ 25 秒ごとに `chrome.runtime.getPlatformInfo()` を呼び、promise 完了時に interval を解除する `waitUntil` 例を示している。本ツールは要求間隔を意図的に空けるため、同期イベントに限ってこの方法を使う。常時 keep-alive には使わない。
+
 ### 7.6 429 / error backoff
 
 **推論**: 429 は inline retry せず同期全体を即時停止する。`consecutiveRateLimits` を 7 で飽和させ、30 秒開始・最大 30 分の指数 delay を計算する。妥当な `Retry-After` と比較して遅い方に jitter を加え、`backoffUntil` とともに永続化する。alarm 後は途中からではなく新しい完全同期を開始し、完全同期成功時だけ counter をリセットする。
@@ -266,7 +268,7 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 **限界**: claim 後・通知表示前の crash や通知 API の明示的失敗では OS 通知が欠落し得る。履歴 event を正本として UI に残し、通知は補助経路と位置づける。
 
-### 7.9 redirect を追従しない
+### 7.11 redirect を追従しない
 
 **推論**: 非公式 endpoint が移動・侵害されたとき既存 Cookie 付き要求を別 URL へ自動追従させないため、全 fetch を `redirect: "manual"` に固定する。3xx または opaque redirect は同期失敗とし、移転先が同じ host でも自動追従しない。
 
