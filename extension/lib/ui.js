@@ -1,10 +1,15 @@
 // @ts-check
 
 import { normalizeSearchText } from "./domain.js";
+import {
+  createFavoriteGroupLabelMap,
+  getFavoriteGroupLabel
+} from "./favorite-groups.js";
 
 /** @typedef {import("./database.js").DatabaseRepository} DatabaseRepository */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listWorlds"]>>[number]} WorldRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listEvents"]>>[number]} HistoryEvent */
+/** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
 
 /**
  * @typedef {object} UiStatus
@@ -15,6 +20,9 @@ import { normalizeSearchText } from "./domain.js";
  * @property {string | null} activeProfileId
  * @property {number} worldCount
  * @property {number} eventCount
+ * @property {number} pendingProbeCount
+ * @property {number} unreadCount
+ * @property {"success" | "stale" | null} favoriteGroupStatus
  * @property {string | null} lastResult
  */
 
@@ -54,8 +62,14 @@ const EVENT_PRESENTATIONS = Object.freeze({
   access_restored: {
     title: "アクセスできる状態へ戻りました",
     tag: "アクセス復帰"
+  },
+  favorite_group_changed: {
+    title: "お気に入りリストが変わりました",
+    tag: "リスト変更"
   }
 });
+
+export const SYNC_STALE_AFTER_MS = 36 * 60 * 60 * 1_000;
 
 /**
  * @param {unknown} value
@@ -88,6 +102,12 @@ export function normalizeStatusResponse(response) {
       typeof candidate.activeProfileId === "string" ? candidate.activeProfileId : null,
     worldCount: safeCount(candidate.worldCount),
     eventCount: safeCount(candidate.eventCount),
+    pendingProbeCount: safeCount(candidate.pendingProbeCount),
+    unreadCount: safeCount(candidate.unreadCount),
+    favoriteGroupStatus:
+      candidate.favoriteGroupStatus === "success" || candidate.favoriteGroupStatus === "stale"
+        ? candidate.favoriteGroupStatus
+        : null,
     lastResult
   };
 }
@@ -120,9 +140,10 @@ export function formatDateTime(value) {
 
 /**
  * @param {UiStatus} status
+ * @param {number} [now]
  * @returns {StatusPresentation}
  */
-export function presentStatus(status) {
+export function presentStatus(status, now = Date.now()) {
   if (status.syncing) {
     return {
       tone: "working",
@@ -173,10 +194,25 @@ export function presentStatus(status) {
       detail: "先にVRChat公式サイトへログインし、「今すぐ確認」を押してください。"
     };
   }
+  const lastSuccessfulTime = new Date(status.lastSuccessfulSyncAt).getTime();
+  if (
+    Number.isFinite(lastSuccessfulTime)
+    && Number.isFinite(now)
+    && now - lastSuccessfulTime > SYNC_STALE_AFTER_MS
+  ) {
+    return {
+      tone: "error",
+      title: "36時間以上確認できていません",
+      detail: "ブラウザを起動した状態で「今すぐ確認」を押してください。保存済みの記録はそのままです。"
+    };
+  }
+  const pendingDetail = status.pendingProbeCount === 0
+    ? ""
+    : ` 個別確認待ちが${status.pendingProbeCount.toLocaleString("ja-JP")}件あります。`;
   return {
     tone: "ready",
     title: "お気に入りを記録しています",
-    detail: `${status.worldCount.toLocaleString("ja-JP")}件のワールドをこのブラウザ内に保存しています。`
+    detail: `${status.worldCount.toLocaleString("ja-JP")}件のワールドをこのブラウザ内に保存しています。${pendingDetail}`
   };
 }
 
@@ -242,6 +278,50 @@ export function commandErrorMessage(code, retryAt = null) {
 }
 
 /**
+ * Uninstall may invalidate the extension context before a success envelope can
+ * return. Only an explicit dataDeleted=true result may be described as erased.
+ *
+ * @param {unknown} response
+ * @returns {{ ok: true, dataDeleted: true } | { ok: false, error: string, dataDeleted: boolean }}
+ */
+export function normalizePurgeResponse(response) {
+  if (isRecord(response) && response.ok === true && response.dataDeleted === true) {
+    return { ok: true, dataDeleted: true };
+  }
+  const rawError = isRecord(response) && typeof response.error === "string"
+    ? response.error
+    : "unavailable";
+  return {
+    ok: false,
+    error: rawError.toLocaleLowerCase("en-US"),
+    dataDeleted: isRecord(response) && response.dataDeleted === true
+  };
+}
+
+/**
+ * @param {string} code
+ * @param {boolean} dataDeleted
+ * @returns {string}
+ */
+export function purgeErrorMessage(code, dataDeleted) {
+  if (dataDeleted) {
+    return "ブラウザ内の記録は削除済みですが、拡張を自動削除できませんでした。ブラウザの拡張機能管理画面から、この拡張を手動で削除してください。";
+  }
+  switch (code) {
+    case "sync_in_progress":
+      return "お気に入りを確認中のため削除を開始しませんでした。確認が終わってから、もう一度お試しください。";
+    case "delete_blocked":
+      return "別の拡張画面が記録を使用しているため削除できませんでした。ほかのポップアップや記録画面を閉じてから、もう一度お試しください。";
+    case "delete_failed":
+      return "削除処理を完了できず、ブラウザ内の記録の状態を確認できませんでした。ブラウザを再起動してから、もう一度お試しください。";
+    case "uninstall_failed":
+      return "削除処理の結果を確認できませんでした。拡張機能管理画面から、記録画面と拡張の状態を確認してください。";
+    default:
+      return "削除結果を確認できませんでした。この画面を閉じ、ブラウザの拡張機能管理画面で拡張が残っているか確認してください。";
+  }
+}
+
+/**
  * @param {WorldRecord} world
  * @param {"all" | "favorite" | "missing" | "unavailable" | "pending"} filter
  * @returns {boolean}
@@ -267,40 +347,64 @@ export function worldMatchesFilter(world, filter) {
 }
 
 /**
- * Search the current name, historical names, author, and immutable world ID.
+ * Search the current name, historical names, author, immutable world ID, and
+ * favorite-list display names. The optional fifth argument preserves the
+ * original four-argument call contract.
  *
  * @param {readonly WorldRecord[]} worlds
  * @param {readonly HistoryEvent[]} events
  * @param {string} query
  * @param {"all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {string | null} [groupTag]
+ * @param {readonly FavoriteGroupRecord[]} [favoriteGroups]
  * @returns {WorldRecord[]}
  */
-export function filterWorlds(worlds, events, query, filter) {
+export function filterWorlds(
+  worlds,
+  events,
+  query,
+  filter,
+  groupTag = null,
+  favoriteGroups = []
+) {
   const normalizedQuery = normalizeSearchText(query);
   /** @type {Map<string, string[]>} */
   const historicalNames = new Map();
+  /** @type {Map<string, Set<string>>} */
+  const historicalGroupTags = new Map();
   for (const event of events) {
-    if (event.kind !== "name_changed") {
-      continue;
+    if (event.kind === "name_changed") {
+      const names = historicalNames.get(event.worldId) ?? [];
+      names.push(event.before, event.after);
+      historicalNames.set(event.worldId, names);
+    } else if (event.kind === "favorite_group_changed") {
+      const tags = historicalGroupTags.get(event.worldId) ?? new Set();
+      for (const tag of [...parseFavoriteGroupTags(event.before), ...parseFavoriteGroupTags(event.after)]) {
+        tags.add(tag);
+      }
+      historicalGroupTags.set(event.worldId, tags);
     }
-    const names = historicalNames.get(event.worldId) ?? [];
-    names.push(event.before, event.after);
-    historicalNames.set(event.worldId, names);
   }
 
   return worlds
     .filter((world) => worldMatchesFilter(world, filter))
+    .filter((world) => groupTag === null || groupTag.length === 0 || world.favoriteTags.includes(groupTag))
     .filter((world) => {
       if (normalizedQuery.length === 0) {
         return true;
       }
+      const recordedGroupTags = new Set([
+        ...world.favoriteTags,
+        ...(historicalGroupTags.get(world.worldId) ?? [])
+      ]);
       const searchable = [
         world.currentName ?? "",
         world.normalizedName ?? "",
         world.authorName ?? "",
         world.normalizedAuthorName ?? "",
         world.worldId,
-        ...(historicalNames.get(world.worldId) ?? [])
+        ...(historicalNames.get(world.worldId) ?? []),
+        ...favoriteGroupSearchValues([...recordedGroupTags], favoriteGroups)
       ];
       return searchable.some((value) => normalizeSearchText(value).includes(normalizedQuery));
     })
@@ -309,7 +413,7 @@ export function filterWorlds(worlds, events, query, filter) {
 
 /**
  * @param {readonly HistoryEvent[]} events
- * @param {"all" | "renamed" | "missing" | "unavailable" | "restored"} filter
+ * @param {"all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} filter
  * @returns {HistoryEvent[]}
  */
 export function filterEvents(events, filter) {
@@ -318,6 +422,8 @@ export function filterEvents(events, filter) {
       switch (filter) {
         case "renamed":
           return event.kind === "name_changed";
+        case "group":
+          return event.kind === "favorite_group_changed";
         case "missing":
           return event.kind === "favorite_missing_confirmed";
         case "unavailable":
@@ -403,19 +509,74 @@ export function worldStateTags(world) {
 }
 
 /**
+ * Map persisted internal favorite tags to user-facing list names. Unknown tags
+ * remain visible instead of silently hiding a world's recorded classification.
+ *
+ * @param {readonly string[]} internalNames
+ * @param {readonly FavoriteGroupRecord[]} favoriteGroups
+ * @returns {string[]}
+ */
+export function favoriteGroupLabels(internalNames, favoriteGroups) {
+  const labels = createFavoriteGroupLabelMap(favoriteGroups);
+  return [...new Set(internalNames)].map((internalName) => (
+    getFavoriteGroupLabel(internalName, labels)
+  ));
+}
+
+/**
+ * @param {readonly string[]} internalNames
+ * @param {readonly FavoriteGroupRecord[]} favoriteGroups
+ * @returns {string[]}
+ */
+function favoriteGroupSearchValues(internalNames, favoriteGroups) {
+  const wanted = new Set(internalNames);
+  const values = [...wanted];
+  for (const group of favoriteGroups) {
+    if (!wanted.has(group.internalName)) {
+      continue;
+    }
+    values.push(group.displayName, group.normalizedDisplayName);
+    for (const previous of group.displayNameHistory) {
+      values.push(previous.displayName);
+    }
+  }
+  return values;
+}
+
+/**
+ * Parse the allowlisted JSON array format used by favorite_group_changed.
+ * Corrupt legacy data produces an empty list and never reaches the DOM.
+ *
+ * @param {string} value
+ * @returns {string[]}
+ */
+export function parseFavoriteGroupTags(value) {
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed) || parsed.some((tag) => typeof tag !== "string")) {
+      return [];
+    }
+    return [...new Set(parsed)];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * @param {HistoryEvent["kind"]} kind
  * @returns {{ title: string, tag: string }}
  */
 export function presentEventKind(kind) {
-  return EVENT_PRESENTATIONS[kind];
+  return EVENT_PRESENTATIONS[kind] ?? { title: "記録された変更", tag: "変更" };
 }
 
 /**
  * @param {HistoryEvent} event
  * @param {WorldRecord | undefined} world
+ * @param {readonly FavoriteGroupRecord[]} [favoriteGroups]
  * @returns {string}
  */
-export function eventDetail(event, world) {
+export function eventDetail(event, world, favoriteGroups = []) {
   if (event.kind === "name_changed") {
     return `「${event.before}」から「${event.after}」へ変更されました。`;
   }
@@ -431,7 +592,33 @@ export function eventDetail(event, world) {
   if (event.kind === "access_restored") {
     return "VRChat APIからワールド情報を再び確認できました。";
   }
+  if (event.kind === "favorite_group_changed") {
+    const before = favoriteGroupLabels(parseFavoriteGroupTags(event.before), favoriteGroups);
+    const after = favoriteGroupLabels(parseFavoriteGroupTags(event.after), favoriteGroups);
+    if (before.length === 0 && after.length === 0) {
+      return "所属するお気に入りリストの記録が変わりました。";
+    }
+    const beforeLabel = before.length === 0 ? "リストなし" : before.join(" / ");
+    const afterLabel = after.length === 0 ? "リストなし" : after.join(" / ");
+    return `「${beforeLabel}」から「${afterLabel}」へ変わりました。`;
+  }
   return world?.currentName ?? event.worldId;
+}
+
+/**
+ * Shared progressive-render helper. It copies only the currently visible
+ * prefix so callers cannot accidentally mutate the complete result set.
+ *
+ * @template T
+ * @param {readonly T[]} items
+ * @param {number} visibleCount
+ * @returns {T[]}
+ */
+export function takeVisibleItems(items, visibleCount) {
+  if (!Number.isSafeInteger(visibleCount) || visibleCount <= 0) {
+    return [];
+  }
+  return items.slice(0, visibleCount);
 }
 
 /**

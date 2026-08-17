@@ -25,6 +25,7 @@ export const PROBE_STATES = Object.freeze({
 
 export const EVENT_KINDS = Object.freeze({
   NAME_CHANGED: "name_changed",
+  FAVORITE_GROUP_CHANGED: "favorite_group_changed",
   FAVORITE_MISSING_CONFIRMED: "favorite_missing_confirmed",
   FAVORITE_RESTORED: "favorite_restored",
   ACCESS_UNAVAILABLE_CONFIRMED: "access_unavailable_confirmed",
@@ -33,18 +34,34 @@ export const EVENT_KINDS = Object.freeze({
 
 export const EVENT_KIND_ORDER = Object.freeze([
   EVENT_KINDS.NAME_CHANGED,
+  EVENT_KINDS.FAVORITE_GROUP_CHANGED,
   EVENT_KINDS.FAVORITE_MISSING_CONFIRMED,
   EVENT_KINDS.FAVORITE_RESTORED,
   EVENT_KINDS.ACCESS_UNAVAILABLE_CONFIRMED,
   EVENT_KINDS.ACCESS_RESTORED,
 ]);
 
+// This is an immutable schema-v2 mapping, not a live notification preference.
+// Supporting another kind requires a new schema policy that continues to
+// accept false on records created under this version.
+export const SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS = Object.freeze([
+  EVENT_KINDS.NAME_CHANGED,
+  EVENT_KINDS.FAVORITE_MISSING_CONFIRMED,
+  EVENT_KINDS.FAVORITE_RESTORED,
+  EVENT_KINDS.ACCESS_UNAVAILABLE_CONFIRMED,
+  EVENT_KINDS.ACCESS_RESTORED,
+]);
+
+const NOTIFICATION_ELIGIBLE_EVENT_KIND_SET = /** @type {ReadonlySet<unknown>} */ (
+  new Set(SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS)
+);
+
 export const MAX_PROBE_CANDIDATES = 20;
 
 /** @typedef {'favorited' | 'missing_once' | 'not_in_favorites'} MembershipState */
 /** @typedef {'unknown' | 'accessible' | 'unavailable_once' | 'unavailable'} AvailabilityState */
 /** @typedef {'none' | 'pending'} ProbeState */
-/** @typedef {'name_changed' | 'favorite_missing_confirmed' | 'favorite_restored' | 'access_unavailable_confirmed' | 'access_restored'} EventKind */
+/** @typedef {'name_changed' | 'favorite_group_changed' | 'favorite_missing_confirmed' | 'favorite_restored' | 'access_unavailable_confirmed' | 'access_restored'} EventKind */
 
 /**
  * @typedef {object} WorldRecord
@@ -80,6 +97,7 @@ export const MAX_PROBE_CANDIDATES = 20;
  * @property {string} after
  * @property {{source: 'bulk' | 'probe', httpStatus: 200 | 404 | null}} evidence
  * @property {string} syncId
+ * @property {boolean} notificationEligible
  * @property {string | null} notificationClaimedAt
  * @property {string | null} notifiedAt
  * @property {'api_rejected' | 'permission_denied' | 'unavailable' | null} notificationError
@@ -125,6 +143,18 @@ const EVENT_ORDER_INDEX = new Map(
 );
 
 /**
+ * Notification eligibility is fixed when an event is created and persisted.
+ * A later outbox allowlist change must never make old suppressed events
+ * eligible retroactively.
+ *
+ * @param {unknown} kind
+ * @returns {boolean}
+ */
+export function isSchemaV2NotificationEligibleEventKind(kind) {
+  return NOTIFICATION_ELIGIBLE_EVENT_KIND_SET.has(kind);
+}
+
+/**
  * Produce a stable, human-searchable form without discarding Japanese text.
  *
  * @param {string} value
@@ -162,7 +192,11 @@ export function reconcileWorlds(input) {
   const relationTagsById = indexFavoriteRelations(input.favoriteRelations);
   const metadataById = indexMetadata(input.metadata);
   const probesById = indexProbes(input.probes);
-  const worldIds = new Set([...previousById.keys(), ...relationTagsById.keys()]);
+  const worldIds = new Set([
+    ...previousById.keys(),
+    ...relationTagsById.keys(),
+    ...metadataById.keys(),
+  ]);
   /** @type {WorldRecord[]} */
   const worlds = [];
   /** @type {HistoryEvent[]} */
@@ -189,6 +223,7 @@ export function reconcileWorlds(input) {
     const result = updateWorldRecord({
       previous,
       hasFavoriteRelation: relationTags !== undefined,
+      hasFavoriteEvidence: relationTags !== undefined || bulkMetadata !== undefined,
       relationTags: relationTags ?? [],
       bulkMetadata,
       probe,
@@ -245,7 +280,18 @@ export function selectProbeCandidates(input) {
   };
 
   for (const world of input.previousWorlds) {
-    if (world.probeState === PROBE_STATES.PENDING) {
+    if (
+      world.availabilityState === AVAILABILITY_STATES.UNAVAILABLE_ONCE
+      && !metadataIds.has(world.worldId)
+    ) {
+      offer(world.worldId, 0);
+    }
+  }
+  for (const world of input.previousWorlds) {
+    if (
+      world.probeState === PROBE_STATES.PENDING
+      && !metadataIds.has(world.worldId)
+    ) {
       offer(world.worldId, 1);
     }
   }
@@ -255,14 +301,21 @@ export function selectProbeCandidates(input) {
     }
   }
   for (const world of input.previousWorlds) {
-    if (!relationIds.has(world.worldId) && world.membershipState === MEMBERSHIP_STATES.FAVORITED) {
+    if (
+      !relationIds.has(world.worldId)
+      && !metadataIds.has(world.worldId)
+      && world.membershipState === MEMBERSHIP_STATES.FAVORITED
+    ) {
       offer(world.worldId, 3);
     }
   }
   for (const world of input.previousWorlds) {
     if (
-      world.membershipState === MEMBERSHIP_STATES.MISSING_ONCE
-      || world.availabilityState === AVAILABILITY_STATES.UNAVAILABLE_ONCE
+      !metadataIds.has(world.worldId)
+      && (
+        world.membershipState === MEMBERSHIP_STATES.MISSING_ONCE
+        || world.availabilityState === AVAILABILITY_STATES.UNAVAILABLE_ONCE
+      )
     ) {
       offer(world.worldId, 4);
     }
@@ -329,6 +382,7 @@ function createWorldRecord(input) {
  * @param {{
  *   previous: WorldRecord,
  *   hasFavoriteRelation: boolean,
+ *   hasFavoriteEvidence: boolean,
  *   relationTags: readonly string[],
  *   bulkMetadata: WorldMetadata | undefined,
  *   probe: WorldProbe | undefined,
@@ -347,7 +401,7 @@ function updateWorldRecord(input) {
   let membershipState;
   /** @type {0 | 1 | 2} */
   let membershipMissCount;
-  if (input.hasFavoriteRelation) {
+  if (input.hasFavoriteEvidence) {
     membershipState = MEMBERSHIP_STATES.FAVORITED;
     membershipMissCount = 0;
     if (previous.membershipState === MEMBERSHIP_STATES.NOT_IN_FAVORITES) {
@@ -429,20 +483,39 @@ function updateWorldRecord(input) {
     });
   }
 
-  const needsProbe = previous.probeState === PROBE_STATES.PENDING
+  const needsProbe = !successful.present && (
+    previous.probeState === PROBE_STATES.PENDING
     || (input.hasFavoriteRelation && input.bulkMetadata === undefined)
-    || (!input.hasFavoriteRelation && previous.membershipState === MEMBERSHIP_STATES.FAVORITED)
+    || (!input.hasFavoriteEvidence && previous.membershipState === MEMBERSHIP_STATES.FAVORITED)
     || previous.membershipState === MEMBERSHIP_STATES.MISSING_ONCE
-    || previous.availabilityState === AVAILABILITY_STATES.UNAVAILABLE_ONCE;
+    || previous.availabilityState === AVAILABILITY_STATES.UNAVAILABLE_ONCE
+  );
   const probeState = input.probe !== undefined
     ? PROBE_STATES.NONE
     : needsProbe
       ? PROBE_STATES.PENDING
       : PROBE_STATES.NONE;
 
+  const favoriteTagSourcesConflict = input.hasFavoriteRelation
+    && hasConflictingFavoriteTags(input.relationTags, input.bulkMetadata);
   const favoriteTags = input.hasFavoriteRelation
-    ? collectCurrentFavoriteTags(input.relationTags, input.bulkMetadata, input.probe)
+    ? favoriteTagSourcesConflict
+      ? previous.favoriteTags.slice()
+      : collectCurrentFavoriteTags(input.relationTags, input.bulkMetadata, input.probe)
     : previous.favoriteTags.slice();
+  const previousFavoriteTags = canonicalizeFavoriteTags(previous.favoriteTags);
+  const favoriteTagsChanged = input.hasFavoriteRelation
+    && !favoriteTagSourcesConflict
+    && !sameStringArray(previousFavoriteTags, favoriteTags);
+  const favoriteTagsRecordChanged = !sameStringArray(previous.favoriteTags, favoriteTags);
+  if (favoriteTagsChanged) {
+    pendingEvents.push({
+      kind: EVENT_KINDS.FAVORITE_GROUP_CHANGED,
+      before: JSON.stringify(previousFavoriteTags),
+      after: JSON.stringify(favoriteTags),
+      evidence: {source: "bulk", httpStatus: null},
+    });
+  }
   const lastEvidenceStatus = successful.present
     ? 200
     : has404
@@ -466,14 +539,21 @@ function updateWorldRecord(input) {
     || event.kind === EVENT_KINDS.ACCESS_RESTORED
   ));
   const hasNameEvent = pendingEvents.some((event) => event.kind === EVENT_KINDS.NAME_CHANGED);
+  const hasFavoriteGroupEvent = pendingEvents.some(
+    (event) => event.kind === EVENT_KINDS.FAVORITE_GROUP_CHANGED,
+  );
 
   let revision = previous.revision;
   if (input.suppressEvents) {
-    revision += Number(membershipChanged) + Number(availabilityChanged) + Number(nameChanged);
+    revision += Number(membershipChanged)
+      + Number(availabilityChanged)
+      + Number(nameChanged)
+      + Number(favoriteTagsRecordChanged);
   } else {
     revision += Number(membershipChanged && !hasMembershipEvent);
     revision += Number(availabilityChanged && !hasAvailabilityEvent);
     revision += Number(nameChanged && !hasNameEvent);
+    revision += Number(favoriteTagsRecordChanged && !hasFavoriteGroupEvent);
   }
   /** @type {HistoryEvent[]} */
   const events = [];
@@ -490,6 +570,7 @@ function updateWorldRecord(input) {
         after: pending.after,
         evidence: pending.evidence,
         syncId: input.syncId,
+        notificationEligible: isSchemaV2NotificationEligibleEventKind(pending.kind),
         notificationClaimedAt: null,
         notifiedAt: null,
         notificationError: null,
@@ -507,7 +588,7 @@ function updateWorldRecord(input) {
       authorName,
       normalizedAuthorName: authorName === null ? null : normalizeSearchText(authorName),
       favoriteTags,
-      lastSeenFavoriteAt: input.hasFavoriteRelation ? input.observedAt : previous.lastSeenFavoriteAt,
+      lastSeenFavoriteAt: input.hasFavoriteEvidence ? input.observedAt : previous.lastSeenFavoriteAt,
       lastMetadataAt: successful.present ? input.observedAt : previous.lastMetadataAt,
       membershipState,
       membershipMissCount,
@@ -624,14 +705,13 @@ function selectMetadataText(probe, bulkMetadata, field) {
  * @returns {string[]}
  */
 function collectCurrentFavoriteTags(relationTags, bulkMetadata, probe) {
+  const relationFavoriteTags = canonicalizeFavoriteTags(relationTags);
+  if (relationFavoriteTags.length > 0) {
+    return relationFavoriteTags;
+  }
+
   /** @type {Set<string>} */
   const tags = new Set();
-  for (const tag of relationTags) {
-    const normalized = tag.trim();
-    if (normalized !== "") {
-      tags.add(normalized);
-    }
-  }
   if (bulkMetadata !== undefined) {
     addTags(tags, bulkMetadata.favoriteTags);
   }
@@ -639,6 +719,49 @@ function collectCurrentFavoriteTags(relationTags, bulkMetadata, probe) {
     addTags(tags, probe.metadata.favoriteTags);
   }
   return [...tags].sort(compareText);
+}
+
+/**
+ * Favorite relations are authoritative for group membership. A later bulk
+ * response can straddle a user move between lists; when it contradicts the
+ * relation snapshot, retain the previous value until a future sync agrees.
+ * A bulk response naming one of multiple relation tags is not contradictory.
+ *
+ * @param {readonly string[]} relationTags
+ * @param {WorldMetadata | undefined} bulkMetadata
+ * @returns {boolean}
+ */
+function hasConflictingFavoriteTags(relationTags, bulkMetadata) {
+  if (bulkMetadata === undefined) {
+    return false;
+  }
+  const relationFavoriteTags = canonicalizeFavoriteTags(relationTags);
+  const bulkFavoriteTags = canonicalizeFavoriteTags(bulkMetadata.favoriteTags);
+  if (relationFavoriteTags.length === 0 || bulkFavoriteTags.length === 0) {
+    return false;
+  }
+  const relationTagSet = new Set(relationFavoriteTags);
+  return bulkFavoriteTags.some((tag) => !relationTagSet.has(tag));
+}
+
+/**
+ * @param {readonly string[]} values
+ * @returns {string[]}
+ */
+function canonicalizeFavoriteTags(values) {
+  const tags = new Set();
+  addTags(tags, values);
+  return [...tags].sort(compareText);
+}
+
+/**
+ * @param {readonly string[]} left
+ * @param {readonly string[]} right
+ * @returns {boolean}
+ */
+function sameStringArray(left, right) {
+  return left.length === right.length
+    && left.every((value, index) => value === right[index]);
 }
 
 /**

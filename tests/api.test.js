@@ -101,6 +101,25 @@ function favoriteWorld(number) {
   };
 }
 
+/**
+ * @param {number} number
+ * @param {"avatar" | "friend" | "world" | "vrcPlusWorld"} [type]
+ * @param {Partial<Record<"id" | "name" | "displayName" | "ownerId", string>>} [overrides]
+ */
+function favoriteGroup(number, type = "world", overrides = {}) {
+  return {
+    id: `fvgrp_00000000-0000-0000-0000-${String(number).padStart(12, "0")}`,
+    name: type === "avatar" ? `avatars${number}` : `worlds${number}`,
+    displayName: `リスト ${number}`,
+    ownerId: USER_ID,
+    ownerDisplayName: "保存しない所有者名",
+    tags: ["保存しないタグ"],
+    type,
+    visibility: "private",
+    ...overrides
+  };
+}
+
 test("getCurrentUser uses fixed read-only options and projects only safe fields", async () => {
   const harness = createHarness([
     jsonResponse({
@@ -270,6 +289,26 @@ test("favorite relation pagination continues after short pages and ends only on 
   assert.deepEqual(harness.sleeps, [2_000, 2_000]);
 });
 
+test("favorite relation pagination handles an 800-world snapshot in eight pages", async () => {
+  const responses = Array.from({ length: 8 }, (_, pageIndex) => jsonResponse(
+    Array.from({ length: 100 }, (_, itemIndex) => relation(pageIndex * 100 + itemIndex + 1))
+  ));
+  responses.push(jsonResponse([]));
+  const harness = createHarness(responses);
+
+  const result = await harness.api.listAllFavoriteRelations();
+
+  assert.equal(result.length, 800);
+  assert.equal(result[0]?.favoriteId, worldId(1));
+  assert.equal(result.at(-1)?.favoriteId, worldId(800));
+  assert.equal(harness.calls.length, 9);
+  assert.equal(
+    harness.calls.at(-1)?.url,
+    `${VRCHAT_API_BASE_URL}/favorites?type=world&n=100&offset=800`
+  );
+  assert.deepEqual(harness.sleeps, Array(8).fill(2_000));
+});
+
 test("favorite world pagination includes releaseStatus=all and validates metadata", async () => {
   const harness = createHarness([
     jsonResponse([{ ...favoriteWorld(1), releaseStatus: "private" }]),
@@ -295,6 +334,86 @@ test("favorite world pagination includes releaseStatus=all and validates metadat
     invalidHarness.api.listAllFavoriteWorlds(),
     ApiSchemaError
   );
+});
+
+test("favorite groups use owner-scoped paging and expose only minimal world metadata", async () => {
+  const first = favoriteGroup(1, "world");
+  const plus = favoriteGroup(2, "vrcPlusWorld");
+  const avatar = favoriteGroup(3, "avatar");
+  const harness = createHarness([
+    jsonResponse([first, plus, avatar]),
+    jsonResponse([])
+  ]);
+
+  const result = await harness.api.listAllFavoriteGroups(USER_ID);
+
+  assert.deepEqual(result, [
+    {
+      id: first.id,
+      name: first.name,
+      displayName: first.displayName,
+      ownerId: USER_ID,
+      type: "world"
+    },
+    {
+      id: plus.id,
+      name: plus.name,
+      displayName: plus.displayName,
+      ownerId: USER_ID,
+      type: "vrcPlusWorld"
+    }
+  ]);
+  assert.deepEqual(
+    harness.calls.map((call) => call.url),
+    [
+      `${VRCHAT_API_BASE_URL}/favorite/groups?n=100&offset=0&ownerId=${USER_ID}`,
+      `${VRCHAT_API_BASE_URL}/favorite/groups?n=100&offset=3&ownerId=${USER_ID}`
+    ]
+  );
+  assert.equal("ownerDisplayName" in (result[0] ?? {}), false);
+  assert.equal("tags" in (result[0] ?? {}), false);
+  assert.equal("visibility" in (result[0] ?? {}), false);
+});
+
+test("favorite groups fail closed on invalid owner, schema, or duplicate identity", async () => {
+  const invalidOwnerArgument = createHarness([]);
+  await assert.rejects(
+    invalidOwnerArgument.api.listAllFavoriteGroups("usr_not-valid"),
+    ApiSchemaError
+  );
+  assert.equal(invalidOwnerArgument.calls.length, 0);
+
+  const wrongOwner = createHarness([
+    jsonResponse([favoriteGroup(1, "world", {
+      ownerId: "usr_00000000-0000-0000-0000-000000000002"
+    })])
+  ]);
+  await assert.rejects(wrongOwner.api.listAllFavoriteGroups(USER_ID), ApiSchemaError);
+
+  const unknownType = createHarness([
+    jsonResponse([{ ...favoriteGroup(1), type: "unknown" }])
+  ]);
+  await assert.rejects(unknownType.api.listAllFavoriteGroups(USER_ID), ApiSchemaError);
+
+  const invalidText = createHarness([
+    jsonResponse([favoriteGroup(1, "world", { displayName: "\u0000" })])
+  ]);
+  await assert.rejects(invalidText.api.listAllFavoriteGroups(USER_ID), ApiSchemaError);
+
+  const duplicateId = createHarness([
+    jsonResponse([favoriteGroup(1)]),
+    jsonResponse([favoriteGroup(1, "world", { displayName: "変更値" })])
+  ]);
+  await assert.rejects(duplicateId.api.listAllFavoriteGroups(USER_ID), ApiSchemaError);
+
+  const duplicateName = createHarness([
+    jsonResponse([
+      favoriteGroup(1),
+      favoriteGroup(2, "vrcPlusWorld", { name: "worlds1" })
+    ]),
+    jsonResponse([])
+  ]);
+  await assert.rejects(duplicateName.api.listAllFavoriteGroups(USER_ID), ApiSchemaError);
 });
 
 test("an initially empty page is a complete empty snapshot", async () => {

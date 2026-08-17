@@ -1,15 +1,23 @@
 // @ts-check
 
+import { DATABASE_VERSION } from "./database.js";
+import {
+  isSchemaV2NotificationEligibleEventKind,
+  normalizeSearchText
+} from "./domain.js";
+
 /** @typedef {import("./database.js").DatabaseRepository} DatabaseRepository */
 /** @typedef {NonNullable<Awaited<ReturnType<DatabaseRepository["getProfile"]>>>} ProfileRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listWorlds"]>>[number]} WorldRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listEvents"]>>[number]} HistoryEvent */
+/** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
 
 export const BACKUP_FORMAT = "vrc_favworld_check-backup";
-export const BACKUP_VERSION = 1;
+export const BACKUP_VERSION = 2;
 export const MAX_BACKUP_BYTES = 25 * 1024 * 1024;
 export const MAX_BACKUP_WORLDS = 10_000;
 export const MAX_BACKUP_EVENTS = 100_000;
+export const MAX_BACKUP_GROUPS = 100;
 export const MAX_STRING_CODE_POINTS = 4_096;
 export const SAFE_PREFERENCE_KEYS = Object.freeze([
   "autoSyncEnabled",
@@ -19,19 +27,23 @@ export const SAFE_PREFERENCE_KEYS = Object.freeze([
 const MAX_ARRAY_NESTING = 4;
 const MAX_OBJECT_NESTING = 8;
 const MAX_FAVORITE_TAGS = 100;
+const MAX_FAVORITE_GROUP_NAME_HISTORY = 100;
 const MAX_OBJECT_FIELDS = 64;
 const MAX_GRAPH_NODES = 2_000_000;
 
 const USER_ID_PATTERN = /^usr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WORLD_ID_PATTERN = /^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const FAVORITE_GROUP_ID_PATTERN = /^fvgrp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SYNC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,199}$/;
-const EVENT_KINDS = new Set([
+const EVENT_KINDS_V1 = new Set([
   "name_changed",
   "favorite_missing_confirmed",
   "favorite_restored",
   "access_unavailable_confirmed",
   "access_restored"
 ]);
+const EVENT_KINDS_V2 = new Set([...EVENT_KINDS_V1, "favorite_group_changed"]);
+const FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
 const MEMBERSHIP_STATES = new Set(["favorited", "missing_once", "not_in_favorites"]);
 const AVAILABILITY_STATES = new Set([
   "unknown",
@@ -49,7 +61,7 @@ const NOTIFICATION_ERRORS = new Set([
 const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SECRET_KEY_PATTERN = /(?:password|passwd|cookie|token|secret|session|authorization|credential)/i;
 
-const TOP_LEVEL_FIELDS = new Set([
+const TOP_LEVEL_FIELDS_V1 = new Set([
   "format",
   "version",
   "exportedAt",
@@ -59,6 +71,7 @@ const TOP_LEVEL_FIELDS = new Set([
   "events",
   "preferences"
 ]);
+const TOP_LEVEL_FIELDS_V2 = new Set([...TOP_LEVEL_FIELDS_V1, "favoriteGroups"]);
 const PROFILE_FIELDS = new Set([
   "userId",
   "displayName",
@@ -87,7 +100,22 @@ const WORLD_FIELDS = new Set([
   "revision",
   "updatedAt"
 ]);
-const EVENT_FIELDS = new Set([
+const FAVORITE_GROUP_FIELDS = new Set([
+  "userId",
+  "groupId",
+  "internalName",
+  "displayName",
+  "normalizedDisplayName",
+  "type",
+  "active",
+  "missingCount",
+  "firstSeenAt",
+  "lastSeenAt",
+  "displayNameHistory",
+  "updatedAt"
+]);
+const FAVORITE_GROUP_HISTORY_FIELDS = new Set(["displayName", "observedAt"]);
+const EVENT_FIELDS_V1 = new Set([
   "eventId",
   "userId",
   "worldId",
@@ -101,17 +129,19 @@ const EVENT_FIELDS = new Set([
   "notifiedAt",
   "notificationError"
 ]);
+const EVENT_FIELDS_V2 = new Set([...EVENT_FIELDS_V1, "notificationEligible"]);
 const EVIDENCE_FIELDS = new Set(["source", "httpStatus"]);
 const PREFERENCE_FIELDS = new Set(SAFE_PREFERENCE_KEYS);
 
 /**
  * @typedef {object} ValidatedBackup
  * @property {typeof BACKUP_FORMAT} format
- * @property {1} version
+ * @property {2} version
  * @property {string} exportedAt
  * @property {string} appVersion
  * @property {ProfileRecord} profile
  * @property {WorldRecord[]} worlds
+ * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {HistoryEvent[]} events
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
  */
@@ -122,6 +152,7 @@ const PREFERENCE_FIELDS = new Set(SAFE_PREFERENCE_KEYS);
  * @property {string} displayName
  * @property {number} worldCount
  * @property {number} eventCount
+ * @property {number} groupCount
  * @property {string} exportedAt
  */
 
@@ -297,10 +328,14 @@ function isoDate(value, path) {
     match === null
       ? null
       : `${match[1]}.${(match[2] ?? "").padEnd(3, "0")}Z`;
-  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== canonical) {
+  if (!Number.isFinite(timestamp)) {
     invalid(`${path} must be a UTC ISO 8601 timestamp`);
   }
-  return date;
+  const normalized = new Date(timestamp).toISOString();
+  if (normalized !== canonical) {
+    invalid(`${path} must be a UTC ISO 8601 timestamp`);
+  }
+  return normalized;
 }
 
 /**
@@ -355,18 +390,30 @@ function identifier(value, path, pattern) {
 }
 
 /**
+ * Locale-independent ordering keeps exported bytes stable across machines.
+ *
+ * @param {string} left
+ * @param {string} right
+ * @returns {number}
+ */
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
  * @param {unknown} value
+ * @param {1 | 2} sourceVersion
  * @returns {ProfileRecord}
  */
-function profileRecord(value) {
+function profileRecord(value, sourceVersion) {
   const record = exactRecord(value, "$.profile", PROFILE_FIELDS);
   const createdBySchemaVersion = integer(
     record.createdBySchemaVersion,
     "$.profile.createdBySchemaVersion",
     1,
-    BACKUP_VERSION
+    sourceVersion === 1 ? 1 : DATABASE_VERSION
   );
-  return {
+  const profile = {
     userId: identifier(record.userId, "$.profile.userId", USER_ID_PATTERN),
     displayName: stringValue(record.displayName, "$.profile.displayName"),
     firstSeenAt: isoDate(record.firstSeenAt, "$.profile.firstSeenAt"),
@@ -376,6 +423,13 @@ function profileRecord(value) {
     ),
     createdBySchemaVersion
   };
+  if (
+    profile.lastSuccessfulSyncAt !== null &&
+    profile.lastSuccessfulSyncAt < profile.firstSeenAt
+  ) {
+    invalid("$.profile.lastSuccessfulSyncAt must not precede firstSeenAt");
+  }
+  return profile;
 }
 
 /**
@@ -425,7 +479,7 @@ function worldRecord(value, index, userId) {
     invalid(`${path}.unavailableCount is inconsistent with availabilityState`);
   }
 
-  return {
+  const world = {
     userId: recordUserId,
     worldId: identifier(record.worldId, `${path}.worldId`, WORLD_ID_PATTERN),
     currentName: nullableString(record.currentName, `${path}.currentName`),
@@ -444,10 +498,154 @@ function worldRecord(value, index, userId) {
       enumValue(record.probeState, `${path}.probeState`, PROBE_STATES)
     ),
     lastProbeAt: nullableIsoDate(record.lastProbeAt, `${path}.lastProbeAt`),
-    lastEvidenceStatus,
+    lastEvidenceStatus: /** @type {200 | 404 | null} */ (lastEvidenceStatus),
     revision: integer(record.revision, `${path}.revision`, 0, Number.MAX_SAFE_INTEGER),
     updatedAt: isoDate(record.updatedAt, `${path}.updatedAt`)
   };
+  /** @type {Array<[string, string | null]>} */
+  const relatedTimestamps = [
+    ["lastSeenFavoriteAt", world.lastSeenFavoriteAt],
+    ["lastMetadataAt", world.lastMetadataAt],
+    ["lastProbeAt", world.lastProbeAt]
+  ];
+  for (const [fieldName, timestamp] of relatedTimestamps) {
+    if (timestamp !== null && (timestamp < world.firstSeenAt || timestamp > world.updatedAt)) {
+      invalid(`${path}.${fieldName} is outside the world record lifetime`);
+    }
+  }
+  if (world.updatedAt < world.firstSeenAt) {
+    invalid(`${path}.updatedAt must not precede firstSeenAt`);
+  }
+  return world;
+}
+
+/**
+ * @param {unknown} value
+ * @param {number} index
+ * @param {string} userId
+ * @returns {FavoriteGroupRecord}
+ */
+function favoriteGroupRecord(value, index, userId) {
+  const path = `$.favoriteGroups[${index}]`;
+  const record = exactRecord(value, path, FAVORITE_GROUP_FIELDS);
+  const recordUserId = identifier(record.userId, `${path}.userId`, USER_ID_PATTERN);
+  if (recordUserId !== userId) {
+    invalid(`${path}.userId does not match the profile`);
+  }
+  if (typeof record.active !== "boolean") {
+    invalid(`${path}.active must be boolean`);
+  }
+  const missingCount = integer(record.missingCount, `${path}.missingCount`, 0, 2);
+  if (
+    (record.active && missingCount !== 0 && missingCount !== 1) ||
+    (!record.active && missingCount !== 2)
+  ) {
+    invalid(`${path}.missingCount is inconsistent with active`);
+  }
+  if (
+    !Array.isArray(record.displayNameHistory) ||
+    record.displayNameHistory.length > MAX_FAVORITE_GROUP_NAME_HISTORY
+  ) {
+    invalid(
+      `${path}.displayNameHistory must contain at most ${MAX_FAVORITE_GROUP_NAME_HISTORY} entries`
+    );
+  }
+
+  const displayName = stringValue(record.displayName, `${path}.displayName`);
+  if (displayName !== displayName.trim()) {
+    invalid(`${path}.displayName must not have surrounding whitespace`);
+  }
+  const internalName = stringValue(record.internalName, `${path}.internalName`, {
+    maximum: 200
+  });
+  if (internalName !== internalName.trim()) {
+    invalid(`${path}.internalName must not have surrounding whitespace`);
+  }
+  const normalizedDisplayName = stringValue(
+    record.normalizedDisplayName,
+    `${path}.normalizedDisplayName`,
+    { allowEmpty: true }
+  );
+  if (normalizedDisplayName !== normalizeSearchText(displayName)) {
+    invalid(`${path}.normalizedDisplayName is inconsistent with displayName`);
+  }
+
+  const firstSeenAt = isoDate(record.firstSeenAt, `${path}.firstSeenAt`);
+  const lastSeenAt = isoDate(record.lastSeenAt, `${path}.lastSeenAt`);
+  const updatedAt = isoDate(record.updatedAt, `${path}.updatedAt`);
+  if (lastSeenAt < firstSeenAt || updatedAt < lastSeenAt) {
+    invalid(`${path} timestamps are not chronological`);
+  }
+
+  let previousObservedAt = firstSeenAt;
+  const displayNameHistory = record.displayNameHistory.map((entry, historyIndex) => {
+    const historyPath = `${path}.displayNameHistory[${historyIndex}]`;
+    const historyRecord = exactRecord(entry, historyPath, FAVORITE_GROUP_HISTORY_FIELDS);
+    const historyDisplayName = stringValue(
+      historyRecord.displayName,
+      `${historyPath}.displayName`
+    );
+    if (historyDisplayName !== historyDisplayName.trim()) {
+      invalid(`${historyPath}.displayName must not have surrounding whitespace`);
+    }
+    const observedAt = isoDate(historyRecord.observedAt, `${historyPath}.observedAt`);
+    if (observedAt < previousObservedAt || observedAt > updatedAt) {
+      invalid(`${historyPath}.observedAt is outside chronological order`);
+    }
+    previousObservedAt = observedAt;
+    return { displayName: historyDisplayName, observedAt };
+  });
+
+  return {
+    userId: recordUserId,
+    groupId: identifier(record.groupId, `${path}.groupId`, FAVORITE_GROUP_ID_PATTERN),
+    internalName,
+    displayName,
+    normalizedDisplayName,
+    type: /** @type {FavoriteGroupRecord["type"]} */ (
+      enumValue(record.type, `${path}.type`, FAVORITE_GROUP_TYPES)
+    ),
+    active: record.active,
+    missingCount: /** @type {0 | 1 | 2} */ (missingCount),
+    firstSeenAt,
+    lastSeenAt,
+    displayNameHistory,
+    updatedAt
+  };
+}
+
+/**
+ * Validate and canonicalize the JSON-array representation used by
+ * favorite_group_changed event payloads.
+ *
+ * @param {unknown} value
+ * @param {string} path
+ * @returns {string}
+ */
+function favoriteGroupChangeValue(value, path) {
+  const encoded = stringValue(value, path, { maximum: 25_000 });
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    invalid(`${path} must be a JSON array`);
+  }
+  if (!Array.isArray(parsed) || parsed.length > MAX_FAVORITE_TAGS) {
+    invalid(`${path} must be a JSON array with at most ${MAX_FAVORITE_TAGS} entries`);
+  }
+  const values = parsed.map((entry, index) => {
+    const groupName = stringValue(entry, `${path}[${index}]`, { maximum: 200 });
+    if (groupName !== groupName.trim()) {
+      invalid(`${path}[${index}] must not have surrounding whitespace`);
+    }
+    return groupName;
+  });
+  if (new Set(values).size !== values.length) {
+    invalid(`${path} contains duplicate group names`);
+  }
+  values.sort(compareText);
+  return JSON.stringify(values);
 }
 
 /**
@@ -455,11 +653,16 @@ function worldRecord(value, index, userId) {
  * @param {number} index
  * @param {string} userId
  * @param {Map<string, WorldRecord>} worlds
+ * @param {1 | 2} sourceVersion
  * @returns {HistoryEvent}
  */
-function eventRecord(value, index, userId, worlds) {
+function eventRecord(value, index, userId, worlds, sourceVersion) {
   const path = `$.events[${index}]`;
-  const record = exactRecord(value, path, EVENT_FIELDS);
+  const record = exactRecord(
+    value,
+    path,
+    sourceVersion === 1 ? EVENT_FIELDS_V1 : EVENT_FIELDS_V2
+  );
   const recordUserId = identifier(record.userId, `${path}.userId`, USER_ID_PATTERN);
   if (recordUserId !== userId) {
     invalid(`${path}.userId does not match the profile`);
@@ -470,7 +673,11 @@ function eventRecord(value, index, userId, worlds) {
     invalid(`${path}.worldId does not refer to a world in this backup`);
   }
   const kind = /** @type {HistoryEvent["kind"]} */ (
-    enumValue(record.kind, `${path}.kind`, EVENT_KINDS)
+    enumValue(
+      record.kind,
+      `${path}.kind`,
+      sourceVersion === 1 ? EVENT_KINDS_V1 : EVENT_KINDS_V2
+    )
   );
   const eventId = stringValue(record.eventId, `${path}.eventId`, { maximum: 500 });
   const prefix = `${userId}:${worldId}:`;
@@ -497,22 +704,57 @@ function eventRecord(value, index, userId, worlds) {
     `${path}.notificationClaimedAt`
   );
   const notifiedAt = nullableIsoDate(record.notifiedAt, `${path}.notifiedAt`);
+  const observedAt = isoDate(record.observedAt, `${path}.observedAt`);
   const notificationError =
     record.notificationError === null
       ? null
       : /** @type {NonNullable<HistoryEvent["notificationError"]>} */ (
           enumValue(record.notificationError, `${path}.notificationError`, NOTIFICATION_ERRORS)
         );
+  const expectedNotificationEligibility = isSchemaV2NotificationEligibleEventKind(kind);
+  const notificationEligible = sourceVersion === 1
+    ? true
+    : record.notificationEligible;
+  if (
+    typeof notificationEligible !== "boolean"
+    || notificationEligible !== expectedNotificationEligibility
+  ) {
+    invalid(`${path}.notificationEligible does not match the event kind`);
+  }
   if (notificationClaimedAt === null && (notifiedAt !== null || notificationError !== null)) {
     invalid(`${path} has a notification result without a claim`);
   }
   if (notifiedAt !== null && notificationError !== null) {
     invalid(`${path} has conflicting notification results`);
   }
+  if (
+    !notificationEligible
+    && (
+      notificationClaimedAt !== null
+      || notifiedAt !== null
+      || notificationError !== null
+    )
+  ) {
+    invalid(`${path} has notification state for a suppressed event`);
+  }
+  if (notificationClaimedAt !== null && notificationClaimedAt < observedAt) {
+    invalid(`${path}.notificationClaimedAt must not precede observedAt`);
+  }
+  if (
+    notifiedAt !== null &&
+    notificationClaimedAt !== null &&
+    notifiedAt < notificationClaimedAt
+  ) {
+    invalid(`${path}.notifiedAt must not precede notificationClaimedAt`);
+  }
 
-  const before = stringValue(record.before, `${path}.before`, { allowEmpty: false });
-  const after = stringValue(record.after, `${path}.after`, { allowEmpty: false });
-  /** @type {Readonly<Record<HistoryEvent["kind"], readonly [string, string] | null>>} */
+  const before = kind === "favorite_group_changed"
+    ? favoriteGroupChangeValue(record.before, `${path}.before`)
+    : stringValue(record.before, `${path}.before`, { allowEmpty: false });
+  const after = kind === "favorite_group_changed"
+    ? favoriteGroupChangeValue(record.after, `${path}.after`)
+    : stringValue(record.after, `${path}.after`, { allowEmpty: false });
+  /** @type {Readonly<Record<Exclude<HistoryEvent["kind"], "favorite_group_changed">, readonly [string, string] | null>>} */
   const transitions = {
     name_changed: null,
     favorite_missing_confirmed: ["missing_once", "not_in_favorites"],
@@ -520,9 +762,21 @@ function eventRecord(value, index, userId, worlds) {
     access_unavailable_confirmed: ["unavailable_once", "unavailable"],
     access_restored: ["unavailable", "accessible"]
   };
-  const expectedTransition = transitions[kind];
-  if (expectedTransition !== null && (before !== expectedTransition[0] || after !== expectedTransition[1])) {
-    invalid(`${path}.before and ${path}.after do not match the event kind`);
+  if (kind === "favorite_group_changed") {
+    if (before === after) {
+      invalid(`${path}.before and ${path}.after must describe a change`);
+    }
+    if (evidenceRecord.source !== "bulk" || httpStatus !== null) {
+      invalid(`${path}.evidence is invalid for a favorite group change`);
+    }
+  } else {
+    const expectedTransition = transitions[kind];
+    if (
+      expectedTransition !== null &&
+      (before !== expectedTransition[0] || after !== expectedTransition[1])
+    ) {
+      invalid(`${path}.before and ${path}.after do not match the event kind`);
+    }
   }
 
   return {
@@ -530,7 +784,7 @@ function eventRecord(value, index, userId, worlds) {
     userId: recordUserId,
     worldId,
     kind,
-    observedAt: isoDate(record.observedAt, `${path}.observedAt`),
+    observedAt,
     before,
     after,
     evidence: {
@@ -540,6 +794,7 @@ function eventRecord(value, index, userId, worlds) {
       httpStatus
     },
     syncId: identifier(record.syncId, `${path}.syncId`, SYNC_ID_PATTERN),
+    notificationEligible,
     notificationClaimedAt,
     notifiedAt,
     notificationError
@@ -596,16 +851,22 @@ export function validateBackup(input) {
     invalid("file is not valid JSON");
   }
 
-  const top = exactRecord(parsed, "$", TOP_LEVEL_FIELDS);
+  inspectObjectGraph(parsed);
+  if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
+    invalid("version is not supported");
+  }
+  const sourceVersion = /** @type {1 | 2} */ (parsed.version);
+  const top = exactRecord(
+    parsed,
+    "$",
+    sourceVersion === 1 ? TOP_LEVEL_FIELDS_V1 : TOP_LEVEL_FIELDS_V2
+  );
   if (top.format !== BACKUP_FORMAT) {
     invalid("format is not supported");
   }
-  if (top.version !== BACKUP_VERSION) {
-    invalid("version is not supported");
-  }
   const exportedAt = isoDate(top.exportedAt, "$.exportedAt");
   const appVersion = stringValue(top.appVersion, "$.appVersion", { maximum: 100 });
-  const profile = profileRecord(top.profile);
+  const profile = profileRecord(top.profile, sourceVersion);
 
   if (!Array.isArray(top.worlds) || top.worlds.length > MAX_BACKUP_WORLDS) {
     invalid(`$.worlds must contain at most ${MAX_BACKUP_WORLDS} entries`);
@@ -613,19 +874,36 @@ export function validateBackup(input) {
   if (!Array.isArray(top.events) || top.events.length > MAX_BACKUP_EVENTS) {
     invalid(`$.events must contain at most ${MAX_BACKUP_EVENTS} entries`);
   }
-  inspectObjectGraph(parsed);
+  const rawFavoriteGroups = sourceVersion === 1 ? [] : top.favoriteGroups;
+  if (!Array.isArray(rawFavoriteGroups) || rawFavoriteGroups.length > MAX_BACKUP_GROUPS) {
+    invalid(`$.favoriteGroups must contain at most ${MAX_BACKUP_GROUPS} entries`);
+  }
 
   const worlds = top.worlds.map((world, index) => worldRecord(world, index, profile.userId));
-  worlds.sort((left, right) => left.worldId.localeCompare(right.worldId));
+  worlds.sort((left, right) => compareText(left.worldId, right.worldId));
   const worldsById = new Map(worlds.map((world) => [world.worldId, world]));
   if (worldsById.size !== worlds.length) {
     invalid("$.worlds contains duplicate world IDs");
   }
 
-  const events = top.events.map((event, index) =>
-    eventRecord(event, index, profile.userId, worldsById)
+  const favoriteGroups = rawFavoriteGroups.map((group, index) =>
+    favoriteGroupRecord(group, index, profile.userId)
   );
-  events.sort((left, right) => left.eventId.localeCompare(right.eventId));
+  favoriteGroups.sort((left, right) => compareText(left.groupId, right.groupId));
+  if (new Set(favoriteGroups.map((group) => group.groupId)).size !== favoriteGroups.length) {
+    invalid("$.favoriteGroups contains duplicate group IDs");
+  }
+  const activeInternalNames = favoriteGroups
+    .filter((group) => group.active)
+    .map((group) => group.internalName);
+  if (new Set(activeInternalNames).size !== activeInternalNames.length) {
+    invalid("$.favoriteGroups contains duplicate active internal names");
+  }
+
+  const events = top.events.map((event, index) =>
+    eventRecord(event, index, profile.userId, worldsById, sourceVersion)
+  );
+  events.sort((left, right) => compareText(left.eventId, right.eventId));
   if (new Set(events.map((event) => event.eventId)).size !== events.length) {
     invalid("$.events contains duplicate event IDs");
   }
@@ -637,6 +915,7 @@ export function validateBackup(input) {
     appVersion,
     profile,
     worlds,
+    favoriteGroups,
     events,
     preferences: preferenceRecord(top.preferences)
   };
@@ -656,6 +935,7 @@ export function backupSummary(backup) {
     displayName: backup.profile.displayName,
     worldCount: backup.worlds.length,
     eventCount: backup.events.length,
+    groupCount: backup.favoriteGroups.length,
     exportedAt: backup.exportedAt
   };
 }
@@ -681,6 +961,7 @@ export async function createBackup(repository, userId, options = {}) {
     appVersion: options.appVersion ?? "0.1.0",
     profile: snapshot.profile,
     worlds: snapshot.worlds,
+    favoriteGroups: snapshot.favoriteGroups,
     events: snapshot.events,
     preferences: snapshot.preferences
   };
@@ -707,14 +988,18 @@ export async function restoreBackup(repository, input, options = {}) {
   const backup = validateBackup(input);
   const restoredAt = isoDate(options.restoredAt ?? new Date().toISOString(), "restoredAt");
   const events = backup.events.map((event) =>
-    event.notificationClaimedAt === null
-      ? { ...event, notificationClaimedAt: restoredAt }
+    event.notificationEligible && event.notificationClaimedAt === null
+      ? {
+          ...event,
+          notificationClaimedAt: event.observedAt > restoredAt ? event.observedAt : restoredAt
+        }
       : event
   );
 
   await repository.replaceProfileData({
     profile: backup.profile,
     worlds: backup.worlds,
+    favoriteGroups: backup.favoriteGroups,
     events,
     preferences: backup.preferences
   });

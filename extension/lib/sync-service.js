@@ -18,9 +18,14 @@ import {
 } from "./database.js";
 import {
   MAX_PROBE_CANDIDATES,
+  SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS,
   reconcileWorlds,
   selectProbeCandidates
 } from "./domain.js";
+import {
+  FavoriteGroupValidationError,
+  reconcileFavoriteGroups
+} from "./favorite-groups.js";
 import {
   calculateNextSyncAt,
   calculateRateLimitBackoff,
@@ -31,6 +36,8 @@ export const SYNC_ALARM_NAME = "sync-next";
 export const MANUAL_SYNC_COOLDOWN_MS = 5 * 60 * 1_000;
 export const SYNC_WATCHDOG_DELAY_MS = 10 * 60 * 1_000;
 export const NOTIFICATION_ID_PREFIX = "vrc-favworld-check-change-";
+export const SETTINGS_SCHEDULE_WARNING = "SCHEDULE_REPAIR_FAILED";
+export const NOTIFICATION_EVENT_KINDS = SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS;
 
 export const SETTING_KEYS = Object.freeze({
   autoSyncEnabled: "autoSyncEnabled",
@@ -41,8 +48,10 @@ export const SETTING_KEYS = Object.freeze({
   consecutiveRateLimits: "consecutiveRateLimits",
   activeProfileId: "activeProfileId",
   lastSyncResult: "lastSyncResult",
+  favoriteGroupStatus: "favoriteGroupStatus",
   lastAlarmError: "lastAlarmError",
-  watchdogUntil: "watchdogUntil"
+  watchdogUntil: "watchdogUntil",
+  purgePending: "purgePending"
 });
 
 /** @typedef {"manual" | "alarm" | "resume"} SyncTrigger */
@@ -53,17 +62,17 @@ export const SETTING_KEYS = Object.freeze({
  *   changes?: number
  * } | {
  *   ok: false,
- *   error: "AUTH_REQUIRED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "MANUAL_COOLDOWN" | "SYNC_CONFLICT" | "SYNC_FAILED" | "STORAGE_UNAVAILABLE",
+ *   error: "AUTH_REQUIRED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "MANUAL_COOLDOWN" | "SYNC_CONFLICT" | "SYNC_FAILED" | "STORAGE_UNAVAILABLE" | "MAINTENANCE_IN_PROGRESS",
  *   retryAt?: string
  * }} PublicSyncResult
  */
 
 /**
  * @typedef {Pick<import("./database.js").DatabaseRepository,
- *   "getProfile" | "listProfiles" | "listWorlds" | "listEvents" |
+ *   "getProfile" | "listProfiles" | "getProfileStats" |
  *   "getSyncSnapshot" | "getDataGeneration" | "getSetting" | "setSetting" |
  *   "setSettings" | "commitSync" | "recordSyncRun" | "claimEvents" |
- *   "updateNotificationResult">} Repository
+ *   "updateNotificationResult" | "getUnreadCount" | "markEventsRead">} Repository
  */
 
 /**
@@ -86,7 +95,7 @@ export const SETTING_KEYS = Object.freeze({
 export class SyncService {
   /** @type {Repository} */
   #repository;
-  /** @type {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} */
+  /** @type {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} */
   #api;
   /** @type {AlarmAdapter} */
   #alarms;
@@ -104,7 +113,7 @@ export class SyncService {
   /**
    * @param {{
    *   repository: Repository,
-   *   api?: Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">,
+   *   api?: Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">,
    *   alarms: AlarmAdapter,
    *   notifications: NotificationAdapter,
    *   clock?: () => number,
@@ -162,6 +171,9 @@ export class SyncService {
    *   activeProfileId: string | null,
    *   worldCount: number,
    *   eventCount: number,
+   *   pendingProbeCount: number,
+   *   unreadCount: number,
+   *   favoriteGroupStatus: "success" | "stale" | null,
    *   lastResult: string | null
    * }>}
    */
@@ -169,16 +181,19 @@ export class SyncService {
     const activeProfileId = await this.#repository.getSetting(SETTING_KEYS.activeProfileId);
     const nextSyncAt = await this.#repository.getSetting(SETTING_KEYS.nextSyncAt);
     const lastResult = await this.#repository.getSetting(SETTING_KEYS.lastSyncResult);
+    const favoriteGroupStatus = await this.#repository.getSetting(
+      SETTING_KEYS.favoriteGroupStatus
+    );
     const profileId = typeof activeProfileId === "string" ? activeProfileId : null;
     const profile = profileId === null
       ? null
       : await this.#repository.getProfile(profileId);
-    const worlds = profileId === null
-      ? []
-      : await this.#repository.listWorlds(profileId);
-    const events = profileId === null
-      ? []
-      : await this.#repository.listEvents(profileId);
+    const stats = profileId === null
+      ? { worldCount: 0, eventCount: 0, pendingProbeCount: 0 }
+      : await this.#repository.getProfileStats(profileId);
+    const unreadCount = profileId === null
+      ? 0
+      : await this.#repository.getUnreadCount(profileId);
 
     return {
       syncing: this.syncing,
@@ -188,14 +203,40 @@ export class SyncService {
         ? new Date(nextSyncAt).toISOString()
         : null,
       activeProfileId: profileId,
-      worldCount: worlds.length,
-      eventCount: events.length,
+      worldCount: stats.worldCount,
+      eventCount: stats.eventCount,
+      pendingProbeCount: stats.pendingProbeCount,
+      unreadCount,
+      favoriteGroupStatus:
+        favoriteGroupStatus === "success" || favoriteGroupStatus === "stale"
+          ? favoriteGroupStatus
+          : null,
       lastResult: typeof lastResult === "string" ? lastResult : null
     };
   }
 
   /**
+   * Mark the active profile's durable history as read. The caller never
+   * supplies a profile ID, so extension messages cannot target arbitrary DB
+   * keys.
+   *
+   * @returns {Promise<boolean>} false when no profile has been established
+   */
+  async markHistoryRead() {
+    const activeProfileId = await this.#repository.getSetting(SETTING_KEYS.activeProfileId);
+    if (typeof activeProfileId !== "string") {
+      return false;
+    }
+    await this.#repository.markEventsRead(activeProfileId);
+    return true;
+  }
+
+  /**
    * @param {{autoSyncEnabled: boolean, notificationsEnabled: boolean}} settings
+   * @returns {Promise<{
+   *   settingsSaved: true,
+   *   scheduleWarning: typeof SETTINGS_SCHEDULE_WARNING | null
+   * }>}
    */
   async updateSettings(settings) {
     if (
@@ -208,7 +249,19 @@ export class SyncService {
       [SETTING_KEYS.autoSyncEnabled]: settings.autoSyncEnabled,
       [SETTING_KEYS.notificationsEnabled]: settings.notificationsEnabled
     });
-    await this.repairSchedule();
+    try {
+      await this.repairSchedule();
+      return { settingsSaved: true, scheduleWarning: null };
+    } catch {
+      // The user settings above are already the durable source of truth.
+      // Alarm state is derived and can be repaired on the next lifecycle
+      // event, so report that secondary failure without misreporting the save.
+      await this.#recordAlarmFailureBestEffort();
+      return {
+        settingsSaved: true,
+        scheduleWarning: SETTINGS_SCHEDULE_WARNING
+      };
+    }
   }
 
   /**
@@ -247,10 +300,22 @@ export class SyncService {
    */
   async prepareAutomaticSync() {
     let enabledSetting;
+    let purgePending;
     try {
-      enabledSetting = await this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled);
+      [enabledSetting, purgePending] = await Promise.all([
+        this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled),
+        this.#repository.getSetting(SETTING_KEYS.purgePending)
+      ]);
     } catch {
       await this.#recordAlarmFailureBestEffort();
+      return false;
+    }
+    if (purgePending === true) {
+      try {
+        await this.#alarms.clear(SYNC_ALARM_NAME);
+      } catch {
+        // The durable guard still prevents every sync and database write.
+      }
       return false;
     }
     if (enabledSetting === undefined || enabledSetting === true) {
@@ -265,8 +330,16 @@ export class SyncService {
    * import. Existing future schedules are retained.
    */
   async repairSchedule() {
-    const enabledSetting = await this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled);
-    const enabled = enabledSetting === undefined ? true : enabledSetting === true;
+    const [enabledSetting, purgePending] = await Promise.all([
+      this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled),
+      this.#repository.getSetting(SETTING_KEYS.purgePending)
+    ]);
+    if (purgePending === true) {
+      await this.#alarms.clear(SYNC_ALARM_NAME);
+      return;
+    }
+    const enabled = purgePending !== true
+      && (enabledSetting === undefined ? true : enabledSetting === true);
     const storedNext = await this.#repository.getSetting(SETTING_KEYS.nextSyncAt);
     const storedWatchdog = await this.#repository.getSetting(SETTING_KEYS.watchdogUntil);
     const existing = await this.#alarms.get(SYNC_ALARM_NAME);
@@ -316,10 +389,22 @@ export class SyncService {
     }
 
     let enabledSetting;
+    let purgePending;
     try {
-      enabledSetting = await this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled);
+      [enabledSetting, purgePending] = await Promise.all([
+        this.#repository.getSetting(SETTING_KEYS.autoSyncEnabled),
+        this.#repository.getSetting(SETTING_KEYS.purgePending)
+      ]);
     } catch {
       await this.#recordAlarmFailureBestEffort();
+      return;
+    }
+    if (purgePending === true) {
+      try {
+        await this.#alarms.clear(SYNC_ALARM_NAME);
+      } catch {
+        return;
+      }
       return;
     }
     if (enabledSetting !== undefined && enabledSetting !== true) {
@@ -364,6 +449,9 @@ export class SyncService {
   /** @param {SyncTrigger} trigger @returns {Promise<PublicSyncResult>} */
   async #startNewSync(trigger) {
     try {
+      if (await this.#repository.getSetting(SETTING_KEYS.purgePending) === true) {
+        return { ok: false, error: "MAINTENANCE_IN_PROGRESS" };
+      }
       const now = this.#now();
       const backoffUntil = await this.#repository.getSetting(SETTING_KEYS.backoffUntil);
       if (isFutureTimestamp(backoffUntil, now)) {
@@ -423,10 +511,37 @@ export class SyncService {
       userId = user.id;
       const initialSnapshot = await this.#repository.getSyncSnapshot(user.id);
 
+      /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>>} */
+      let apiFavoriteGroups = [];
+      let groupSnapshotComplete = true;
+      try {
+        apiFavoriteGroups = await this.#api.listAllFavoriteGroups(user.id);
+      } catch (error) {
+        if (
+          error instanceof ApiSchemaError
+          || error instanceof PaginationError
+          || error instanceof ForbiddenError
+        ) {
+          groupSnapshotComplete = false;
+        } else {
+          throw error;
+        }
+      }
+
       const apiRelations = await this.#api.listAllFavoriteRelations();
       favoriteCount = apiRelations.length;
       const apiMetadata = await this.#api.listAllFavoriteWorlds();
       metadataCount = apiMetadata.length;
+      if (
+        groupSnapshotComplete
+        && !isFavoriteGroupSnapshotConsistent({
+          currentGroups: apiFavoriteGroups,
+          relations: apiRelations,
+          metadata: apiMetadata
+        })
+      ) {
+        groupSnapshotComplete = false;
+      }
       const favoriteRelations = apiRelations.map((relation) => ({
         worldId: relation.favoriteId,
         tags: relation.tags
@@ -473,6 +588,8 @@ export class SyncService {
         startedAt,
         observedAt,
         initialSnapshot,
+        apiFavoriteGroups,
+        groupSnapshotComplete,
         favoriteRelations,
         metadata,
         probes,
@@ -526,6 +643,8 @@ export class SyncService {
    *   startedAt: string,
    *   observedAt: string,
    *   initialSnapshot: Awaited<ReturnType<import("./database.js").DatabaseRepository["getSyncSnapshot"]>>,
+   *   apiFavoriteGroups: Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>>,
+   *   groupSnapshotComplete: boolean,
    *   favoriteRelations: Parameters<typeof reconcileWorlds>[0]["favoriteRelations"],
    *   metadata: Parameters<typeof reconcileWorlds>[0]["metadata"],
    *   probes: Parameters<typeof reconcileWorlds>[0]["probes"],
@@ -536,6 +655,7 @@ export class SyncService {
    */
   async #commitReconciledSnapshot(input) {
     let snapshot = input.initialSnapshot;
+    let groupSnapshotComplete = input.groupSnapshotComplete;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const plan = reconcileWorlds({
         userId: input.user.id,
@@ -547,6 +667,28 @@ export class SyncService {
         syncId: input.syncId,
         isBaseline: snapshot.profile === null
       });
+      let favoriteGroups = snapshot.favoriteGroups;
+      /** @type {"success" | "stale"} */
+      let favoriteGroupStatus = "stale";
+      if (groupSnapshotComplete) {
+        try {
+          favoriteGroups = reconcileFavoriteGroups({
+            userId: input.user.id,
+            previousGroups: snapshot.favoriteGroups,
+            currentGroups: input.apiFavoriteGroups,
+            observedAt: input.observedAt
+          });
+          favoriteGroupStatus = favoriteGroups.some((group) => group.missingCount === 1)
+            ? "stale"
+            : "success";
+        } catch (error) {
+          if (!(error instanceof FavoriteGroupValidationError)) {
+            throw error;
+          }
+          groupSnapshotComplete = false;
+          favoriteGroups = snapshot.favoriteGroups;
+        }
+      }
       const previousRevisions = new Map(
         snapshot.worlds.map((world) => [world.worldId, world.revision])
       );
@@ -562,6 +704,7 @@ export class SyncService {
           },
           worlds: plan.worlds,
           events: plan.events,
+          favoriteGroups,
           expectedWorldRevisions: plan.worlds.map((world) => ({
             userId: input.user.id,
             worldId: world.worldId,
@@ -572,7 +715,8 @@ export class SyncService {
             activeProfileId: input.user.id,
             backoffUntil: null,
             consecutiveRateLimits: 0,
-            lastSyncResult: "success"
+            lastSyncResult: "success",
+            favoriteGroupStatus
           },
           syncRun: {
             syncId: input.syncId,
@@ -678,7 +822,10 @@ export class SyncService {
       userId,
       claimedAt,
       undefined,
-      { expectedGeneration }
+      {
+        expectedGeneration,
+        allowedKinds: NOTIFICATION_EVENT_KINDS
+      }
     );
     if (claimed.length === 0) {
       return;
@@ -861,6 +1008,28 @@ export class SyncService {
     }
     return value;
   }
+}
+
+/**
+ * A syntactically valid, non-empty group response can still be truncated.
+ * Preserve the previous classification unless every group name referenced by
+ * the two complete world snapshots is present. Empty, unreferenced groups use
+ * the reconciler's two-snapshot missingCount confirmation instead.
+ *
+ * @param {{
+ *   currentGroups: Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>>,
+ *   relations: Awaited<ReturnType<VrchatApi["listAllFavoriteRelations"]>>,
+ *   metadata: Awaited<ReturnType<VrchatApi["listAllFavoriteWorlds"]>>
+ * }} input
+ */
+function isFavoriteGroupSnapshotConsistent(input) {
+  const currentNames = new Set(input.currentGroups.map((group) => group.name));
+  if (input.relations.some((relation) => (
+    relation.tags.some((tag) => !currentNames.has(tag))
+  ))) {
+    return false;
+  }
+  return !input.metadata.some((world) => !currentNames.has(world.favoriteGroup));
 }
 
 /** @param {unknown} error */

@@ -28,6 +28,8 @@ Creator Guidelines の「API Usage / Bots」が本製品に直接関係する。
 - [VRChat.community トップ](https://vrchat.community/)
 - [Login and/or Get Current User Info](https://vrchat.community/reference/get-current-user)
 - [List Favorites](https://vrchat.community/reference/get-favorites)
+- [List Favorite Groups](https://vrchat.community/reference/get-favorite-groups)
+- [FavoriteGroup schema](https://raw.githubusercontent.com/vrchatapi/specification/main/openapi/components/schemas/FavoriteGroup.yaml)
 - [List Favorited Worlds](https://vrchat.community/reference/get-favorited-worlds)
 - [Get World by ID](https://vrchat.community/reference/get-world)
 - [Websocket API / Pipeline](https://vrchat.community/websocket)
@@ -136,6 +138,7 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 | 目的 | Request | 資料上の認証・応答 | 本製品で使うフィールド |
 | --- | --- | --- | --- |
 | 既存セッション確認 | `GET /auth/user` | 有効な `auth` Cookie があれば current user、401 の記述あり | `id`, `displayName` のみ |
+| お気に入りリスト名 | `GET /favorite/groups?n=100&offset={n}&ownerId={本人ID}` | auth Cookie、200 array。type絞り込みparameterはない | `id`, `name`, `displayName`, `ownerId`, `type` |
 | お気に入り関係 ID | `GET /favorites?type=world&n=100&offset={n}` | auth Cookie、200 array、401。`n` は 1〜100、offset は 0 以上 | `favoriteId`, `tags`, `type` |
 | お気に入り world metadata | `GET /worlds/favorites?n=100&offset={n}&releaseStatus=all` | auth Cookie、200 array、401、403。`releaseStatus` は `all|hidden|private|public` | `id`, `name`, `authorName`, `favoriteGroup`, `releaseStatus` |
 | 消失候補の再確認 | `GET /worlds/{worldId}` | 200 world、404。未認証でも動くが一部 field が 0 との記述 | `id`, `name`, `authorName`, `releaseStatus` |
@@ -166,7 +169,15 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 この endpoint は名称と作者をまとめて取得するために使い、通常時の全件個別 GET を避ける。
 
-### 5.6 `/worlds/{worldId}`
+### 5.6 `/favorite/groups`
+
+現行コミュニティOpenAPIの `FavoriteGroup` は安定ID `id`、relationタグに対応する内部名 `name`、利用者が変更できる `displayName`、`ownerId`、`type` を持つ。`type` は world以外も返り得るため、全レコードを検証して本人所有を確認した後、`world` と `vrcPlusWorld` だけを採用する。VRC+用の内部名は現行資料上 `vrcPlusWorlds1`〜`vrcPlusWorlds4` である。
+
+本製品はリスト名表示のためだけに上記5フィールドを新しいobjectへコピーする。raw応答、ownerの表示名、説明、visibilityなどは保存しない。重複ID、重複内部名、owner不一致、未知typeはグループsnapshot不正として既存対応表を維持する。
+
+この補助endpointだけの403、schema不正、ページング不整合は、既存リスト名を保持したままワールド同期を続ける。401、429、network、5xx、redirectは共通の安全・負荷境界なので同期全体を中止する。
+
+### 5.7 `/worlds/{worldId}`
 
 非公式資料では、成功時に world object、見つからない場合に 404 を返す。world object は `id`、`name`、`authorName`、`releaseStatus` などを持つ。
 
@@ -179,6 +190,7 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 - 実際の rate limit の request 数、時間窓、account / IP / endpoint ごとの差。
 - `Retry-After` が常に返るか、単位や最大値が一定か。
 - `/favorites` と `/worlds/favorites` が同じ時点の原子的 snapshot を返すか。
+- `/favorite/groups` と2つのワールド一覧が同じ時点の原子的 snapshot を返すか。
 - pagination 中にお気に入りが更新された場合の重複・欠落挙動。
 - API が短い非空ページの後にもデータを返すか、および空ページ以外の明示的な終端表現。
 - private / deleted / moderation / access control の各場合に、2 endpoint と個別 GET がそれぞれ何を返すか。
@@ -262,13 +274,19 @@ Chrome 公式の [Migrate to a service worker: Keep the service worker alive](ht
 
 各 endpoint は最大 10,000 データ件、100 非空要求、その後の空終端確認 1 要求を上限とする。最大 101 要求で空 page を確認できない場合、同一非空 fingerprint が反復した場合、offset が停滞した場合は完全 snapshot とみなさない。
 
-### 7.10 通知を厳密な at-most-once にする
+### 7.10 リスト表示名を安定IDと分離する
+
+**推論**: `displayName` は利用者が自由に変更できるため、ワールド所属の正本やDB keyには使えない。`groupId`を安定key、`name`をrelationタグ対応、`displayName`を表示と履歴に使う。リスト名変更とワールド移動は別の変化として扱う。
+
+**限界**: endpointは非公式で部分的に利用不能になり得る。表示名だけが取得できない場合は前回値または内部名へfallbackし、主要な消失検知を止めない。
+
+### 7.11 通知を厳密な at-most-once にする
 
 **推論**: `chrome.notifications` の呼出しと IndexedDB 更新を同一 transaction にできないため、OS 通知の exactly-once は保証できない。重複通知を避けるため、通知 API の前に event の `notificationClaimedAt` を確定し、成功、明示的失敗、crash のすべてで claim を永久に維持する。成功時は `notifiedAt`、明示的失敗時は秘密を含まない固定 `notificationError` を記録できるが、どちらも再 attempt の条件にしない。
 
 **限界**: claim 後・通知表示前の crash や通知 API の明示的失敗では OS 通知が欠落し得る。履歴 event を正本として UI に残し、通知は補助経路と位置づける。
 
-### 7.11 redirect を追従しない
+### 7.12 redirect を追従しない
 
 **推論**: 非公式 endpoint が移動・侵害されたとき既存 Cookie 付き要求を別 URL へ自動追従させないため、全 fetch を `redirect: "manual"` に固定する。3xx または opaque redirect は同期失敗とし、移転先が同じ host でも自動追従しない。
 
@@ -334,7 +352,7 @@ error body の文言は不安定で機密を含む可能性があるため、UI 
 各リリース前に次を再確認する。
 
 - Creator Guidelines の更新日と「API Usage / Bots」の変更。
-- community OpenAPI の `/auth/user`、`/favorites`、`/worlds/favorites`、`/worlds/{id}` の差分。
+- community OpenAPI の `/auth/user`、`/favorite/groups`、`/favorites`、`/worlds/favorites`、`/worlds/{id}` の差分。
 - Chrome の Cookie / partitioning、DNR header modification、Manifest V3 Service Worker lifecycle の変更。
 - Edge の使用 API 対応状況。
 

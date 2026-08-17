@@ -103,6 +103,29 @@ test("initial baseline records favorites without emitting notifications", () => 
   assert.equal(result.worlds[1]?.probeState, PROBE_STATES.PENDING);
 });
 
+test("favorite metadata alone is retained as positive membership evidence", () => {
+  const result = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [],
+    favoriteRelations: [],
+    metadata: [{
+      worldId: "wrld_metadata_only",
+      name: "メタデータ側のお気に入り",
+      authorName: "作者",
+      favoriteTags: ["worlds1"],
+    }],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-metadata-only",
+    isBaseline: true,
+  });
+
+  assert.equal(result.worlds.length, 1);
+  assert.equal(result.worlds[0]?.membershipState, MEMBERSHIP_STATES.FAVORITED);
+  assert.equal(result.worlds[0]?.membershipMissCount, 0);
+  assert.deepEqual(result.worlds[0]?.favoriteTags, ["worlds1"]);
+});
+
 test("one missing snapshot is provisional and preserves known metadata", () => {
   const previous = makeWorld({worldId: "wrld_missing"});
   const result = reconcileWorlds({
@@ -125,6 +148,46 @@ test("one missing snapshot is provisional and preserves known metadata", () => {
   assert.equal(result.worlds[0]?.availabilityState, AVAILABILITY_STATES.ACCESSIBLE);
   assert.equal(result.worlds[0]?.probeState, PROBE_STATES.PENDING);
   assert.equal(result.worlds[0]?.revision, 1);
+});
+
+test("favorite metadata prevents a contradictory relation snapshot from advancing a miss", () => {
+  const previous = makeWorld({worldId: "wrld_endpoint_disagreement"});
+  const metadata = [{
+    worldId: previous.worldId,
+    name: "昔の名前",
+    authorName: "作者",
+    favoriteTags: ["worlds1"],
+  }];
+  const first = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [previous],
+    favoriteRelations: [],
+    metadata,
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-disagreement-1",
+    isBaseline: false,
+  });
+  const second = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: first.worlds,
+    favoriteRelations: [],
+    metadata,
+    probes: [],
+    observedAt: T2,
+    syncId: "sync-disagreement-2",
+    isBaseline: false,
+  });
+
+  assert.deepEqual(first.events, []);
+  assert.deepEqual(second.events, []);
+  assert.equal(second.worlds[0]?.membershipState, MEMBERSHIP_STATES.FAVORITED);
+  assert.equal(second.worlds[0]?.membershipMissCount, 0);
+  assert.deepEqual(selectProbeCandidates({
+    previousWorlds: second.worlds,
+    favoriteRelations: [],
+    metadata,
+  }), []);
 });
 
 test("two missing snapshots confirm removal exactly once", () => {
@@ -150,6 +213,7 @@ test("two missing snapshots confirm removal exactly once", () => {
   assert.equal(confirmed.worlds[0]?.membershipMissCount, 2);
   assert.equal(confirmed.events.length, 1);
   assert.equal(confirmed.events[0]?.kind, EVENT_KINDS.FAVORITE_MISSING_CONFIRMED);
+  assert.equal(confirmed.events[0]?.notificationEligible, true);
   assert.equal(
     confirmed.events[0]?.eventId,
     `${USER_ID}:wrld_missing:2:${EVENT_KINDS.FAVORITE_MISSING_CONFIRMED}`,
@@ -226,6 +290,7 @@ test("two consecutive 404 probes confirm unavailability exactly once", () => {
   });
   assert.equal(second.worlds[0]?.availabilityState, AVAILABILITY_STATES.UNAVAILABLE);
   assert.equal(second.events[0]?.kind, EVENT_KINDS.ACCESS_UNAVAILABLE_CONFIRMED);
+  assert.equal(second.events[0]?.notificationEligible, true);
   assert.equal(second.events[0]?.before, AVAILABILITY_STATES.UNAVAILABLE_ONCE);
   assert.equal(second.events[0]?.after, AVAILABILITY_STATES.UNAVAILABLE);
 
@@ -269,6 +334,7 @@ test("a trimmed name change emits one revision-backed event", () => {
     before: "昔の名前",
     after: "新しい名前",
   }]);
+  assert.equal(changed.events[0]?.notificationEligible, true);
   assert.equal(
     changed.events[0]?.eventId,
     `${USER_ID}:wrld_rename:5:${EVENT_KINDS.NAME_CHANGED}`,
@@ -286,6 +352,149 @@ test("a trimmed name change emits one revision-backed event", () => {
   });
   assert.deepEqual(replay.events, []);
   assert.equal(replay.worlds[0]?.revision, 5);
+});
+
+test("a favorite-list move emits one canonical revision-backed event", () => {
+  const previous = makeWorld({
+    worldId: "wrld_group_move",
+    favoriteTags: ["worlds1"],
+    revision: 6,
+  });
+  const changed = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [previous],
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds3", "worlds2"]}],
+    metadata: [{
+      worldId: previous.worldId,
+      name: "昔の名前",
+      authorName: "作者",
+      favoriteTags: ["worlds2"],
+    }],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-group-move",
+    isBaseline: false,
+  });
+
+  assert.deepEqual(changed.worlds[0]?.favoriteTags, ["worlds2", "worlds3"]);
+  assert.equal(changed.worlds[0]?.revision, 7);
+  assert.deepEqual(changed.events.map(({kind, before, after}) => ({kind, before, after})), [{
+    kind: EVENT_KINDS.FAVORITE_GROUP_CHANGED,
+    before: JSON.stringify(["worlds1"]),
+    after: JSON.stringify(["worlds2", "worlds3"]),
+  }]);
+  assert.equal(changed.events[0]?.notificationEligible, false);
+  assert.equal(
+    changed.events[0]?.eventId,
+    `${USER_ID}:wrld_group_move:7:${EVENT_KINDS.FAVORITE_GROUP_CHANGED}`,
+  );
+
+  const replay = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: changed.worlds,
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds2", "worlds3"]}],
+    metadata: [{
+      worldId: previous.worldId,
+      name: "昔の名前",
+      authorName: "作者",
+      favoriteTags: ["worlds3"],
+    }],
+    probes: [],
+    observedAt: T2,
+    syncId: "sync-group-move-replay",
+    isBaseline: false,
+  });
+  assert.deepEqual(replay.events, []);
+  assert.equal(replay.worlds[0]?.revision, 7);
+});
+
+test("baseline tag changes update revision without emitting a group event", () => {
+  const previous = makeWorld({worldId: "wrld_baseline_group"});
+  const result = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [previous],
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds2"]}],
+    metadata: [],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-baseline-group",
+    isBaseline: true,
+  });
+
+  assert.deepEqual(result.events, []);
+  assert.deepEqual(result.worlds[0]?.favoriteTags, ["worlds2"]);
+  assert.equal(result.worlds[0]?.revision, 1);
+});
+
+test("conflicting group snapshots wait for agreement before emitting one event", () => {
+  const previous = makeWorld({
+    worldId: "wrld_group_snapshot_race",
+    favoriteTags: ["worlds1"],
+    revision: 3,
+  });
+  const conflicted = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [previous],
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds2"]}],
+    metadata: [{
+      worldId: previous.worldId,
+      name: "昔の名前",
+      authorName: "作者",
+      favoriteTags: ["worlds1"],
+    }],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-group-conflict",
+    isBaseline: false,
+  });
+
+  assert.deepEqual(conflicted.events, []);
+  assert.deepEqual(conflicted.worlds[0]?.favoriteTags, ["worlds1"]);
+  assert.equal(conflicted.worlds[0]?.revision, 3);
+
+  const agreed = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: conflicted.worlds,
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds2"]}],
+    metadata: [{
+      worldId: previous.worldId,
+      name: "昔の名前",
+      authorName: "作者",
+      favoriteTags: ["worlds2"],
+    }],
+    probes: [],
+    observedAt: T2,
+    syncId: "sync-group-agreed",
+    isBaseline: false,
+  });
+  assert.deepEqual(agreed.events.map((event) => event.kind), [
+    EVENT_KINDS.FAVORITE_GROUP_CHANGED,
+  ]);
+  assert.equal(agreed.events[0]?.before, JSON.stringify(["worlds1"]));
+  assert.equal(agreed.events[0]?.after, JSON.stringify(["worlds2"]));
+  assert.equal(agreed.worlds[0]?.revision, 4);
+});
+
+test("canonicalizing stored favorite tags advances revision without a false event", () => {
+  const previous = makeWorld({
+    worldId: "wrld_noncanonical_tags",
+    favoriteTags: ["worlds2", "worlds1", "worlds1"],
+    revision: 4,
+  });
+  const result = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [previous],
+    favoriteRelations: [{worldId: previous.worldId, tags: ["worlds1", "worlds2"]}],
+    metadata: [],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-canonicalize-tags",
+    isBaseline: false,
+  });
+
+  assert.deepEqual(result.events, []);
+  assert.deepEqual(result.worlds[0]?.favoriteTags, ["worlds1", "worlds2"]);
+  assert.equal(result.worlds[0]?.revision, 5);
 });
 
 test("favorite and access restoration are independent events", () => {
@@ -321,12 +530,19 @@ test("favorite and access restoration are independent events", () => {
   assert.equal(result.worlds[0]?.membershipState, MEMBERSHIP_STATES.FAVORITED);
   assert.equal(result.worlds[0]?.availabilityState, AVAILABILITY_STATES.ACCESSIBLE);
   assert.deepEqual(result.events.map((event) => event.kind), [
+    EVENT_KINDS.FAVORITE_GROUP_CHANGED,
     EVENT_KINDS.FAVORITE_RESTORED,
     EVENT_KINDS.ACCESS_RESTORED,
   ]);
+  assert.deepEqual(result.events.map((event) => event.notificationEligible), [
+    false,
+    true,
+    true,
+  ]);
   assert.deepEqual(result.events.map((event) => event.eventId), [
-    `${USER_ID}:wrld_restored:10:${EVENT_KINDS.FAVORITE_RESTORED}`,
-    `${USER_ID}:wrld_restored:11:${EVENT_KINDS.ACCESS_RESTORED}`,
+    `${USER_ID}:wrld_restored:10:${EVENT_KINDS.FAVORITE_GROUP_CHANGED}`,
+    `${USER_ID}:wrld_restored:11:${EVENT_KINDS.FAVORITE_RESTORED}`,
+    `${USER_ID}:wrld_restored:12:${EVENT_KINDS.ACCESS_RESTORED}`,
   ]);
 });
 
@@ -380,6 +596,13 @@ test("probe selection respects priority, fairness, caller limit, and hard limit"
     }),
     makeWorld({worldId: "wrld_first_missing"}),
     makeWorld({
+      worldId: "wrld_unavailable_once",
+      availabilityState: AVAILABILITY_STATES.UNAVAILABLE_ONCE,
+      unavailableCount: 1,
+      probeState: PROBE_STATES.NONE,
+      lastProbeAt: T1,
+    }),
+    makeWorld({
       worldId: "wrld_second_check",
       membershipState: MEMBERSHIP_STATES.MISSING_ONCE,
       membershipMissCount: 1,
@@ -392,11 +615,11 @@ test("probe selection respects priority, fairness, caller limit, and hard limit"
     limit: 5,
   });
   assert.deepEqual(selected, [
+    "wrld_unavailable_once",
     "wrld_pending_never_a",
     "wrld_pending_never_b",
     "wrld_pending_newer",
     "wrld_no_metadata",
-    "wrld_first_missing",
   ]);
 
   const manyRelations = Array.from({length: MAX_PROBE_CANDIDATES + 5}, (_, index) => ({
@@ -412,6 +635,108 @@ test("probe selection respects priority, fairness, caller limit, and hard limit"
   assert.equal(capped.length, MAX_PROBE_CANDIDATES);
   assert.equal(capped[0], "wrld_00");
   assert.equal(capped.at(-1), "wrld_19");
+});
+
+test("bulk-recovered unavailable worlds do not consume individual probe slots", () => {
+  const recovered = Array.from({length: MAX_PROBE_CANDIDATES}, (_, index) => makeWorld({
+    worldId: `wrld_recovered_${String(index).padStart(2, "0")}`,
+    availabilityState: AVAILABILITY_STATES.UNAVAILABLE_ONCE,
+    unavailableCount: 1,
+    probeState: PROBE_STATES.PENDING,
+    lastProbeAt: T0,
+  }));
+  const unknown = makeWorld({
+    worldId: "wrld_needs_probe",
+    probeState: PROBE_STATES.PENDING,
+  });
+  const selected = selectProbeCandidates({
+    previousWorlds: [...recovered, unknown],
+    favoriteRelations: [...recovered, unknown].map((world) => ({
+      worldId: world.worldId,
+      tags: ["worlds1"],
+    })),
+    metadata: recovered.map((world) => ({
+      worldId: world.worldId,
+      name: "復旧済み",
+      authorName: "作者",
+      favoriteTags: ["worlds1"],
+    })),
+  });
+  assert.deepEqual(selected, [unknown.worldId]);
+
+  const reconciled = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: [recovered[0] ?? makeWorld()],
+    favoriteRelations: [{worldId: recovered[0]?.worldId ?? "", tags: ["worlds1"]}],
+    metadata: [{
+      worldId: recovered[0]?.worldId ?? "",
+      name: "復旧済み",
+      authorName: "作者",
+      favoriteTags: ["worlds1"],
+    }],
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-bulk-recovered",
+    isBaseline: false,
+  });
+  assert.equal(reconciled.worlds[0]?.availabilityState, AVAILABILITY_STATES.ACCESSIBLE);
+  assert.equal(reconciled.worlds[0]?.probeState, PROBE_STATES.NONE);
+});
+
+test("800 favorites detect first, middle, and last removals after two snapshots", () => {
+  const removedIndexes = new Set([0, 399, 799]);
+  const previousWorlds = Array.from({length: 800}, (_, index) => makeWorld({
+    worldId: `wrld_scale_${String(index).padStart(3, "0")}`,
+    currentName: `ワールド ${index}`,
+    normalizedName: `ワールド ${index}`,
+  }));
+  const favoriteRelations = previousWorlds
+    .filter((_, index) => !removedIndexes.has(index))
+    .map((world) => ({worldId: world.worldId, tags: ["worlds1"]}));
+  const metadata = favoriteRelations.map((relation) => ({
+    worldId: relation.worldId,
+    name: previousWorlds.find((world) => world.worldId === relation.worldId)?.currentName ?? "",
+    authorName: "作者",
+    favoriteTags: ["worlds1"],
+  }));
+
+  const first = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds,
+    favoriteRelations,
+    metadata,
+    probes: [],
+    observedAt: T1,
+    syncId: "sync-scale-first",
+    isBaseline: false,
+  });
+  assert.equal(first.worlds.length, 800);
+  assert.deepEqual(first.events, []);
+  for (const index of removedIndexes) {
+    const world = first.worlds.find((candidate) => (
+      candidate.worldId === previousWorlds[index]?.worldId
+    ));
+    assert.equal(world?.membershipState, MEMBERSHIP_STATES.MISSING_ONCE);
+  }
+
+  const second = reconcileWorlds({
+    userId: USER_ID,
+    previousWorlds: first.worlds,
+    favoriteRelations,
+    metadata,
+    probes: [],
+    observedAt: T2,
+    syncId: "sync-scale-second",
+    isBaseline: false,
+  });
+  assert.equal(second.worlds.length, 800);
+  assert.deepEqual(
+    second.events.map((event) => event.worldId),
+    ["wrld_scale_000", "wrld_scale_399", "wrld_scale_799"],
+  );
+  assert.ok(second.events.every(
+    (event) => event.kind === EVENT_KINDS.FAVORITE_MISSING_CONFIRMED,
+  ));
 });
 
 test("rejects a missing or non-VRChat user ID at the domain boundary", () => {

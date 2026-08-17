@@ -1,9 +1,25 @@
 // @ts-check
 
+import {
+  EVENT_KIND_ORDER,
+  isSchemaV2NotificationEligibleEventKind
+} from "./domain.js";
+
 export const DATABASE_NAME = "vrc-favworld-check";
-export const DATABASE_VERSION = 1;
+export const DATABASE_VERSION = 2;
+export const SYNC_RUN_RETENTION_PER_PROFILE = 100;
+export const SYNC_RUN_RETENTION_ANONYMOUS = 20;
+export const ANONYMOUS_RETENTION_OWNER = "__anonymous__";
 
 const DATA_GENERATION_PREFIX = "dataGeneration:";
+const UNREAD_COUNT_PREFIX = "unreadCount:";
+const EVENT_KIND_SET = new Set(EVENT_KIND_ORDER);
+const NOTIFICATION_ERROR_SET = /** @type {ReadonlySet<unknown>} */ (new Set([
+  "api_rejected",
+  "permission_denied",
+  "unavailable",
+  null
+]));
 const BACKUP_PREFERENCE_KEYS = Object.freeze([
   "autoSyncEnabled",
   "notificationsEnabled"
@@ -17,7 +33,10 @@ const ALLOWED_SETTING_KEYS = new Set([
   "activeProfileId",
   "lastSyncResult",
   "lastAlarmError",
-  "watchdogUntil"
+  "watchdogUntil",
+  "lastBackupAt",
+  "purgePending",
+  "favoriteGroupStatus"
 ]);
 
 export class GenerationConflictError extends Error {
@@ -45,9 +64,17 @@ export class RevisionConflictError extends Error {
   }
 }
 
+export class PurgePendingError extends Error {
+  constructor() {
+    super("Database writes are disabled while permanent data removal is pending");
+    this.name = "PurgePendingError";
+  }
+}
+
 export const STORES = Object.freeze({
   profiles: "profiles",
   worlds: "worlds",
+  favoriteGroups: "favoriteGroups",
   events: "events",
   syncRuns: "syncRuns",
   settings: "settings",
@@ -60,12 +87,15 @@ const INDEXES = Object.freeze({
   worldsByMembership: "by-user-membership",
   worldsByAvailability: "by-user-availability",
   worldsByProbe: "by-user-probe",
+  favoriteGroupsByUser: "by-user",
+  favoriteGroupsByInternalName: "by-user-internal-name",
   eventsByUser: "by-user",
   eventsByObserved: "by-user-observed-at",
   eventsByKind: "by-user-kind-observed-at",
   eventsByWorld: "by-user-world-observed-at",
   syncRunsByUser: "by-user",
-  syncRunsByStarted: "by-user-started-at"
+  syncRunsByStarted: "by-user-started-at",
+  syncRunsByRetention: "by-retention-owner-started-at"
 });
 
 /**
@@ -101,6 +131,28 @@ const INDEXES = Object.freeze({
  */
 
 /**
+ * @typedef {object} FavoriteGroupNameHistoryEntry
+ * @property {string} displayName
+ * @property {string} observedAt
+ */
+
+/**
+ * @typedef {object} FavoriteGroupRecord
+ * @property {string} userId
+ * @property {string} groupId
+ * @property {string} internalName
+ * @property {string} displayName
+ * @property {string} normalizedDisplayName
+ * @property {"world" | "vrcPlusWorld"} type
+ * @property {boolean} active
+ * @property {0 | 1 | 2} missingCount
+ * @property {string} firstSeenAt
+ * @property {string} lastSeenAt
+ * @property {FavoriteGroupNameHistoryEntry[]} displayNameHistory
+ * @property {string} updatedAt
+ */
+
+/**
  * @typedef {object} EventEvidence
  * @property {"bulk" | "probe"} source
  * @property {200 | 404 | null} httpStatus
@@ -111,12 +163,13 @@ const INDEXES = Object.freeze({
  * @property {string} eventId
  * @property {string} userId
  * @property {string} worldId
- * @property {"name_changed" | "favorite_missing_confirmed" | "favorite_restored" | "access_unavailable_confirmed" | "access_restored"} kind
+ * @property {"name_changed" | "favorite_group_changed" | "favorite_missing_confirmed" | "favorite_restored" | "access_unavailable_confirmed" | "access_restored"} kind
  * @property {string} observedAt
  * @property {string} before
  * @property {string} after
  * @property {EventEvidence} evidence
  * @property {string} syncId
+ * @property {boolean} notificationEligible
  * @property {string | null} notificationClaimedAt
  * @property {string | null} notifiedAt
  * @property {"api_rejected" | "permission_denied" | "unavailable" | null} notificationError
@@ -135,12 +188,14 @@ const INDEXES = Object.freeze({
  * @property {number} probeCount
  * @property {number} changeCount
  * @property {string | null} retryAt
+ * @property {string} [retentionOwner] Repository-derived field present on stored v2 records
  */
 
 /**
  * @typedef {object} SyncCommit
  * @property {ProfileRecord} profile
  * @property {readonly WorldRecord[]} worlds
+ * @property {readonly FavoriteGroupRecord[]} favoriteGroups
  * @property {readonly HistoryEvent[]} events
  * @property {SyncRunRecord} syncRun
  * @property {readonly ExpectedWorldRevision[]} expectedWorldRevisions
@@ -154,6 +209,7 @@ const INDEXES = Object.freeze({
  * @property {null} backoffUntil
  * @property {0} consecutiveRateLimits
  * @property {"success"} lastSyncResult
+ * @property {"success" | "stale"} favoriteGroupStatus
  */
 
 /**
@@ -167,6 +223,7 @@ const INDEXES = Object.freeze({
  * @typedef {object} ProfileReplacement
  * @property {ProfileRecord} profile
  * @property {readonly WorldRecord[]} worlds
+ * @property {readonly FavoriteGroupRecord[]} favoriteGroups
  * @property {readonly HistoryEvent[]} events
  * @property {Readonly<Record<string, boolean>>} [preferences]
  */
@@ -177,6 +234,7 @@ const INDEXES = Object.freeze({
  * @typedef {object} SyncSnapshot
  * @property {ProfileRecord | null} profile
  * @property {WorldRecord[]} worlds
+ * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {number} generation
  */
 
@@ -184,6 +242,7 @@ const INDEXES = Object.freeze({
  * @typedef {object} BackupSnapshot
  * @property {ProfileRecord | null} profile
  * @property {WorldRecord[]} worlds
+ * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {HistoryEvent[]} events
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
  */
@@ -237,7 +296,7 @@ async function abortAndThrow(transaction, error, finished) {
   try {
     transaction.abort();
   } catch (abortError) {
-    if (!(abortError instanceof DOMException && abortError.name === "InvalidStateError")) {
+    if (!hasErrorName(abortError, "InvalidStateError")) {
       throw new AggregateError([error, abortError], "IndexedDB transaction cleanup failed", {
         cause: abortError
       });
@@ -246,13 +305,25 @@ async function abortAndThrow(transaction, error, finished) {
   try {
     await finished;
   } catch (transactionError) {
-    if (!(transactionError instanceof DOMException && transactionError.name === "AbortError")) {
+    if (!hasErrorName(transactionError, "AbortError")) {
       throw new AggregateError([error, transactionError], "IndexedDB transaction aborted", {
         cause: transactionError
       });
     }
   }
   throw error;
+}
+
+/**
+ * IndexedDB errors may originate in another realm, so `instanceof
+ * DOMException` is not a reliable discriminator.
+ *
+ * @param {unknown} error
+ * @param {string} name
+ * @returns {boolean}
+ */
+function hasErrorName(error, name) {
+  return typeof error === "object" && error !== null && "name" in error && error.name === name;
 }
 
 /**
@@ -294,6 +365,14 @@ function generationKey(userId) {
 }
 
 /**
+ * @param {string} userId
+ * @returns {string}
+ */
+function unreadCountKey(userId) {
+  return `${UNREAD_COUNT_PREFIX}${userId}`;
+}
+
+/**
  * @param {unknown} stored
  * @param {string} userId
  * @returns {number}
@@ -307,6 +386,34 @@ function generationValue(stored, userId) {
     throw new Error(`Stored data generation is invalid: ${userId}`);
   }
   return value;
+}
+
+/**
+ * @param {unknown} stored
+ * @param {string} userId
+ * @returns {number}
+ */
+function unreadCountValue(stored, userId) {
+  if (stored === undefined) {
+    return 0;
+  }
+  const value = (/** @type {StoredValue} */ (stored)).value;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Stored unread event count is invalid: ${userId}`);
+  }
+  return value;
+}
+
+/**
+ * @param {unknown} stored
+ */
+function requireWritesAllowed(stored) {
+  if (
+    stored !== undefined &&
+    (/** @type {StoredValue} */ (stored)).value !== false
+  ) {
+    throw new PurgePendingError();
+  }
 }
 
 /**
@@ -354,7 +461,8 @@ function validateSuccessSettings(settings, userId) {
     "activeProfileId",
     "backoffUntil",
     "consecutiveRateLimits",
-    "lastSyncResult"
+    "lastSyncResult",
+    "favoriteGroupStatus"
   ];
   if (keys.length !== required.length || required.some((key) => !Object.hasOwn(settings, key))) {
     throw new Error("Successful sync settings must contain every required key only");
@@ -363,10 +471,129 @@ function validateSuccessSettings(settings, userId) {
     settings.activeProfileId !== userId ||
     settings.backoffUntil !== null ||
     settings.consecutiveRateLimits !== 0 ||
-    settings.lastSyncResult !== "success"
+    settings.lastSyncResult !== "success" ||
+    (settings.favoriteGroupStatus !== "success" && settings.favoriteGroupStatus !== "stale")
   ) {
     throw new Error("Successful sync settings are inconsistent with the committed profile");
   }
+}
+
+/**
+ * @param {readonly FavoriteGroupRecord[]} groups
+ * @param {string} userId
+ */
+function validateFavoriteGroupPlan(groups, userId) {
+  if (!Array.isArray(groups)) {
+    throw new Error("favoriteGroups is required for every sync or replacement");
+  }
+  const groupIds = new Set();
+  const activeInternalNames = new Set();
+  for (const group of groups) {
+    if (group.userId !== userId) {
+      throw new Error(`Favorite group belongs to another profile: ${group.groupId}`);
+    }
+    if (groupIds.has(group.groupId)) {
+      throw new Error(`Duplicate favorite group: ${group.groupId}`);
+    }
+    groupIds.add(group.groupId);
+    if (
+      (group.active && group.missingCount !== 0 && group.missingCount !== 1) ||
+      (!group.active && group.missingCount !== 2)
+    ) {
+      throw new Error(`Favorite group missing count is inconsistent: ${group.groupId}`);
+    }
+    if (group.active) {
+      if (activeInternalNames.has(group.internalName)) {
+        throw new Error(`Duplicate active favorite group name: ${group.internalName}`);
+      }
+      activeInternalNames.add(group.internalName);
+    }
+  }
+}
+
+/**
+ * Notification eligibility is immutable event evidence, not a live policy
+ * lookup. Keeping the kind-to-boolean mapping strict prevents a future
+ * outbox allowlist expansion from notifying historical suppressed events.
+ *
+ * @param {readonly HistoryEvent[]} events
+ */
+function validateEventPlan(events) {
+  for (const event of events) {
+    if (!EVENT_KIND_SET.has(event.kind)) {
+      throw new Error(`Unknown event kind: ${event.eventId}`);
+    }
+    const expectedEligibility = isSchemaV2NotificationEligibleEventKind(event.kind);
+    if (
+      typeof event.notificationEligible !== "boolean"
+      || event.notificationEligible !== expectedEligibility
+    ) {
+      throw new Error(`Event notification eligibility is inconsistent: ${event.eventId}`);
+    }
+    if (
+      !event.notificationEligible
+      && (
+        event.notificationClaimedAt !== null
+        || event.notifiedAt !== null
+        || event.notificationError !== null
+      )
+    ) {
+      throw new Error(`Suppressed event has notification delivery state: ${event.eventId}`);
+    }
+  }
+}
+
+/**
+ * @param {SyncRunRecord} syncRun
+ */
+function validateSyncRun(syncRun) {
+  if (
+    typeof syncRun.syncId !== "string" ||
+    syncRun.syncId.length === 0 ||
+    (syncRun.userId !== null &&
+      (typeof syncRun.userId !== "string" || syncRun.userId.length === 0)) ||
+    !isCanonicalUtcTimestamp(syncRun.startedAt) ||
+    !isCanonicalUtcTimestamp(syncRun.finishedAt) ||
+    syncRun.finishedAt < syncRun.startedAt
+  ) {
+    throw new Error("Sync run identity and retention fields are invalid");
+  }
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+function isCanonicalUtcTimestamp(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+/**
+ * Notification delivery fields may legitimately differ when an idempotent
+ * sync plan is replayed. Every immutable event field must still match.
+ *
+ * @param {HistoryEvent} left
+ * @param {HistoryEvent} right
+ * @returns {boolean}
+ */
+function sameEventPayload(left, right) {
+  return (
+    left.eventId === right.eventId &&
+    left.userId === right.userId &&
+    left.worldId === right.worldId &&
+    left.kind === right.kind &&
+    left.observedAt === right.observedAt &&
+    left.before === right.before &&
+    left.after === right.after &&
+    left.evidence.source === right.evidence.source &&
+    left.evidence.httpStatus === right.evidence.httpStatus &&
+    left.syncId === right.syncId &&
+    left.notificationEligible === right.notificationEligible
+  );
 }
 
 /**
@@ -406,6 +633,58 @@ function deleteByIndex(index, query) {
 }
 
 /**
+ * @param {SyncRunRecord} syncRun
+ * @returns {string}
+ */
+function retentionOwnerFor(syncRun) {
+  return syncRun.userId ?? ANONYMOUS_RETENTION_OWNER;
+}
+
+/**
+ * Insert one diagnostic and delete the oldest excess records for the same
+ * retention owner before the caller's transaction commits.
+ *
+ * @param {IDBObjectStore} store
+ * @param {SyncRunRecord} syncRun
+ * @returns {Promise<void>}
+ */
+function putSyncRunAndPrune(store, syncRun) {
+  validateSyncRun(syncRun);
+  const retentionOwner = retentionOwnerFor(syncRun);
+  const limit = retentionOwner === ANONYMOUS_RETENTION_OWNER
+    ? SYNC_RUN_RETENTION_ANONYMOUS
+    : SYNC_RUN_RETENTION_PER_PROFILE;
+  store.put({ ...syncRun, retentionOwner });
+
+  return new Promise((resolve, reject) => {
+    /** @type {IDBValidKey[]} */
+    const retainedKeys = [];
+    const request = store.index(INDEXES.syncRunsByRetention).openCursor();
+    request.addEventListener("error", () => {
+      reject(request.error ?? new Error("IndexedDB retention cursor failed"));
+    }, { once: true });
+    request.addEventListener("success", () => {
+      const cursor = request.result;
+      if (cursor === null) {
+        resolve();
+        return;
+      }
+      const record = /** @type {SyncRunRecord} */ (cursor.value);
+      if (record.retentionOwner === retentionOwner) {
+        retainedKeys.push(cursor.primaryKey);
+        if (retainedKeys.length > limit) {
+          const oldest = retainedKeys.shift();
+          if (oldest !== undefined) {
+            store.delete(oldest);
+          }
+        }
+      }
+      cursor.continue();
+    });
+  });
+}
+
+/**
  * @param {IDBDatabase} database
  */
 function installSchema(database) {
@@ -427,6 +706,16 @@ function installSchema(database) {
     unique: false
   });
 
+  const favoriteGroups = database.createObjectStore(STORES.favoriteGroups, {
+    keyPath: ["userId", "groupId"]
+  });
+  favoriteGroups.createIndex(INDEXES.favoriteGroupsByUser, "userId", { unique: false });
+  favoriteGroups.createIndex(
+    INDEXES.favoriteGroupsByInternalName,
+    ["userId", "internalName"],
+    { unique: false }
+  );
+
   const events = database.createObjectStore(STORES.events, { keyPath: "eventId" });
   events.createIndex(INDEXES.eventsByUser, "userId", { unique: false });
   events.createIndex(INDEXES.eventsByObserved, ["userId", "observedAt"], { unique: false });
@@ -440,9 +729,67 @@ function installSchema(database) {
   const syncRuns = database.createObjectStore(STORES.syncRuns, { keyPath: "syncId" });
   syncRuns.createIndex(INDEXES.syncRunsByUser, "userId", { unique: false });
   syncRuns.createIndex(INDEXES.syncRunsByStarted, ["userId", "startedAt"], { unique: false });
+  syncRuns.createIndex(
+    INDEXES.syncRunsByRetention,
+    ["retentionOwner", "startedAt", "syncId"],
+    { unique: false }
+  );
 
   database.createObjectStore(STORES.settings, { keyPath: "key" });
   database.createObjectStore(STORES.meta, { keyPath: "key" });
+}
+
+/**
+ * Upgrade an existing v1 database in place. The upgrade transaction owns all
+ * writes, so a cursor failure aborts both the new schema and record backfill.
+ *
+ * @param {IDBDatabase} database
+ * @param {IDBTransaction} transaction
+ */
+function migrateV1ToV2(database, transaction) {
+  const favoriteGroups = database.createObjectStore(STORES.favoriteGroups, {
+    keyPath: ["userId", "groupId"]
+  });
+  favoriteGroups.createIndex(INDEXES.favoriteGroupsByUser, "userId", { unique: false });
+  favoriteGroups.createIndex(
+    INDEXES.favoriteGroupsByInternalName,
+    ["userId", "internalName"],
+    { unique: false }
+  );
+
+  const syncRuns = transaction.objectStore(STORES.syncRuns);
+  syncRuns.createIndex(
+    INDEXES.syncRunsByRetention,
+    ["retentionOwner", "startedAt", "syncId"],
+    { unique: false }
+  );
+  const request = syncRuns.openCursor();
+  request.addEventListener("error", () => {
+    transaction.abort();
+  }, { once: true });
+  request.addEventListener("success", () => {
+    const cursor = request.result;
+    if (cursor === null) {
+      return;
+    }
+    const existing = /** @type {SyncRunRecord} */ (cursor.value);
+    cursor.update({ ...existing, retentionOwner: retentionOwnerFor(existing) });
+    cursor.continue();
+  });
+
+  const eventRequest = transaction.objectStore(STORES.events).openCursor();
+  eventRequest.addEventListener("error", () => {
+    transaction.abort();
+  }, { once: true });
+  eventRequest.addEventListener("success", () => {
+    const cursor = eventRequest.result;
+    if (cursor === null) {
+      return;
+    }
+    const existing = /** @type {Omit<HistoryEvent, "notificationEligible">} */ (cursor.value);
+    cursor.update({ ...existing, notificationEligible: true });
+    cursor.continue();
+  });
 }
 
 /**
@@ -479,21 +826,28 @@ export class DatabaseRepository {
 
     const request = this.#factory.open(this.#name, DATABASE_VERSION);
     request.addEventListener("upgradeneeded", (event) => {
-      if ((/** @type {IDBVersionChangeEvent} */ (event)).oldVersion === 0) {
-        installSchema(request.result);
-        request.transaction?.objectStore(STORES.meta).put({
-          key: "schemaVersion",
-          value: DATABASE_VERSION
-        });
-        request.transaction?.objectStore(STORES.meta).put({
-          key: "backupFormatVersion",
-          value: 1
-        });
-        request.transaction?.objectStore(STORES.meta).put({
-          key: "lastMigration",
-          value: DATABASE_VERSION
-        });
+      const oldVersion = (/** @type {IDBVersionChangeEvent} */ (event)).oldVersion;
+      const transaction = request.transaction;
+      if (transaction === null) {
+        throw new Error("IndexedDB upgrade transaction is unavailable");
       }
+      if (oldVersion === 0) {
+        installSchema(request.result);
+      } else if (oldVersion === 1) {
+        migrateV1ToV2(request.result, transaction);
+      }
+      transaction.objectStore(STORES.meta).put({
+        key: "schemaVersion",
+        value: DATABASE_VERSION
+      });
+      transaction.objectStore(STORES.meta).put({
+        key: "backupFormatVersion",
+        value: 2
+      });
+      transaction.objectStore(STORES.meta).put({
+        key: "lastMigration",
+        value: DATABASE_VERSION
+      });
     });
 
     const database = await requestResult(request);
@@ -538,10 +892,10 @@ export class DatabaseRepository {
    */
   async getSyncSnapshot(userId) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.worlds, STORES.meta],
+      [STORES.profiles, STORES.worlds, STORES.favoriteGroups, STORES.meta],
       "readonly"
     );
-    const [profileValue, worldValues, generationRecord] = await completeRead(
+    const [profileValue, worldValues, favoriteGroupValues, generationRecord] = await completeRead(
       transaction,
       Promise.all([
         getValue(transaction.objectStore(STORES.profiles), userId),
@@ -549,15 +903,22 @@ export class DatabaseRepository {
           transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
           userId
         ),
+        getAllValues(
+          transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
+          userId
+        ),
         getValue(transaction.objectStore(STORES.meta), generationKey(userId))
       ])
     );
     const worlds = /** @type {WorldRecord[]} */ (worldValues);
     worlds.sort((left, right) => left.worldId.localeCompare(right.worldId));
+    const favoriteGroups = /** @type {FavoriteGroupRecord[]} */ (favoriteGroupValues);
+    favoriteGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
     return {
       profile:
         profileValue === undefined ? null : /** @type {ProfileRecord} */ (profileValue),
       worlds,
+      favoriteGroups,
       generation: generationValue(generationRecord, userId)
     };
   }
@@ -584,16 +945,33 @@ export class DatabaseRepository {
    */
   async getBackupSnapshot(userId) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.worlds, STORES.events, STORES.settings],
+      [
+        STORES.profiles,
+        STORES.worlds,
+        STORES.favoriteGroups,
+        STORES.events,
+        STORES.settings
+      ],
       "readonly"
     );
-    const [profileValue, worldValues, eventValues, autoSyncRecord, notificationRecord] =
+    const [
+      profileValue,
+      worldValues,
+      favoriteGroupValues,
+      eventValues,
+      autoSyncRecord,
+      notificationRecord
+    ] =
       await completeRead(
         transaction,
         Promise.all([
           getValue(transaction.objectStore(STORES.profiles), userId),
           getAllValues(
             transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
+            userId
+          ),
+          getAllValues(
+            transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
             userId
           ),
           getAllValues(
@@ -607,6 +985,8 @@ export class DatabaseRepository {
 
     const worlds = /** @type {WorldRecord[]} */ (worldValues);
     worlds.sort((left, right) => left.worldId.localeCompare(right.worldId));
+    const favoriteGroups = /** @type {FavoriteGroupRecord[]} */ (favoriteGroupValues);
+    favoriteGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
     const events = /** @type {HistoryEvent[]} */ (eventValues);
     events.sort((left, right) => left.eventId.localeCompare(right.eventId));
     /** @type {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} */
@@ -629,6 +1009,7 @@ export class DatabaseRepository {
       profile:
         profileValue === undefined ? null : /** @type {ProfileRecord} */ (profileValue),
       worlds,
+      favoriteGroups,
       events,
       preferences
     };
@@ -654,13 +1035,17 @@ export class DatabaseRepository {
    */
   async saveProfile(profile) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.meta],
+      [STORES.profiles, STORES.settings, STORES.meta],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
     try {
       const metaStore = transaction.objectStore(STORES.meta);
-      const storedGeneration = await getValue(metaStore, generationKey(profile.userId));
+      const [storedGeneration, storedPurgePending] = await Promise.all([
+        getValue(metaStore, generationKey(profile.userId)),
+        getValue(transaction.objectStore(STORES.settings), "purgePending")
+      ]);
+      requireWritesAllowed(storedPurgePending);
       const nextGeneration = incrementGeneration(
         generationValue(storedGeneration, profile.userId),
         profile.userId
@@ -702,6 +1087,24 @@ export class DatabaseRepository {
 
   /**
    * @param {string} userId
+   * @returns {Promise<FavoriteGroupRecord[]>}
+   */
+  async listFavoriteGroups(userId) {
+    const transaction = this.#requireDatabase().transaction(STORES.favoriteGroups, "readonly");
+    const values = await completeRead(
+      transaction,
+      getAllValues(
+        transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
+        userId
+      )
+    );
+    return /** @type {FavoriteGroupRecord[]} */ (values).sort((left, right) =>
+      left.groupId.localeCompare(right.groupId)
+    );
+  }
+
+  /**
+   * @param {string} userId
    * @returns {Promise<HistoryEvent[]>}
    */
   async listEvents(userId) {
@@ -717,6 +1120,87 @@ export class DatabaseRepository {
       const byTime = right.observedAt.localeCompare(left.observedAt);
       return byTime === 0 ? left.eventId.localeCompare(right.eventId) : byTime;
     });
+  }
+
+  /**
+   * Count profile data without materializing all records. Pending probes are
+   * counted once per world from the same readonly snapshot as both totals.
+   *
+   * @param {string} userId
+   * @returns {Promise<{ worldCount: number, eventCount: number, pendingProbeCount: number }>}
+   */
+  async getProfileStats(userId) {
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.worlds, STORES.events],
+      "readonly"
+    );
+    const worldIndex = transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser);
+    const eventIndex = transaction.objectStore(STORES.events).index(INDEXES.eventsByUser);
+    /** @type {Promise<number>} */
+    const pendingProbeCount = new Promise((resolve, reject) => {
+      let count = 0;
+      const request = worldIndex.openCursor(userId);
+      request.addEventListener("error", () => {
+        reject(request.error ?? new Error("IndexedDB profile stats cursor failed"));
+      }, { once: true });
+      request.addEventListener("success", () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve(count);
+          return;
+        }
+        const world = /** @type {WorldRecord} */ (cursor.value);
+        if (world.probeState === "pending" || world.availabilityState === "unavailable_once") {
+          count += 1;
+        }
+        cursor.continue();
+      });
+    });
+    const [worldCount, eventCount, pendingCount] = await completeRead(
+      transaction,
+      Promise.all([
+        requestResult(worldIndex.count(userId)),
+        requestResult(eventIndex.count(userId)),
+        pendingProbeCount
+      ])
+    );
+    return { worldCount, eventCount, pendingProbeCount: pendingCount };
+  }
+
+  /**
+   * @param {string} userId
+   * @returns {Promise<number>}
+   */
+  async getUnreadCount(userId) {
+    const transaction = this.#requireDatabase().transaction(STORES.meta, "readonly");
+    const stored = await completeRead(
+      transaction,
+      getValue(transaction.objectStore(STORES.meta), unreadCountKey(userId))
+    );
+    return unreadCountValue(stored, userId);
+  }
+
+  /**
+   * @param {string} userId
+   * @returns {Promise<void>}
+   */
+  async markEventsRead(userId) {
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.settings, STORES.meta],
+      "readwrite"
+    );
+    const finished = transactionFinished(transaction);
+    try {
+      const storedPurgePending = await getValue(
+        transaction.objectStore(STORES.settings),
+        "purgePending"
+      );
+      requireWritesAllowed(storedPurgePending);
+      transaction.objectStore(STORES.meta).put({ key: unreadCountKey(userId), value: 0 });
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
   }
 
   /**
@@ -753,7 +1237,67 @@ export class DatabaseRepository {
     const transaction = this.#requireDatabase().transaction(STORES.settings, "readwrite");
     const finished = transactionFinished(transaction);
     try {
-      putSettings(transaction.objectStore(STORES.settings), updates);
+      const settingsStore = transaction.objectStore(STORES.settings);
+      const storedPurgePending = await getValue(settingsStore, "purgePending");
+      requireWritesAllowed(storedPurgePending);
+      putSettings(settingsStore, updates);
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
+  }
+
+  /**
+   * Atomically enable the durable purge guard. Concurrent and resumed callers
+   * can safely retry: exactly one false-to-true transition returns true, while
+   * an already-active guard returns false without weakening it.
+   *
+   * @returns {Promise<boolean>} true only when this call enabled the guard
+   */
+  async beginPurge() {
+    const transaction = this.#requireDatabase().transaction(STORES.settings, "readwrite");
+    const finished = transactionFinished(transaction);
+    try {
+      const settingsStore = transaction.objectStore(STORES.settings);
+      const storedPurgePending = await getValue(settingsStore, "purgePending");
+      if (storedPurgePending !== undefined) {
+        const value = (/** @type {StoredValue} */ (storedPurgePending)).value;
+        if (value === true) {
+          await finished;
+          return false;
+        }
+        if (value !== false) {
+          throw new Error("Stored purge guard is invalid");
+        }
+      }
+      settingsStore.put({ key: "purgePending", value: true });
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
+    return true;
+  }
+
+  /**
+   * Clear the durable write guard only after the background confirms that a
+   * purge/uninstall attempt failed and normal operation should be repaired.
+   * General setting APIs deliberately cannot perform this transition.
+   *
+   * @returns {Promise<void>}
+   */
+  async recoverFromFailedPurge() {
+    const transaction = this.#requireDatabase().transaction(STORES.settings, "readwrite");
+    const finished = transactionFinished(transaction);
+    try {
+      const settingsStore = transaction.objectStore(STORES.settings);
+      const storedPurgePending = await getValue(settingsStore, "purgePending");
+      if (
+        storedPurgePending === undefined ||
+        (/** @type {StoredValue} */ (storedPurgePending)).value !== true
+      ) {
+        throw new Error("Purge recovery requires an active purge guard");
+      }
+      settingsStore.put({ key: "purgePending", value: false });
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -781,6 +1325,8 @@ export class DatabaseRepository {
       throw new Error("Successful sync run does not belong to the committed profile");
     }
     validateSuccessSettings(commit.settings, commit.profile.userId);
+    validateFavoriteGroupPlan(commit.favoriteGroups, commit.profile.userId);
+    validateEventPlan(commit.events);
 
     /** @type {Map<string, number | null>} */
     const expectedRevisions = new Map();
@@ -814,6 +1360,7 @@ export class DatabaseRepository {
       }
       committedWorldKeys.add(key);
     }
+    const committedEventIds = new Set();
     for (const event of commit.events) {
       if (event.userId !== commit.profile.userId) {
         throw new Error(`Committed event belongs to another profile: ${event.eventId}`);
@@ -821,12 +1368,17 @@ export class DatabaseRepository {
       if (!committedWorldKeys.has(`${event.userId}\u0000${event.worldId}`)) {
         throw new Error(`Event target is not part of the sync plan: ${event.eventId}`);
       }
+      if (committedEventIds.has(event.eventId)) {
+        throw new Error(`Duplicate committed event: ${event.eventId}`);
+      }
+      committedEventIds.add(event.eventId);
     }
 
     const transaction = this.#requireDatabase().transaction(
       [
         STORES.profiles,
         STORES.worlds,
+        STORES.favoriteGroups,
         STORES.events,
         STORES.syncRuns,
         STORES.settings,
@@ -840,13 +1392,25 @@ export class DatabaseRepository {
 
     try {
       const worldStore = transaction.objectStore(STORES.worlds);
+      const eventStore = transaction.objectStore(STORES.events);
+      const settingsStore = transaction.objectStore(STORES.settings);
       const metaStore = transaction.objectStore(STORES.meta);
-      const [storedGeneration, currentWorlds] = await Promise.all([
+      const [
+        storedPurgePending,
+        storedGeneration,
+        storedUnreadCount,
+        currentWorlds,
+        currentEvents
+      ] = await Promise.all([
+        getValue(settingsStore, "purgePending"),
         getValue(metaStore, generationKey(commit.profile.userId)),
+        getValue(metaStore, unreadCountKey(commit.profile.userId)),
         Promise.all(
           commit.worlds.map((world) => getValue(worldStore, [world.userId, world.worldId]))
-        )
+        ),
+        Promise.all(commit.events.map((event) => getValue(eventStore, event.eventId)))
       ]);
+      requireWritesAllowed(storedPurgePending);
       const actualGeneration = generationValue(storedGeneration, commit.profile.userId);
       if (actualGeneration !== commit.expectedGeneration) {
         throw new GenerationConflictError(
@@ -883,24 +1447,60 @@ export class DatabaseRepository {
         }
       }
 
+      const currentUnreadCount = unreadCountValue(
+        storedUnreadCount,
+        commit.profile.userId
+      );
+      let newEventCount = 0;
+      for (let index = 0; index < commit.events.length; index += 1) {
+        const plannedEvent = commit.events[index];
+        const currentEvent = currentEvents[index];
+        if (plannedEvent === undefined) {
+          throw new Error("Event validation failed");
+        }
+        if (currentEvent === undefined) {
+          newEventCount += 1;
+        } else if (!sameEventPayload(/** @type {HistoryEvent} */ (currentEvent), plannedEvent)) {
+          throw new Error(`Event ID collision: ${plannedEvent.eventId}`);
+        }
+      }
+      if (currentUnreadCount > Number.MAX_SAFE_INTEGER - newEventCount) {
+        throw new RangeError(`Unread event count is exhausted: ${commit.profile.userId}`);
+      }
+
       transaction.objectStore(STORES.profiles).put(commit.profile);
       for (const world of commit.worlds) {
         worldStore.put(world);
       }
-      const events = transaction.objectStore(STORES.events);
-      for (const event of commit.events) {
-        events.put(event);
+      const favoriteGroupStore = transaction.objectStore(STORES.favoriteGroups);
+      await deleteByIndex(
+        favoriteGroupStore.index(INDEXES.favoriteGroupsByUser),
+        commit.profile.userId
+      );
+      for (const favoriteGroup of commit.favoriteGroups) {
+        favoriteGroupStore.put(favoriteGroup);
       }
-      transaction.objectStore(STORES.syncRuns).put(commit.syncRun);
-      putSettings(transaction.objectStore(STORES.settings), {
+      for (let index = 0; index < commit.events.length; index += 1) {
+        const event = commit.events[index];
+        if (event !== undefined && currentEvents[index] === undefined) {
+          eventStore.put(event);
+        }
+      }
+      await putSyncRunAndPrune(transaction.objectStore(STORES.syncRuns), commit.syncRun);
+      putSettings(settingsStore, {
         activeProfileId: commit.settings.activeProfileId,
         backoffUntil: commit.settings.backoffUntil,
         consecutiveRateLimits: commit.settings.consecutiveRateLimits,
-        lastSyncResult: commit.settings.lastSyncResult
+        lastSyncResult: commit.settings.lastSyncResult,
+        favoriteGroupStatus: commit.settings.favoriteGroupStatus
       });
       metaStore.put({
         key: generationKey(commit.profile.userId),
         value: nextGeneration
+      });
+      metaStore.put({
+        key: unreadCountKey(commit.profile.userId),
+        value: currentUnreadCount + newEventCount
       });
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
@@ -920,10 +1520,18 @@ export class DatabaseRepository {
     if (syncRun.result === "success") {
       throw new Error("Successful sync runs must use commitSync()");
     }
-    const transaction = this.#requireDatabase().transaction(STORES.syncRuns, "readwrite");
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.syncRuns, STORES.settings],
+      "readwrite"
+    );
     const finished = transactionFinished(transaction);
     try {
-      transaction.objectStore(STORES.syncRuns).put(syncRun);
+      const storedPurgePending = await getValue(
+        transaction.objectStore(STORES.settings),
+        "purgePending"
+      );
+      requireWritesAllowed(storedPurgePending);
+      await putSyncRunAndPrune(transaction.objectStore(STORES.syncRuns), syncRun);
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -937,48 +1545,67 @@ export class DatabaseRepository {
    * @param {string} userId
    * @param {string} claimedAt
    * @param {readonly string[] | undefined} eventIds
-   * @param {{ expectedGeneration: number }} options
+   * @param {{
+   *   expectedGeneration: number,
+   *   allowedKinds?: ReadonlyArray<HistoryEvent["kind"]>
+   * }} options
    * @returns {Promise<HistoryEvent[]>}
    */
   async claimEvents(userId, claimedAt, eventIds, options) {
     requireGeneration(options.expectedGeneration, "expectedGeneration");
+    if (!isCanonicalUtcTimestamp(claimedAt)) {
+      throw new TypeError("claimedAt must be a canonical UTC timestamp");
+    }
     const transaction = this.#requireDatabase().transaction(
-      [STORES.events, STORES.meta],
+      [STORES.events, STORES.settings, STORES.meta],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
     const store = transaction.objectStore(STORES.events);
     const allowedIds = eventIds === undefined ? null : new Set(eventIds);
+    const allowedKinds = options.allowedKinds === undefined
+      ? null
+      : new Set(options.allowedKinds);
     /** @type {HistoryEvent[]} */
     const claimed = [];
 
     try {
-      const storedGeneration = await getValue(
-        transaction.objectStore(STORES.meta),
-        generationKey(userId)
-      );
+      const [storedPurgePending, storedGeneration] = await Promise.all([
+        getValue(transaction.objectStore(STORES.settings), "purgePending"),
+        getValue(transaction.objectStore(STORES.meta), generationKey(userId))
+      ]);
+      requireWritesAllowed(storedPurgePending);
       const actualGeneration = generationValue(storedGeneration, userId);
       if (actualGeneration !== options.expectedGeneration) {
         throw new GenerationConflictError(userId, options.expectedGeneration, actualGeneration);
       }
 
-      const request = store.index(INDEXES.eventsByUser).openCursor(userId);
-      request.addEventListener("success", () => {
-        const cursor = request.result;
-        if (cursor === null) {
-          return;
-        }
-        const event = /** @type {HistoryEvent} */ (cursor.value);
+      /** @type {unknown[][]} */
+      let candidateGroups;
+      if (allowedKinds === null) {
+        candidateGroups = [await getAllValues(store.index(INDEXES.eventsByUser), userId)];
+      } else {
+        const index = store.index(INDEXES.eventsByKind);
+        candidateGroups = await Promise.all([...allowedKinds].map((kind) => getAllValues(
+          index,
+          IDBKeyRange.bound([userId, kind, ""], [userId, kind, "\uffff"])
+        )));
+      }
+      for (const candidate of candidateGroups.flat()) {
+        const event = /** @type {HistoryEvent} */ (candidate);
         if (
-          event.notificationClaimedAt === null &&
-          (allowedIds === null || allowedIds.has(event.eventId))
+          event.notificationEligible === true
+          && event.notificationClaimedAt === null
+          && (allowedIds === null || allowedIds.has(event.eventId))
         ) {
-          const updated = { ...event, notificationClaimedAt: claimedAt };
-          cursor.update(updated);
+          const effectiveClaimedAt = event.observedAt > claimedAt
+            ? event.observedAt
+            : claimedAt;
+          const updated = { ...event, notificationClaimedAt: effectiveClaimedAt };
+          store.put(updated);
           claimed.push(updated);
         }
-        cursor.continue();
-      });
+      }
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -998,18 +1625,31 @@ export class DatabaseRepository {
    */
   async updateNotificationResult(eventIds, result, options) {
     requireGeneration(options.expectedGeneration, "expectedGeneration");
+    if (result.notifiedAt !== null && !isCanonicalUtcTimestamp(result.notifiedAt)) {
+      throw new TypeError("notifiedAt must be a canonical UTC timestamp or null");
+    }
+    if (!NOTIFICATION_ERROR_SET.has(result.notificationError)) {
+      throw new TypeError("notificationError must be a fixed error code or null");
+    }
+    if (result.notifiedAt !== null && result.notificationError !== null) {
+      throw new TypeError("Notification success and error results are mutually exclusive");
+    }
     if (eventIds.length === 0) {
       throw new Error("At least one event is required to update a notification result");
     }
     const transaction = this.#requireDatabase().transaction(
-      [STORES.events, STORES.meta],
+      [STORES.events, STORES.settings, STORES.meta],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
     const store = transaction.objectStore(STORES.events);
 
     try {
-      const values = await Promise.all(eventIds.map((eventId) => getValue(store, eventId)));
+      const [storedPurgePending, values] = await Promise.all([
+        getValue(transaction.objectStore(STORES.settings), "purgePending"),
+        Promise.all(eventIds.map((eventId) => getValue(store, eventId)))
+      ]);
+      requireWritesAllowed(storedPurgePending);
       /** @type {HistoryEvent[]} */
       const events = [];
       for (let index = 0; index < eventIds.length; index += 1) {
@@ -1019,6 +1659,9 @@ export class DatabaseRepository {
           throw new Error(`Unknown notification event: ${eventId ?? "missing event ID"}`);
         }
         const event = /** @type {HistoryEvent} */ (value);
+        if (!event.notificationEligible) {
+          throw new Error(`Notification event is suppressed: ${eventId}`);
+        }
         if (event.notificationClaimedAt === null) {
           throw new Error(`Notification event is not claimed: ${eventId}`);
         }
@@ -1037,9 +1680,14 @@ export class DatabaseRepository {
         throw new GenerationConflictError(userId, options.expectedGeneration, actualGeneration);
       }
       for (const event of events) {
+        const effectiveNotifiedAt = result.notifiedAt !== null
+          && event.notificationClaimedAt !== null
+          && event.notificationClaimedAt > result.notifiedAt
+          ? event.notificationClaimedAt
+          : result.notifiedAt;
         store.put({
           ...event,
-          notifiedAt: result.notifiedAt,
+          notifiedAt: effectiveNotifiedAt,
           notificationError: result.notificationError
         });
       }
@@ -1057,13 +1705,15 @@ export class DatabaseRepository {
    * @returns {Promise<number>} the replacement data generation
    */
   async replaceProfileData(replacement) {
-    const { profile, worlds, events, preferences = {} } = replacement;
+    const { profile, worlds, favoriteGroups, events, preferences = {} } = replacement;
     if (worlds.some((world) => world.userId !== profile.userId)) {
       throw new Error("Replacement contains a world owned by another profile");
     }
     if (events.some((event) => event.userId !== profile.userId)) {
       throw new Error("Replacement contains an event owned by another profile");
     }
+    validateFavoriteGroupPlan(favoriteGroups, profile.userId);
+    validateEventPlan(events);
     for (const key of Object.keys(preferences)) {
       if (!BACKUP_PREFERENCE_KEYS.includes(key)) {
         throw new Error(`Replacement contains an unsafe preference: ${key}`);
@@ -1074,7 +1724,14 @@ export class DatabaseRepository {
     }
 
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.worlds, STORES.events, STORES.settings, STORES.meta],
+      [
+        STORES.profiles,
+        STORES.worlds,
+        STORES.favoriteGroups,
+        STORES.events,
+        STORES.settings,
+        STORES.meta
+      ],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
@@ -1083,7 +1740,11 @@ export class DatabaseRepository {
 
     try {
       const metaStore = transaction.objectStore(STORES.meta);
-      const storedGeneration = await getValue(metaStore, generationKey(profile.userId));
+      const [storedPurgePending, storedGeneration] = await Promise.all([
+        getValue(transaction.objectStore(STORES.settings), "purgePending"),
+        getValue(metaStore, generationKey(profile.userId))
+      ]);
+      requireWritesAllowed(storedPurgePending);
       nextGeneration = incrementGeneration(
         generationValue(storedGeneration, profile.userId),
         profile.userId
@@ -1096,6 +1757,10 @@ export class DatabaseRepository {
         deleteByIndex(
           transaction.objectStore(STORES.events).index(INDEXES.eventsByUser),
           profile.userId
+        ),
+        deleteByIndex(
+          transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
+          profile.userId
         )
       ]);
 
@@ -1103,6 +1768,10 @@ export class DatabaseRepository {
       const worldStore = transaction.objectStore(STORES.worlds);
       for (const world of worlds) {
         worldStore.put(world);
+      }
+      const favoriteGroupStore = transaction.objectStore(STORES.favoriteGroups);
+      for (const favoriteGroup of favoriteGroups) {
+        favoriteGroupStore.put(favoriteGroup);
       }
       const eventStore = transaction.objectStore(STORES.events);
       for (const event of events) {
@@ -1113,6 +1782,7 @@ export class DatabaseRepository {
         settingStore.put({ key, value: preferences[key] });
       }
       metaStore.put({ key: generationKey(profile.userId), value: nextGeneration });
+      metaStore.put({ key: unreadCountKey(profile.userId), value: 0 });
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -1139,7 +1809,15 @@ export class DatabaseRepository {
    */
   async clearProfile(userId) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.worlds, STORES.events, STORES.syncRuns, STORES.meta],
+      [
+        STORES.profiles,
+        STORES.worlds,
+        STORES.favoriteGroups,
+        STORES.events,
+        STORES.syncRuns,
+        STORES.settings,
+        STORES.meta
+      ],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
@@ -1147,7 +1825,11 @@ export class DatabaseRepository {
     let nextGeneration;
     try {
       const metaStore = transaction.objectStore(STORES.meta);
-      const storedGeneration = await getValue(metaStore, generationKey(userId));
+      const [storedPurgePending, storedGeneration] = await Promise.all([
+        getValue(transaction.objectStore(STORES.settings), "purgePending"),
+        getValue(metaStore, generationKey(userId))
+      ]);
+      requireWritesAllowed(storedPurgePending);
       nextGeneration = incrementGeneration(generationValue(storedGeneration, userId), userId);
       transaction.objectStore(STORES.profiles).delete(userId);
       await Promise.all([
@@ -1160,16 +1842,49 @@ export class DatabaseRepository {
           userId
         ),
         deleteByIndex(
+          transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
+          userId
+        ),
+        deleteByIndex(
           transaction.objectStore(STORES.syncRuns).index(INDEXES.syncRunsByUser),
           userId
         )
       ]);
       metaStore.put({ key: generationKey(userId), value: nextGeneration });
+      metaStore.delete(unreadCountKey(userId));
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
     await finished;
     return nextGeneration;
+  }
+
+  /**
+   * Atomically erase every user-owned record while keeping the minimum schema
+   * and purge guard metadata. Keeping the database itself avoids the
+   * uncancellable `deleteDatabase()` blocked-request race.
+   *
+   * @returns {Promise<void>}
+   */
+  async purgeAllData() {
+    const transaction = this.#requireDatabase().transaction(
+      Object.values(STORES),
+      "readwrite"
+    );
+    const finished = transactionFinished(transaction);
+    try {
+      for (const storeName of Object.values(STORES)) {
+        transaction.objectStore(storeName).clear();
+      }
+      transaction.objectStore(STORES.settings).put({ key: "purgePending", value: true });
+      const metaStore = transaction.objectStore(STORES.meta);
+      metaStore.put({ key: "schemaVersion", value: DATABASE_VERSION });
+      metaStore.put({ key: "backupFormatVersion", value: 2 });
+      metaStore.put({ key: "lastMigration", value: DATABASE_VERSION });
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
   }
 }
 

@@ -338,6 +338,24 @@ main {
   box-shadow: 0 4px 12px rgb(0 0 0 / 13%);
 }
 
+.tab-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 19px;
+  min-height: 19px;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: #17162b;
+  background: #ffb29f;
+  font-size: 9px;
+  font-weight: 900;
+}
+
+.tab-count[hidden] {
+  display: none;
+}
+
 .tab-panel[hidden] {
   display: none;
 }
@@ -416,6 +434,11 @@ input::placeholder {
   color: #9794a7;
   font-size: 11px;
   line-height: 1.65;
+}
+
+.world-group-meta {
+  margin-top: 4px;
+  color: #8de8dc;
 }
 
 .event-card details {
@@ -617,6 +640,35 @@ input::placeholder {
   color: #ffc2b5 !important;
 }
 
+.storage-warning {
+  margin: 16px 0 0 !important;
+  padding: 12px 13px;
+  border: 1px solid rgb(242 196 107 / 20%);
+  border-radius: 11px;
+  color: #ffe0a5 !important;
+  background: rgb(242 196 107 / 8%);
+}
+
+.storage-warning[hidden] {
+  display: none;
+}
+
+.danger-card {
+  grid-column: 1 / -1;
+  border-color: rgb(255 132 106 / 18%);
+  background: rgb(255 132 106 / 5%);
+}
+
+.danger-card .section-label {
+  color: #ffab98;
+}
+
+.button-danger {
+  border: 1px solid rgb(255 132 106 / 25%);
+  color: #ffd3ca;
+  background: rgb(255 132 106 / 12%);
+}
+
 .privacy-card ul {
   display: grid;
   gap: 10px;
@@ -662,6 +714,18 @@ input::placeholder {
 
   .top-actions {
     flex-wrap: wrap;
+  }
+
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .toolbar .search-field {
+    flex-basis: 100%;
+  }
+
+  .toolbar .select-field {
+    flex: 1;
   }
 
   .onboarding,

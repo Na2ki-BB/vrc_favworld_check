@@ -30,6 +30,7 @@ const CURRENT_USER_MAX_DEPTH = 8;
 const CURRENT_USER_MAX_OBJECTS = 10_000;
 const WORLD_ID_PATTERN = /^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const USER_ID_PATTERN = /^usr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const FAVORITE_GROUP_ID_PATTERN = /^fvgrp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SENSITIVE_FIELD_PATTERN = /(credential|password|passwd|token|cookie|session|authorization|secret|apikey)/;
 const SENSITIVE_FIELD_NAMES = new Set([
   "auth",
@@ -44,6 +45,8 @@ const SAFE_CURRENT_USER_KEY_FIELDS = new Set([
   "friendkey"
 ]);
 const RELEASE_STATUSES = new Set(["public", "private", "hidden"]);
+const FAVORITE_GROUP_TYPES = new Set(["avatar", "friend", "world", "vrcPlusWorld"]);
+const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
 
 /**
  * @typedef {(typeof API_ERROR_CODES)[keyof typeof API_ERROR_CODES]} ApiErrorCode
@@ -62,6 +65,20 @@ const RELEASE_STATUSES = new Set(["public", "private", "hidden"]);
  *   favoriteGroup: string,
  *   releaseStatus: "public" | "private" | "hidden"
  * }} FavoriteWorldMetadata
+ * @typedef {{
+ *   id: string,
+ *   name: string,
+ *   displayName: string,
+ *   ownerId: string,
+ *   type: "world" | "vrcPlusWorld"
+ * }} FavoriteGroupMetadata
+ * @typedef {{
+ *   id: string,
+ *   name: string,
+ *   displayName: string,
+ *   ownerId: string,
+ *   type: "avatar" | "friend" | "world" | "vrcPlusWorld"
+ * }} FavoriteGroupListItem
  * @typedef {{
  *   id: string,
  *   name: string,
@@ -234,6 +251,48 @@ export class VrchatApi {
   }
 
   /**
+   * Fetch the authenticated user's complete favorite-group snapshot, while
+   * retaining only world groups. The endpoint can also return avatar and
+   * friend groups, which are validated but deliberately not exposed.
+   *
+   * @param {string} ownerId
+   * @returns {Promise<FavoriteGroupMetadata[]>}
+   */
+  async listAllFavoriteGroups(ownerId) {
+    if (!isUserId(ownerId)) {
+      throw new ApiSchemaError(null);
+    }
+
+    const allGroups = await this.#listAll(
+      (offset) => (
+        `/favorite/groups?n=${API_PAGE_SIZE}&offset=${offset}`
+        + `&ownerId=${encodeURIComponent(ownerId)}`
+      ),
+      (value) => projectFavoriteGroup(value, ownerId),
+      (group) => group.id,
+      true
+    );
+
+    const seenNames = new Set();
+    for (const group of allGroups) {
+      if (seenNames.has(group.name)) {
+        throw new ApiSchemaError();
+      }
+      seenNames.add(group.name);
+    }
+
+    return allGroups.filter(
+      (group) => WORLD_FAVORITE_GROUP_TYPES.has(group.type)
+    ).map((group) => ({
+      id: group.id,
+      name: group.name,
+      displayName: group.displayName,
+      ownerId: group.ownerId,
+      type: /** @type {"world" | "vrcPlusWorld"} */ (group.type)
+    }));
+  }
+
+  /**
    * @param {string} worldId
    * @returns {Promise<WorldProbe>}
    */
@@ -258,9 +317,15 @@ export class VrchatApi {
    * @param {(offset: number) => string} pathForOffset
    * @param {(value: unknown) => T} projectItem
    * @param {(value: T) => string} itemIdentity
+   * @param {boolean} [duplicateItemIsSchemaError]
    * @returns {Promise<T[]>}
    */
-  async #listAll(pathForOffset, projectItem, itemIdentity) {
+  async #listAll(
+    pathForOffset,
+    projectItem,
+    itemIdentity,
+    duplicateItemIsSchemaError = false
+  ) {
     /** @type {T[]} */
     const items = [];
     const pageFingerprints = new Set();
@@ -299,12 +364,18 @@ export class VrchatApi {
       const pageIds = page.map(itemIdentity);
       const fingerprint = JSON.stringify([...pageIds].sort());
       if (pageFingerprints.has(fingerprint)) {
+        if (duplicateItemIsSchemaError) {
+          throw new ApiSchemaError();
+        }
         throw new PaginationError();
       }
       pageFingerprints.add(fingerprint);
 
       for (const itemId of pageIds) {
         if (seenItemIds.has(itemId)) {
+          if (duplicateItemIsSchemaError) {
+            throw new ApiSchemaError();
+          }
           throw new PaginationError();
         }
         seenItemIds.add(itemId);
@@ -519,6 +590,39 @@ function projectFavoriteWorld(value) {
 }
 
 /**
+ * Validate every group returned for the requested owner before filtering out
+ * non-world types. This prevents a malformed mixed response from being
+ * mistaken for a complete world-group snapshot.
+ *
+ * @param {unknown} value
+ * @param {string} expectedOwnerId
+ * @returns {FavoriteGroupListItem}
+ */
+function projectFavoriteGroup(value, expectedOwnerId) {
+  if (!isRecord(value)) {
+    throw new ApiSchemaError();
+  }
+
+  const id = value.id;
+  const name = value.name;
+  const displayName = value.displayName;
+  const ownerId = value.ownerId;
+  const type = value.type;
+  if (
+    !isFavoriteGroupId(id)
+    || !isNonEmptyString(name)
+    || !isNonEmptyString(displayName)
+    || !isUserId(ownerId)
+    || ownerId !== expectedOwnerId
+    || !isFavoriteGroupType(type)
+  ) {
+    throw new ApiSchemaError();
+  }
+
+  return {id, name, displayName, ownerId, type};
+}
+
+/**
  * @param {unknown} value
  * @returns {WorldMetadata}
  */
@@ -634,6 +738,22 @@ function isWorldId(value) {
  */
 function isUserId(value) {
   return typeof value === "string" && USER_ID_PATTERN.test(value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+function isFavoriteGroupId(value) {
+  return typeof value === "string" && FAVORITE_GROUP_ID_PATTERN.test(value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is "avatar" | "friend" | "world" | "vrcPlusWorld"}
+ */
+function isFavoriteGroupType(value) {
+  return typeof value === "string" && FAVORITE_GROUP_TYPES.has(value);
 }
 
 /**

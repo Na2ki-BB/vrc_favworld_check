@@ -70,7 +70,10 @@
 
         <nav class="tabs" aria-label="表示内容">
           <button class="tab is-active" type="button" data-tab="worlds">ワールド</button>
-          <button class="tab" type="button" data-tab="events">変更履歴</button>
+          <button class="tab" type="button" data-tab="events">
+            変更履歴
+            <span id="history-unread-badge" class="tab-count" hidden></span>
+          </button>
           <button class="tab" type="button" data-tab="settings">設定とバックアップ</button>
         </nav>
 
@@ -78,7 +81,7 @@
           <div class="toolbar">
             <label class="search-field">
               <span class="sr-only">ワールドを検索</span>
-              <input id="world-search" type="search" placeholder="現在名・過去名・作者名・World IDで検索">
+              <input id="world-search" type="search" placeholder="名前・作者・リスト名・World IDで検索">
             </label>
             <label class="select-field">
               <span class="sr-only">状態で絞り込み</span>
@@ -88,6 +91,12 @@
                 <option value="missing">お気に入り一覧にない</option>
                 <option value="unavailable">現在アクセス不可</option>
                 <option value="pending">確認中</option>
+              </select>
+            </label>
+            <label class="select-field">
+              <span class="sr-only">お気に入りリストで絞り込み</span>
+              <select id="group-filter">
+                <option value="">すべてのリスト</option>
               </select>
             </label>
           </div>
@@ -113,6 +122,7 @@
               <select id="event-filter">
                 <option value="all">すべての変更</option>
                 <option value="renamed">名前変更</option>
+                <option value="group">お気に入りリスト変更</option>
                 <option value="missing">お気に入り一覧にない</option>
                 <option value="unavailable">現在アクセスできない</option>
                 <option value="restored">復帰</option>
@@ -143,6 +153,8 @@
               <dl class="sync-details">
                 <div><dt>最終成功</dt><dd id="settings-last-sync">—</dd></div>
                 <div><dt>次回予定</dt><dd id="settings-next-sync">—</dd></div>
+                <div><dt>個別確認待ち</dt><dd id="settings-pending-probes">0件</dd></div>
+                <div><dt>未読の変更</dt><dd id="settings-unread-events">0件</dd></div>
                 <div><dt>保存先</dt><dd>このブラウザのIndexedDB</dd></div>
               </dl>
             </article>
@@ -161,6 +173,20 @@
               <p id="backup-message" class="form-message" role="status"></p>
             </article>
 
+            <article class="settings-card">
+              <p class="section-label">STORAGE</p>
+              <h2>保存している記録</h2>
+              <p>履歴は自動削除せず、このブラウザ内だけに保持します。使用量はブラウザによる概算です。</p>
+              <dl class="sync-details">
+                <div><dt>ワールド</dt><dd id="settings-world-count">0件</dd></div>
+                <div><dt>変更履歴</dt><dd id="settings-event-count">0件</dd></div>
+                <div><dt>お気に入りリスト</dt><dd id="settings-group-count">0件</dd></div>
+                <div><dt>概算使用量</dt><dd id="settings-storage-usage">確認中</dd></div>
+                <div><dt>最終バックアップ</dt><dd id="settings-last-backup">まだありません</dd></div>
+              </dl>
+              <p id="storage-warning" class="storage-warning" role="status" hidden></p>
+            </article>
+
             <article class="settings-card privacy-card">
               <p class="section-label">PRIVACY</p>
               <h2>認証情報は扱いません</h2>
@@ -170,6 +196,16 @@
                 <li>開発者サーバー、広告、分析通信なし</li>
                 <li>VRChat APIへの読み取り専用GETだけ</li>
               </ul>
+            </article>
+
+            <article class="settings-card danger-card">
+              <p class="section-label">DANGER ZONE</p>
+              <h2>この端末での利用を終了</h2>
+              <p>このブラウザ内の記録を消去してから、拡張を削除します。必要な履歴は先にバックアップしてください。</p>
+              <button id="purge-uninstall-button" class="button button-danger" type="button">
+                記録をすべて削除して拡張を削除
+              </button>
+              <p id="purge-message" class="form-message" role="status"></p>
             </article>
           </div>
         </section>

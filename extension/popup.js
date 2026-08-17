@@ -47,13 +47,19 @@ async function refreshStatus() {
   const presentation = presentStatus(status);
   statusDot.className = `status-dot is-${presentation.tone}`;
   statusTitle.textContent = presentation.title;
-  statusDetail.textContent = presentation.detail;
+  const groupNameWarning = status.favoriteGroupStatus === "stale"
+    ? " お気に入りリスト名は、前回確認できた名前を表示しています。"
+    : "";
+  statusDetail.textContent = `${presentation.detail}${groupNameWarning}`;
   lastSync.textContent =
     status.lastSuccessfulSyncAt === null
       ? "最終確認: まだありません"
       : `最終確認: ${formatDateTime(status.lastSuccessfulSyncAt)}`;
   syncButton.disabled = status.syncing;
   syncButton.textContent = status.syncing ? "確認しています…" : "今すぐお気に入りを確認";
+  dashboardButton.textContent = status.unreadCount === 0
+    ? "記録と設定を詳しく見る →"
+    : `記録と設定を詳しく見る（未読${status.unreadCount.toLocaleString("ja-JP")}件） →`;
 }
 
 function showUnavailableStatus() {

@@ -3,20 +3,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 
 import {
   KEEPALIVE_INTERVAL_MS,
   MESSAGE_TYPES,
   createAlarmEventHandler,
+  createBadgeUpdater,
   createGatedSyncRunner,
   createMessageHandler,
+  createPurgeController,
   keepServiceWorkerAlive
 } from "../extension/background.js";
-import { NetworkError, RateLimitedError } from "../extension/lib/api.js";
+import { ApiSchemaError, NetworkError, RateLimitedError } from "../extension/lib/api.js";
 import { DatabaseRepository } from "../extension/lib/database.js";
 import {
   MANUAL_SYNC_COOLDOWN_MS,
+  NOTIFICATION_EVENT_KINDS,
+  SETTINGS_SCHEDULE_WARNING,
   SETTING_KEYS,
   SYNC_ALARM_NAME,
   SYNC_WATCHDOG_DELAY_MS,
@@ -32,17 +36,28 @@ const NOW = Date.parse("2026-08-17T00:00:00.000Z");
 const USER_ID = "usr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const WORLD_ID = "wrld_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+Object.defineProperty(globalThis, "IDBKeyRange", {
+  configurable: true,
+  value: IDBKeyRange
+});
+
 /** @typedef {import("../extension/lib/api.js").VrchatApi} VrchatApi */
-/** @typedef {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} ApiPort */
+/** @typedef {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} ApiPort */
 
 class FakeApi {
   /** @type {string[]} */
   calls = [];
-  /** @type {"user" | "relations" | "metadata" | "probe" | null} */
+  /** @type {"user" | "groups" | "relations" | "metadata" | "probe" | null} */
   failureStep = null;
   /** @type {unknown} */
   failure = new Error("fake API failure");
   worldName = "最初の名前";
+  groupName = "worlds1";
+  groupDisplayName = "いつもの場所";
+  relationTags = ["worlds1"];
+  metadataFavoriteGroup = "worlds1";
+  /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>> | null} */
+  favoriteGroupsOverride = null;
   /** @type {(() => Promise<void>) | null} */
   beforeUser = null;
 
@@ -56,11 +71,27 @@ class FakeApi {
     return { id: USER_ID, displayName: "テストユーザー" };
   }
 
+  /** @returns {ReturnType<VrchatApi["listAllFavoriteGroups"]>} */
+  async listAllFavoriteGroups() {
+    this.calls.push("groups");
+    this.#throwAt("groups");
+    if (this.favoriteGroupsOverride !== null) {
+      return this.favoriteGroupsOverride.map((group) => ({ ...group }));
+    }
+    return [{
+      id: "fvgrp_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      name: this.groupName,
+      displayName: this.groupDisplayName,
+      ownerId: USER_ID,
+      type: "world"
+    }];
+  }
+
   /** @returns {ReturnType<VrchatApi["listAllFavoriteRelations"]>} */
   async listAllFavoriteRelations() {
     this.calls.push("relations");
     this.#throwAt("relations");
-    return [{ favoriteId: WORLD_ID, tags: ["worlds1"], type: "world" }];
+    return [{ favoriteId: WORLD_ID, tags: [...this.relationTags], type: "world" }];
   }
 
   /** @returns {ReturnType<VrchatApi["listAllFavoriteWorlds"]>} */
@@ -71,7 +102,7 @@ class FakeApi {
       id: WORLD_ID,
       name: this.worldName,
       authorName: "作者",
-      favoriteGroup: "worlds1",
+      favoriteGroup: this.metadataFavoriteGroup,
       releaseStatus: "public"
     }];
   }
@@ -91,7 +122,7 @@ class FakeApi {
     };
   }
 
-  /** @param {"user" | "relations" | "metadata" | "probe"} step */
+  /** @param {"user" | "groups" | "relations" | "metadata" | "probe"} step */
   #throwAt(step) {
     if (this.failureStep === step) {
       throw this.failure;
@@ -230,6 +261,205 @@ test("successful snapshots commit with revisions and claim before one notificati
   assert.equal(notifications.created.length, 1);
   assert.equal(await repository.getSetting(SETTING_KEYS.activeProfileId), USER_ID);
   assert.equal(await repository.getSetting(SETTING_KEYS.lastSyncResult), "success");
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "success");
+  assert.equal((await repository.listFavoriteGroups(USER_ID))[0]?.displayName, "いつもの場所");
+  assert.equal(await repository.getUnreadCount(USER_ID), 1);
+});
+
+test("favorite-list moves stay unread history but never enter the OS notification outbox", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const notifications = new FakeNotifications();
+  const { service } = createService({ repository, api, notifications });
+  await service.start("alarm");
+
+  api.relationTags = ["worlds2"];
+  api.metadataFavoriteGroup = "worlds2";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  let events = await repository.listEvents(USER_ID);
+  assert.equal(events[0]?.kind, "favorite_group_changed");
+  assert.equal(events[0]?.notificationEligible, false);
+  assert.equal(events[0]?.notificationClaimedAt, null);
+  assert.equal((await service.getStatus()).unreadCount, 1);
+  assert.equal(notifications.created.length, 0);
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  events = await repository.listEvents(USER_ID);
+  assert.equal(events[0]?.notificationClaimedAt, null);
+  assert.equal(notifications.created.length, 0);
+
+  api.worldName = "通知対象の名称変更";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  events = await repository.listEvents(USER_ID);
+  const groupEvent = events.find((event) => event.kind === "favorite_group_changed");
+  const nameEvent = events.find((event) => event.kind === "name_changed");
+  assert.equal(groupEvent?.notificationClaimedAt, null);
+  assert.equal(groupEvent?.notificationEligible, false);
+  assert.notEqual(nameEvent?.notificationClaimedAt, null);
+  assert.equal(nameEvent?.notificationEligible, true);
+  assert.equal(notifications.created.length, 1);
+  assert.equal(notifications.created[0]?.options.message, "1件の変化を記録しました。履歴を確認してください。");
+});
+
+test("notification outbox allowlist exactly matches confirmed FR-NOTIFY-01 events", () => {
+  assert.deepEqual(NOTIFICATION_EVENT_KINDS, [
+    "name_changed",
+    "favorite_missing_confirmed",
+    "favorite_restored",
+    "access_unavailable_confirmed",
+    "access_restored"
+  ]);
+  assert.equal(NOTIFICATION_EVENT_KINDS.includes("favorite_group_changed"), false);
+});
+
+test("favorite-group schema failure preserves prior labels without blocking core world sync", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const groupsBefore = await repository.listFavoriteGroups(USER_ID);
+
+  api.failureStep = "groups";
+  api.failure = new ApiSchemaError();
+  api.worldName = "グループAPI不調中の変更";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+
+  assert.deepEqual(await repository.listFavoriteGroups(USER_ID), groupsBefore);
+  assert.equal((await repository.listWorlds(USER_ID))[0]?.currentName, "グループAPI不調中の変更");
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "stale");
+});
+
+test("favorite-group identity drift is isolated as stale while world changes still commit", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await service.start("alarm");
+  const groupsBefore = await repository.listFavoriteGroups(USER_ID);
+
+  api.groupName = "worlds8";
+  api.worldName = "識別子変化中のワールド名";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  assert.deepEqual(await repository.listFavoriteGroups(USER_ID), groupsBefore);
+  assert.equal((await repository.listWorlds(USER_ID))[0]?.currentName, "識別子変化中のワールド名");
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "stale");
+});
+
+test("favorite-group ID replacement is isolated as stale while world changes still commit", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const groupsBefore = await repository.listFavoriteGroups(USER_ID);
+
+  api.favoriteGroupsOverride = [{
+    id: "fvgrp_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    name: "worlds1",
+    displayName: "置き換わったID",
+    ownerId: USER_ID,
+    type: "world"
+  }];
+  api.worldName = "グループID置換中のワールド名";
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  assert.deepEqual(await repository.listFavoriteGroups(USER_ID), groupsBefore);
+  assert.equal(
+    (await repository.listWorlds(USER_ID))[0]?.currentName,
+    "グループID置換中のワールド名"
+  );
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "stale");
+});
+
+test("an unreferenced favorite group needs two missing snapshots before deactivation", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const firstGroup = {
+    id: "fvgrp_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    name: "worlds1",
+    displayName: "いつもの場所",
+    ownerId: USER_ID,
+    type: /** @type {const} */ ("world")
+  };
+  const secondGroup = {
+    id: "fvgrp_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    name: "worlds2",
+    displayName: "あとで行く場所",
+    ownerId: USER_ID,
+    type: /** @type {const} */ ("world")
+  };
+  api.favoriteGroupsOverride = [firstGroup, secondGroup];
+  const { service } = createService({ repository, api });
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const groupsBefore = await repository.listFavoriteGroups(USER_ID);
+  assert.equal(groupsBefore.length, 2);
+
+  api.favoriteGroupsOverride = [firstGroup];
+  api.worldName = "部分応答中の名前変更";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  const missingOnce = await repository.listFavoriteGroups(USER_ID);
+  assert.equal(missingOnce[1]?.displayName, groupsBefore[1]?.displayName);
+  assert.equal(missingOnce[1]?.active, true);
+  assert.equal(missingOnce[1]?.missingCount, 1);
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "stale");
+  assert.equal(
+    (await repository.listWorlds(USER_ID))[0]?.currentName,
+    "部分応答中の名前変更"
+  );
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const missingTwice = await repository.listFavoriteGroups(USER_ID);
+  assert.equal(missingTwice[1]?.displayName, groupsBefore[1]?.displayName);
+  assert.equal(missingTwice[1]?.active, false);
+  assert.equal(missingTwice[1]?.missingCount, 2);
+  assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "success");
+});
+
+test("favorite-group display-name changes update group history without a world event", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await service.start("alarm");
+
+  api.groupDisplayName = "名前を変えたリスト";
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const group = (await repository.listFavoriteGroups(USER_ID))[0];
+  assert.equal(group?.displayName, "名前を変えたリスト");
+  assert.deepEqual(group?.displayNameHistory, [{
+    displayName: "いつもの場所",
+    observedAt: new Date(NOW).toISOString()
+  }]);
+  assert.deepEqual(await repository.listEvents(USER_ID), []);
+});
+
+test("favorite-group network failure aborts the complete sync and preserves state", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await service.start("alarm");
+  const worldsBefore = await repository.listWorlds(USER_ID);
+  const groupsBefore = await repository.listFavoriteGroups(USER_ID);
+
+  api.failureStep = "groups";
+  api.failure = new NetworkError();
+  api.worldName = "保存してはいけない名前";
+  assert.deepEqual(await service.start("alarm"), { ok: false, error: "OFFLINE" });
+  assert.deepEqual(await repository.listWorlds(USER_ID), worldsBefore);
+  assert.deepEqual(await repository.listFavoriteGroups(USER_ID), groupsBefore);
+});
+
+test("status exposes pending probes and durable unread history, then marks it read", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await service.start("alarm");
+  api.worldName = "未読になる変更";
+  await service.start("alarm");
+
+  const status = await service.getStatus();
+  assert.equal(status.unreadCount, 1);
+  assert.equal(status.pendingProbeCount, 0);
+  assert.equal(status.favoriteGroupStatus, "success");
+  assert.equal(await service.markHistoryRead(), true);
+  assert.equal((await service.getStatus()).unreadCount, 0);
 });
 
 test("a final alarm-create failure cannot turn a committed success into failure", async () => {
@@ -354,7 +584,7 @@ test("one generation conflict replans without repeating any API request", async 
 
   assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
   assert.equal(commitAttempts, 2);
-  assert.deepEqual(api.calls, ["user", "relations", "metadata"]);
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
   assert.equal((await repository.listWorlds(USER_ID)).length, 1);
 });
 
@@ -381,7 +611,7 @@ test("a second generation conflict stops unchanged and schedules a short resume"
     error: "SYNC_CONFLICT"
   });
   assert.equal(commitAttempts, 2);
-  assert.deepEqual(api.calls, ["user", "relations", "metadata"]);
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
   assert.deepEqual(await repository.listWorlds(USER_ID), []);
   assert.equal(alarms.scheduledAt, NOW + RECOVERY_MIN_DELAY_MS);
   assert.equal(
@@ -542,7 +772,7 @@ test("disabled automatic sync clears residual state before DNR/API while manual 
 
   assert.deepEqual(await runner("manual"), { ok: true, changes: 0 });
   assert.equal(ruleChecks, 1);
-  assert.deepEqual(api.calls, ["user", "relations", "metadata"]);
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
 });
 
 test("disabled automatic sync stays fail-closed when residual alarm clear fails", async () => {
@@ -576,6 +806,94 @@ test("disabled automatic sync stays fail-closed when residual alarm clear fails"
   assert.equal(await repository.getSetting(SETTING_KEYS.nextSyncAt), null);
   assert.equal(await repository.getSetting(SETTING_KEYS.watchdogUntil), null);
   assert.equal(await repository.getSetting(SETTING_KEYS.lastAlarmError), "unavailable");
+});
+
+test("a durable purge guard clears alarms without attempting blocked setting writes", async () => {
+  const repository = await createRepository();
+  await repository.setSettings({
+    [SETTING_KEYS.autoSyncEnabled]: true,
+    [SETTING_KEYS.purgePending]: true
+  });
+  const alarms = new FakeAlarms();
+  alarms.scheduledAt = NOW + 60_000;
+  const { service } = createService({ repository, api: new FakeApi(), alarms });
+
+  await service.repairSchedule();
+  assert.equal(alarms.scheduledAt, null);
+  assert.equal(await repository.getSetting(SETTING_KEYS.purgePending), true);
+
+  alarms.scheduledAt = NOW + 120_000;
+  assert.equal(await service.prepareAutomaticSync(), false);
+  assert.equal(alarms.scheduledAt, null);
+  assert.equal(await repository.getSetting(SETTING_KEYS.purgePending), true);
+});
+
+test("settings stay committed when automatic schedule repair fails", async () => {
+  const repository = await createRepository();
+  const alarms = new FakeAlarms();
+  alarms.failCreateAttempt = 1;
+  const { service } = createService({ repository, api: new FakeApi(), alarms });
+
+  assert.deepEqual(await service.updateSettings({
+    autoSyncEnabled: true,
+    notificationsEnabled: false
+  }), {
+    settingsSaved: true,
+    scheduleWarning: SETTINGS_SCHEDULE_WARNING
+  });
+  assert.equal(await repository.getSetting(SETTING_KEYS.autoSyncEnabled), true);
+  assert.equal(await repository.getSetting(SETTING_KEYS.notificationsEnabled), false);
+  assert.equal(await repository.getSetting(SETTING_KEYS.lastAlarmError), "unavailable");
+});
+
+test("disabled automatic setting stays committed when residual alarm clearing fails", async () => {
+  const repository = await createRepository();
+  const alarms = new FakeAlarms();
+  alarms.scheduledAt = NOW + 60_000;
+  alarms.failClear = true;
+  const { service } = createService({ repository, api: new FakeApi(), alarms });
+
+  assert.deepEqual(await service.updateSettings({
+    autoSyncEnabled: false,
+    notificationsEnabled: true
+  }), {
+    settingsSaved: true,
+    scheduleWarning: SETTINGS_SCHEDULE_WARNING
+  });
+  assert.equal(await repository.getSetting(SETTING_KEYS.autoSyncEnabled), false);
+  assert.equal(await repository.getSetting(SETTING_KEYS.notificationsEnabled), true);
+  assert.equal(await repository.getSetting(SETTING_KEYS.lastAlarmError), "unavailable");
+});
+
+test("settings message distinguishes a durable save from a schedule warning", async () => {
+  const repository = await createRepository();
+  const alarms = new FakeAlarms();
+  alarms.failCreateAttempt = 1;
+  const { service } = createService({ repository, api: new FakeApi(), alarms });
+  const handler = createMessageHandler({
+    service,
+    startSync: createGatedSyncRunner({
+      ensureUserAgentRule: async () => {},
+      startSync: (trigger) => service.start(trigger),
+      keepAlive: async (operation) => operation
+    }),
+    openVrchat: async () => {},
+    openDashboard: async () => {},
+    refreshBadge: async () => {},
+    purgeAndUninstall: async () => ({ ok: true, dataDeleted: true })
+  });
+
+  assert.deepEqual(await handler({
+    type: MESSAGE_TYPES.updateSettings,
+    autoSyncEnabled: true,
+    notificationsEnabled: false
+  }), {
+    ok: true,
+    settingsSaved: true,
+    scheduleWarning: SETTINGS_SCHEDULE_WARNING
+  });
+  assert.equal(await repository.getSetting(SETTING_KEYS.autoSyncEnabled), true);
+  assert.equal(await repository.getSetting(SETTING_KEYS.notificationsEnabled), false);
 });
 
 test("alarm boundary catches resolve, rearm, run, and repair rejection stages", async (context) => {
@@ -668,6 +986,219 @@ test("DNR gate failure returns a fixed code and never invokes the sync/API entry
   assert.equal(starts, 0);
 });
 
+test("maintenance gate is checked again after DNR before the API entry", async () => {
+  let allowed = true;
+  let starts = 0;
+  const runner = createGatedSyncRunner({
+    canStart: () => allowed,
+    ensureUserAgentRule: async () => {
+      allowed = false;
+    },
+    startSync: async () => {
+      starts += 1;
+      return { ok: true };
+    },
+    keepAlive: async (operation) => operation
+  });
+
+  assert.deepEqual(await runner("manual"), {
+    ok: false,
+    error: "MAINTENANCE_IN_PROGRESS"
+  });
+  assert.equal(starts, 0);
+});
+
+test("badge uses durable unread count and caps its display", async () => {
+  /** @type {{text: string}[]} */
+  const texts = [];
+  /** @type {{color: string}[]} */
+  const colors = [];
+  /**
+   * @template T
+   * @returns {Promise<T | undefined>}
+   */
+  async function getActiveProfileSetting() {
+    return /** @type {T} */ (/** @type {unknown} */ (USER_ID));
+  }
+  const updateBadge = createBadgeUpdater({
+    repository: {
+      getSetting: getActiveProfileSetting,
+      getUnreadCount: async () => 123
+    },
+    setBadgeText: async (details) => {
+      texts.push(details);
+    },
+    setBadgeBackgroundColor: async (details) => {
+      colors.push(details);
+    }
+  });
+
+  await updateBadge();
+  assert.deepEqual(texts, [{ text: "99+" }]);
+  assert.deepEqual(colors, [{ color: "#B4234D" }]);
+});
+
+test("purge clears user records before uninstall and never uninstalls after a purge failure", async () => {
+  /** @type {string[]} */
+  const order = [];
+  const success = createPurgeController({
+    service: { syncing: false, repairScheduleBestEffort: async () => {} },
+    repository: {
+      beginPurge: async () => {
+        order.push("begin-purge:new");
+        return true;
+      },
+      recoverFromFailedPurge: async () => {
+        order.push("recover-purge");
+      },
+      purgeAllData: async () => {
+        order.push("purge");
+      }
+    },
+    clearAlarm: async () => {
+      order.push("clear-alarm");
+      return true;
+    },
+    clearBadge: async () => {
+      order.push("clear-badge");
+    },
+    uninstallSelf: async () => {
+      order.push("uninstall");
+    }
+  });
+  assert.deepEqual(await success.purgeAndUninstall(), { ok: true, dataDeleted: true });
+  assert.deepEqual(order, [
+    "begin-purge:new",
+    "clear-alarm",
+    "purge",
+    "clear-badge",
+    "uninstall"
+  ]);
+
+  let uninstallCalls = 0;
+  let scheduleRepairs = 0;
+  let purgeRecoveries = 0;
+  const blocked = createPurgeController({
+    service: {
+      syncing: false,
+      repairScheduleBestEffort: async () => {
+        scheduleRepairs += 1;
+      }
+    },
+    repository: {
+      beginPurge: async () => true,
+      recoverFromFailedPurge: async () => {
+        purgeRecoveries += 1;
+      },
+      purgeAllData: async () => {
+        throw new Error("purge transaction failed");
+      }
+    },
+    clearAlarm: async () => true,
+    clearBadge: async () => {},
+    uninstallSelf: async () => {
+      uninstallCalls += 1;
+    }
+  });
+  assert.deepEqual(await blocked.purgeAndUninstall(), {
+    ok: false,
+    error: "DELETE_FAILED",
+    dataDeleted: false
+  });
+  assert.equal(uninstallCalls, 0);
+  assert.equal(scheduleRepairs, 1);
+  assert.equal(purgeRecoveries, 1);
+});
+
+test("a resumed purge keeps its existing guard on failure and retries deletion on success", async () => {
+  let recoveries = 0;
+  let repairs = 0;
+  let uninstallCalls = 0;
+  let purgeCalls = 0;
+  const controller = createPurgeController({
+    service: {
+      syncing: false,
+      repairScheduleBestEffort: async () => {
+        repairs += 1;
+      }
+    },
+    repository: {
+      beginPurge: async () => false,
+      recoverFromFailedPurge: async () => {
+        recoveries += 1;
+      },
+      purgeAllData: async () => {
+        purgeCalls += 1;
+        throw new Error("resumed purge failed");
+      }
+    },
+    clearAlarm: async () => true,
+    clearBadge: async () => {},
+    uninstallSelf: async () => {
+      uninstallCalls += 1;
+    }
+  });
+
+  assert.deepEqual(await controller.purgeAndUninstall(), {
+    ok: false,
+    error: "DELETE_FAILED",
+    dataDeleted: false
+  });
+  assert.equal(recoveries, 0);
+  assert.equal(repairs, 0);
+  assert.equal(uninstallCalls, 0);
+  assert.equal(purgeCalls, 1);
+  assert.equal(controller.canStartSync(), false);
+
+  const restartedController = createPurgeController({
+    service: { syncing: false, repairScheduleBestEffort: async () => {} },
+    repository: {
+      beginPurge: async () => false,
+      recoverFromFailedPurge: async () => {
+        recoveries += 1;
+      },
+      purgeAllData: async () => {
+        purgeCalls += 1;
+      }
+    },
+    clearAlarm: async () => true,
+    clearBadge: async () => {},
+    uninstallSelf: async () => {
+      uninstallCalls += 1;
+    }
+  });
+  assert.deepEqual(await restartedController.purgeAndUninstall(), {
+    ok: true,
+    dataDeleted: true
+  });
+  assert.equal(recoveries, 0);
+  assert.equal(uninstallCalls, 1);
+  assert.equal(purgeCalls, 2);
+});
+
+test("failed self-uninstall reports purged data while the durable gate remains closed", async () => {
+  const controller = createPurgeController({
+    service: { syncing: false, repairScheduleBestEffort: async () => {} },
+    repository: {
+      beginPurge: async () => true,
+      recoverFromFailedPurge: async () => {},
+      purgeAllData: async () => {}
+    },
+    clearAlarm: async () => true,
+    clearBadge: async () => {},
+    uninstallSelf: async () => {
+      throw new Error("user cancelled");
+    }
+  });
+
+  assert.deepEqual(await controller.purgeAndUninstall(), {
+    ok: false,
+    error: "UNINSTALL_FAILED",
+    dataDeleted: true
+  });
+  assert.equal(controller.canStartSync(), false);
+});
+
 test("each completed gated sync performs a fresh security-rule verification", async () => {
   let verifications = 0;
   let starts = 0;
@@ -745,17 +1276,84 @@ test("message router exposes only fixed operations and never accepts a URL", asy
     },
     openDashboard: async () => {
       openedDashboard += 1;
-    }
+    },
+    refreshBadge: async () => {},
+    purgeAndUninstall: async () => ({ ok: true, dataDeleted: true })
   });
 
   assert.deepEqual(await handler({ type: MESSAGE_TYPES.openVrchat }), { ok: true });
   assert.deepEqual(await handler({ type: MESSAGE_TYPES.openDashboard }), { ok: true });
   assert.equal(openedVrchat, 1);
   assert.equal(openedDashboard, 1);
+  assert.deepEqual(await handler({ type: MESSAGE_TYPES.markHistoryRead }), {
+    ok: false,
+    error: "NO_ACTIVE_PROFILE"
+  });
+  assert.deepEqual(await handler({ type: MESSAGE_TYPES.purgeAndUninstall }), {
+    ok: true,
+    dataDeleted: true
+  });
   assert.deepEqual(
     await handler({ type: "OPEN_URL", url: "https://attacker.invalid/" }),
     { ok: false, error: "INVALID_REQUEST" }
   );
+});
+
+test("durable settings and read markers stay successful when badge refresh rejects", async () => {
+  let updates = 0;
+  let repairs = 0;
+  let marks = 0;
+  const handler = createMessageHandler({
+    service: {
+      getStatus: async () => ({
+        syncing: false,
+        authRequired: false,
+        lastSuccessfulSyncAt: null,
+        nextSyncAt: null,
+        activeProfileId: null,
+        worldCount: 0,
+        eventCount: 0,
+        pendingProbeCount: 0,
+        unreadCount: 0,
+        favoriteGroupStatus: null,
+        lastResult: null
+      }),
+      updateSettings: async () => {
+        updates += 1;
+        return { settingsSaved: true, scheduleWarning: null };
+      },
+      repairSchedule: async () => {
+        repairs += 1;
+      },
+      markHistoryRead: async () => {
+        marks += 1;
+        return true;
+      }
+    },
+    startSync: /** @type {ReturnType<typeof createGatedSyncRunner>} */ (
+      async () => ({ ok: true })
+    ),
+    openVrchat: async () => {},
+    openDashboard: async () => {},
+    refreshBadge: async () => {
+      throw new Error("badge unavailable");
+    },
+    purgeAndUninstall: async () => ({ ok: true, dataDeleted: true })
+  });
+
+  assert.deepEqual(await handler({
+    type: MESSAGE_TYPES.updateSettings,
+    autoSyncEnabled: true,
+    notificationsEnabled: true
+  }), { ok: true, settingsSaved: true, scheduleWarning: null });
+  assert.deepEqual(await handler({ type: MESSAGE_TYPES.settingsChanged }), { ok: true });
+  assert.deepEqual(await handler({ type: MESSAGE_TYPES.markHistoryRead }), {
+    ok: true,
+    unreadCount: 0
+  });
+  assert.equal(updates, 1);
+  assert.equal(repairs, 1);
+  assert.equal(marks, 1);
 });
 
 /**

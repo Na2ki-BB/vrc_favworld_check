@@ -28,7 +28,7 @@
 ### 2.2 製品がローカルに保持する利用者データ
 
 - VRChat user ID と表示名
-- お気に入り world ID、現在名、過去名、作者名、お気に入りグループ
+- お気に入り world ID、現在名、過去名、作者名、お気に入りリストの内部名・表示名・表示名履歴
 - 初回・最終確認時刻、状態変更履歴
 - 定期同期と通知の設定
 
@@ -75,6 +75,8 @@
 | 依存関係侵害 | npm package の悪意ある更新 | lockfile 固定、最小依存、監査、配布物へリモートコードなし | build 端末・registry の侵害 |
 | 通知からの情報漏えい | OS ロック画面にワールド名表示 | 通知本文は既定で「お気に入りワールドに変化があります」と件数だけ。詳細は拡張画面 | OS 通知履歴に製品利用の事実は残り得る |
 | バックアップの漏えい | 利用者が JSON を共有・クラウド同期 | エクスポート前に内容と保存先注意を表示。秘密情報は含めない | 嗜好履歴自体は平文なので、ファイル管理は利用者責任 |
+| グループAPIの部分破損 | owner不一致、重複ID、未知type、空応答 | 全要素を検証し、異常時は既存対応表を保持。主要ワールド同期と失敗境界を分離 | 前回名または内部名表示になる |
+| 消去前のアンインストール | IndexedDB transactionの失敗・中断 | 永続purge gate、alarm停止、全storeの原子的clear成功後だけ自己アンインストール | 書き出し済みJSONと手動展開フォルダーは残る |
 
 ## 5. 認証設計
 
@@ -128,6 +130,8 @@ IndexedDB の API 利用自体に `storage` 権限は不要だが、Chrome 公�
 - `scripting`, `activeTab`, content scripts: VRChat ページへコードを注入しない。
 - `<all_urls>` または wildcard host: VRChat API 以外を読む必要がない。
 
+自己アンインストールは `chrome.management.uninstallSelf` だけを利用し、他拡張の管理を可能にする `management` 権限は追加しない。
+
 ## 7. User-Agent 付与の安全性
 
 VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の User-Agent を要求する。一方、Web `fetch` では User-Agent を直接設定できないため、[chrome.declarativeNetRequest](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest) の `modifyHeaders` を使う。
@@ -178,6 +182,7 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - redirect response を JSON として parse しない。
 - 配列要素は `unknown` から必要 DTO へ 1 件ずつ検証する。
 - `id`、`favoriteId` の prefix と UUID 形式を検査する。
+- favorite group は `fvgrp_` ID、本人 `ownerId`、一意な内部名、`world|vrcPlusWorld` type を検査する。avatar/friend groupは検証後に破棄し、raw objectを保存しない。
 - 名前と作者名は制御文字を除外し、表示・保存長を合理的な上限にする。ただし空白や Unicode 名を不必要に破壊しない。
 - 未知フィールドは無視する。必須フィールド欠落は page 全体を不正として同期を中止する。
 - 現行 OpenAPI `CurrentUser` に credential / token / session field がないことを release ごとに schema test する。実応答に禁止 field 名があれば値を抽出せず fail closed にする。
@@ -194,15 +199,15 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 
 ### 9.3 バックアップ
 
-復元入力の初期上限は、ファイル 25 MiB、profile ちょうど 1 件、worlds 10,000、events 100,000、文字列 4,096 code points、配列 nesting 4 とする。製品の実測により縮小できるが、無制限にしない。
+復元入力の初期上限は、ファイル 25 MiB、profile ちょうど 1 件、worlds 10,000、favoriteGroups 100、events 100,000、表示名履歴はグループごと100、文字列 4,096 code points、配列 nesting 4 とする。製品の実測により縮小できるが、無制限にしない。
 
 - `__proto__` 等を特別扱いする merge を行わず、schema field を新規 object へコピーする。
 - enum 外、非有限数、無効日時、重複 key、存在しない world への event を拒否する。
 - HTML や JavaScript として解釈しない。
 - 全検証完了前に IndexedDB を変更しない。
-- 復元 transaction は対象 `userId` の profile/worlds/events だけを key range で置換し、他 user の record を削除しない。global settings は allowlist 済み preferences だけを同じ transaction で merge する。
+- 復元 transaction は対象 `userId` の profile/worlds/favoriteGroups/events だけを key range で置換し、他 user の record を削除しない。global settings は allowlist 済み preferences だけを同じ transaction で merge する。
 - profile ごとの単調増加 generation を復元 transaction で更新し、復元前の snapshot から作られた同期 plan が同じ world revision を偶然持っていても commit できないようにする。generation は端末内の競合検知専用で export しない。
-- event の `notificationClaimedAt`、`notifiedAt`、固定 enum の `notificationError` を検証して復元し、未 claim の import event には `notificationClaimedAt = restoredAt` を設定して再通知しない。
+- event作成時に固定した`notificationEligible`と、`notificationClaimedAt`、`notifiedAt`、固定enumの`notificationError`を検証して復元する。通知対象かつ未claimのimport eventだけ`notificationClaimedAt = max(restoredAt, observedAt)`を設定し、時計ずれで日時順序を壊さず再通知しない。通知対象外eventにdelivery stateがあれば拒否する。
 - 復元 transaction が失敗した場合は対象 user、他 user、settings の処理前状態を保持する。
 
 ## 10. 保存とプライバシー
@@ -212,6 +217,8 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 Chrome 拡張の IndexedDB はブラウザプロファイル内に保存されるが、アプリケーションレベルで暗号化されない。暗号化パスワードを利用者に管理させることは、初心者向け要件と復旧性に反するため MVP では採用しない。
 
 `unlimitedStorage` により quota と自動 eviction から保護するが、利用者による拡張削除、ブラウザプロファイル削除、端末故障は防げない。1 profile 単位の JSON バックアップを併用する。
+
+`syncRuns` はプロフィールごと100件、認証前は20件へ自動整理する。過去worldと変更eventは製品の正本なので自動削除せず、8,000world、80,000event、概算20MiBで事前警告する。
 
 端末を共有する場合は OS アカウント分離、画面ロック、ディスク暗号化を推奨する。ローカル管理者、端末 malware、ブラウザプロファイルを直接読める攻撃者からの保護は本製品単独では保証できない。
 
@@ -231,9 +238,17 @@ Chrome 拡張の IndexedDB はブラウザプロファイル内に保存され�
 
 ### 10.3 通知
 
-OS 通知はロック画面へ表示され得るため、既定本文にワールド名と VRChat 表示名を入れない。「お気に入りワールドに 3 件の変化があります」のように件数だけを表示し、詳細は拡張画面を開いて確認する。
+OS 通知はロック画面へ表示され得るため、既定本文にワールド名と VRChat 表示名を入れない。「お気に入りワールドに 3 件の変化があります」のように件数だけを表示し、詳細は拡張画面を開いて確認する。通知対象は名称変更、確定したお気に入り消失・復帰、アクセス不可・復帰だけとし、リスト移動は履歴と未読件数には残してもOS通知しない。通知クリックは固定の拡張内`dashboard.html#events`だけを開き、通知IDや外部値をURLへ連結しない。
 
 通知 API の attempt は event ごとに最大 1 回とする。呼出し前に `notificationClaimedAt` を transaction で確定し、成功、明示的失敗、crash のいずれでも解除しない。成功時は `notifiedAt`、明示的失敗時は応答本文や stack trace ではなく固定 `notificationError` だけを保存する。通知が欠落しても再 attempt せず、ローカル履歴を正本として常に確認可能にする。
+
+未読件数はイベントcommitと同じtransactionで増やし、履歴画面を開いた操作でだけ0にする。バッジAPI失敗は同期結果を巻き戻さず、次回起動または同期後にDBから再構築する。
+
+### 10.4 全消去
+
+全消去開始時に冪等な`beginPurge`で `purgePending` を先に保存して手動・自動同期をfail closedにし、`sync-next` alarmを止める。全storeを1 read-write transactionでclearし、同じtransactionで`purgePending`とschema情報だけを再作成する。repositoryの全書込みtransactionもsettings storeから同じguardを読み、別タブ・別DB connectionによる復元や設定変更を消去開始後は拒否する。transaction abortなら利用者recordを処理前のまま維持し、自己アンインストールしない。成功時だけ`uninstallSelf`へ進むため、確認ダイアログ中の終了や取消後もguardが残り、同期もDB書込みも再開しない。再起動後の再試行は有効なguardを解除せず消去と自己アンインストールをやり直し、新規guardを設定した今回の処理が消去前に失敗した場合だけ専用recoveryを許可する。
+
+この論理削除はSSD上の物理ブロック消去を保証しない。またダウンロード済みJSON、ZIP、展開フォルダーを探索・削除しない。認証情報を保存しないこと、OSアカウント保護、ブラウザプロファイル暗号化により残余リスクを軽減する。
 
 ## 11. ビルドと供給網
 
