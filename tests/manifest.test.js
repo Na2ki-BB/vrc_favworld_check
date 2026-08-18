@@ -43,6 +43,7 @@ test("manifest grants only the reviewed minimum permissions", async () => {
   assert.deepEqual(manifest.host_permissions, ["https://api.vrchat.cloud/*"]);
   assert.equal(manifest.content_scripts, undefined);
   assert.equal(manifest.externally_connectable, undefined);
+  assert.equal(manifest.key, undefined);
   assert.equal(manifest.optional_host_permissions, undefined);
   assert.equal(manifest.background.type, "module");
   assert.equal(

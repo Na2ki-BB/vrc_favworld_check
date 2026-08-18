@@ -2,7 +2,7 @@
 
 ## 1. 設計方針
 
-`vrc_favworld_check` は Chrome / Edge Manifest V3 拡張として動作し、VRChat API との通信、差分検知、履歴保存、表示、通知を利用者のブラウザ内だけで完結させる。
+`vrc_favworld_check` は Windows 版 Google Chrome の Manifest V3 拡張として動作し、VRChat API との通信、差分検知、履歴保存、表示、通知を利用者のブラウザ内だけで完結させる。
 
 中心となる設計原則は次のとおりである。
 
@@ -41,7 +41,7 @@
 
 ### 3.1 Extension Service Worker
 
-- 拡張機能の install / startup / alarm / UI message イベントを受ける。
+- Chrome 拡張機能の install / startup / alarm / UI message イベントを受ける。ここでいう install は Chrome の拡張イベントであり、Windows インストーラーの処理とは別である。
 - 同期を単一 flight（同時に 1 実行だけ）として調停する。
 - VRChat API adapter、差分検知、IndexedDB transaction、通知を順に呼び、同期のアプリケーション制御下にある全終了経路の `finally` で次回 alarm を置換する。
 - install / startup 時に User-Agent 用の動的 Declarative Net Request ルールを再登録する。
@@ -55,7 +55,7 @@
 
 - **ホーム**: ログイン案内、今すぐ確認、同期状態、最終成功、次回予定。
 - **履歴**: 検索、状態フィルター、イベント一覧、各ワールドの詳細。
-- **設定**: 定期同期、通知、エクスポート、復元、保存量表示、全記録削除と自己アンインストール。
+- **設定**: 定期同期、通知、エクスポート、復元、保存量表示、全記録削除と Chrome 側の自己アンインストール。Windows の固定配置ファイルはこの操作では削除しない。
 
 UI は同期、外部ページを開く操作、通常設定を Service Worker の閉じた `chrome.runtime.sendMessage` command で行い、API を直接呼ばない。大量になり得る一覧照会とバックアップ入出力だけは共有 repository を直接使う。復元は全検証後の単一 transaction とし、profile 世代番号を増加させて進行中の古い同期 plan を必ず競合 abort させる。
 
@@ -89,6 +89,20 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 - デスクトップ通知は transaction で生成された未 claim event のうち、名称変更、確定したお気に入り消失・復帰、アクセス不可・復帰だけを同期単位で集約する。`favorite_group_changed`は履歴と未読件数には含めるが、OS通知outboxへ入れない。
 - OS 通知は exactly-once にできないため、通知 API の attempt を最大 1 回にする厳密な at-most-once とする。API 呼出し前の transaction で `notificationClaimedAt` を確定し、以後は成功、明示的失敗、crash のいずれでも claim を解除しない。成功時は `notifiedAt`、明示的失敗時は固定コード `notificationError` を記録し、結果不明時は claim だけを残す。通知の成否にかかわらず履歴 event を正本とする。
 
+### 3.7 Windows Installer
+
+Inno Setup 6 は実行時コンポーネントではなく、検証済みの `dist/extension` を第一の利用者の端末へ固定配置する配布境界である。
+
+- `PrivilegesRequired=lowest` とし、現在の Windows ユーザー専用の `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` へ配置する。install path は変更させない。
+- Inno Setup 標準の HKCU アンインストール登録だけを使い、custom `[Registry]` section、browser policy、force install は使用しない。
+- 初回導入後に `chrome://extensions/` と固定 `extension` フォルダーを開き、Developer Mode、Load unpacked、フォルダー選択を日本語で案内する。Downloads のインストーラー自体は導入後に削除できる。
+- manifest に `key` を追加しない。同じ Windows ユーザー、Chrome プロフィール、固定 path を維持して同じ unpacked 拡張として読み込まれる前提とし、実機更新試験で extension ID と IndexedDB 履歴の保持を確認する。
+- 更新前に Chrome の全ウィンドウを閉じるよう表示するが、プロセス検出や強制終了はしない。semantic version の downgrade は拒否し、同版再インストールは許可する。
+- 新版は app root 内の `extension.new` へ展開・検証してから、現行 `extension` を `extension.old` へ移し、新版を固定 path へ切り替える。成功後は `extension.old` を削除し、失敗時だけ元へ戻す。退避は 1 世代に限定する。
+- Windows アンインストール前に、必要なら JSON をバックアップし、拡張 UI の「記録をすべて削除してアンインストール」を先に実行するよう案内する。Chrome 側の完了をプロフィールから自動判定しない。
+- Windows アンインストーラーの削除範囲は固定 app root 内に限定する。Chrome のプロフィール、Cookie、IndexedDB、書き出した JSON backup は探索も削除もしない。
+- service、scheduled task、startup、telemetry、自動更新、実行時ダウンロード、コード署名は持たない。
+
 ## 4. Manifest と権限設計
 
 ### 4.1 必要な宣言
@@ -103,7 +117,7 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 
 `cookies`、`webRequest`、`tabs`、`scripting`、`activeTab`、`<all_urls>` は宣言しない。`chrome.tabs.create` で固定 URL を開く操作は `tabs` 権限なしで行える。
 
-ブラウザ実装差で `declarativeNetRequestWithHostAccess` が利用できない対象版を支援する場合だけ、同等の限定ルールを保ったまま `declarativeNetRequest` を使う。必要最低ブラウザ版はビルド時に固定し、無条件に広い権限へフォールバックしない。
+対象とする Chrome 版で `declarativeNetRequestWithHostAccess` が利用できない場合だけ、同等の限定ルールを保ったまま `declarativeNetRequest` を使う。必要最低ブラウザ版はビルド時に固定し、無条件に広い権限へフォールバックしない。
 
 ### 4.2 User-Agent 動的ルール
 
@@ -472,7 +486,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - 拡張アイコンは未読イベント数を `1`〜`99+` で表示し、履歴画面を開いたときだけ DB の未読件数を0へする。
 - OS通知の本体または「履歴を見る」ボタンは、外部入力を混ぜない固定の`dashboard.html#events`を開く。dashboardはhashをallowlistで解釈し、DB読込み後に履歴タブを選択して既読化する。
 - 最終正常同期から36時間、8,000ワールド、80,000イベント、または概算20MiBを超えた場合だけ行動案内を表示する。通常の800件では利用者へメンテナンスを要求しない。
-- 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、clearと`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSONや手動配布フォルダーは削除対象外と明示する。
+- 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、clearと`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSON、Downloadsのインストーラー、Windowsの固定配置ファイルは拡張側の削除対象外と明示し、続けてWindows側のアンインストールを案内する。
 
 ## 12. テスト可能性
 
@@ -498,3 +512,5 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - version 1 DB migration と version 1 backup import が既存ワールド・イベントを保持し、version 2の空グループ状態へ安全に移行する。
 - 101件目のプロフィールrunと21件目の匿名run追加後に上限だけが残り、履歴は減らない。
 - purge transactionの注入abortでは自己アンインストールを呼ばず全利用者recordが残る。成功時だけ順序が `gate → alarm停止 → 全store原子的clear+gate再作成 → uninstall` となる。
+- installer config の静的テストで、ユーザー単位の固定 path、custom registry 不在、`key` 不在、禁止機能不在、downgrade 拒否、単一世代 rollback、app root 限定削除を確認する。
+- Windows 上の Inno Setup 6 compile と、知人の実 PC / 実 Chrome による fresh install、Downloads 削除後の動作、同版再インストール、1 回の上書き更新、ID・履歴保持、正規順序のアンインストールは手動リリースゲートとする。

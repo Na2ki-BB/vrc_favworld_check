@@ -56,7 +56,7 @@
                          └── credentials: include
 ```
 
-信頼するものは、配布パッケージに同梱されたコード、Chrome / Edge の拡張分離機構、IndexedDB の transaction、HTTPS 証明書検証である。VRChat API の内容、ワールド名、作者名、インポートファイル、時計、ネットワークは検証なしに信頼しない。
+信頼するものは、配布パッケージに同梱されたコード、Chrome の拡張分離機構、IndexedDB の transaction、HTTPS 証明書検証である。VRChat API の内容、ワールド名、作者名、インポートファイル、時計、ネットワークは検証なしに信頼しない。
 
 ## 4. 脅威モデル
 
@@ -64,7 +64,7 @@
 | --- | --- | --- | --- |
 | 資格情報の窃取 | 偽ログイン UI、入力欄、Cookie API | ログイン UI を作らない。`cookies` 権限なし。公式サイトを固定 HTTPS URL で開く | 端末またはブラウザ自体が侵害された場合は防げない |
 | 将来の token field 追加 | `/auth/user` schema / 実応答の変更 | 現行 `CurrentUser` に credential field がないことをリリースゲートで確認。禁止 field 名を検出したら fail closed。`id` と `displayName` だけを新 object へコピーし raw object を即時破棄 | JavaScript heap 上には parse 中の一時値が存在する |
-| セッションの外部送信 | 開発者 API、分析 SDK、クラッシュ収集 | VRChat 以外のネットワーク endpoint を持たない。テレメトリなし | 悪意ある将来更新はストア審査と公開ソースの検証対象 |
+| セッションの外部送信 | 開発者 API、分析 SDK、クラッシュ収集 | VRChat 以外のネットワーク endpoint を持たない。テレメトリ、自動更新、実行時ダウンロードなし | 悪意ある配布物を利用者が手動実行した場合は防げない |
 | 保存型 XSS | ワールド名・作者名に HTML / script | `textContent` 等の安全な DOM API、CSP、URL allowlist、`innerHTML` 禁止 | ブラウザ実装の未知の脆弱性 |
 | 悪意あるバックアップ | 巨大 JSON、prototype pollution、型偽装 | 1 profile に限定し、サイズ・深さ・件数・文字列長・ID・enum・日時を検証して plain data へ再構築 | 極端な入力による一時的メモリ負荷を上限で抑える |
 | 履歴破損 | 中断、部分書込み、並行同期 | 単一 flight、revision 検査、1 IndexedDB transaction、復元は対象 user だけ全件成功か全件失敗 | ブラウザプロファイル自体の物理破損 |
@@ -76,7 +76,10 @@
 | 通知からの情報漏えい | OS ロック画面にワールド名表示 | 通知本文は既定で「お気に入りワールドに変化があります」と件数だけ。詳細は拡張画面 | OS 通知履歴に製品利用の事実は残り得る |
 | バックアップの漏えい | 利用者が JSON を共有・クラウド同期 | エクスポート前に内容と保存先注意を表示。秘密情報は含めない | 嗜好履歴自体は平文なので、ファイル管理は利用者責任 |
 | グループAPIの部分破損 | owner不一致、重複ID、未知type、空応答 | 全要素を検証し、異常時は既存対応表を保持。主要ワールド同期と失敗境界を分離 | 前回名または内部名表示になる |
-| 消去前のアンインストール | IndexedDB transactionの失敗・中断 | 永続purge gate、alarm停止、全storeの原子的clear成功後だけ自己アンインストール | 書き出し済みJSONと手動展開フォルダーは残る |
+| 消去前のアンインストール | IndexedDB transactionの失敗・中断、Windows側だけの削除 | 永続purge gate、alarm停止、全storeの原子的clear成功後だけ自己アンインストールし、その後にWindows側を削除するよう案内 | Windows側はChrome内の削除完了を判定せず、書き出し済みJSONとブラウザ内DBは自動削除しない |
+| 未署名インストーラーの改ざん | 配布途中の実行ファイル差替え | ビルド時の内容検査、ファイル名とSHA-256を別経路で照合、自動更新なし | コード署名による発行者確認はなく、SmartScreen警告も残る |
+| 更新中の配置失敗 | 部分展開、file move失敗 | `extension.new`で先に検証し、現行版を`extension.old`へ1世代だけ退避、失敗時だけ復元 | 電源断の全状態や複数世代rollbackは扱わない |
+| 過剰なアンインストール | 広いwildcard、profile探索 | 削除対象を固定app root内の既知ファイルに限定 | 利用者がapp root外へ手動コピーしたファイルは残る |
 
 ## 5. 認証設計
 
@@ -131,6 +134,12 @@ IndexedDB の API 利用自体に `storage` 権限は不要だが、Chrome 公�
 - `<all_urls>` または wildcard host: VRChat API 以外を読む必要がない。
 
 自己アンインストールは `chrome.management.uninstallSelf` だけを利用し、他拡張の管理を可能にする `management` 権限は追加しない。
+
+### 6.3 Windows インストーラーの権限
+
+Inno Setup 6 は `PrivilegesRequired=lowest` で現在の Windows ユーザーだけを対象とし、管理者権限と UAC を要求しない。書込み・削除対象は `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory` の app root 内に固定する。
+
+Inno Setup 標準の HKCU アンインストール登録以外に registry を変更せず、custom `[Registry]` section、browser policy、force install、service、scheduled task、startup を使わない。Chrome のプロフィール、Cookie、IndexedDBを探索せず、インストーラーから認証、API、同期、DB、backup 処理を呼ばない。
 
 ## 7. User-Agent 付与の安全性
 
@@ -248,7 +257,9 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 
 全消去開始時に冪等な`beginPurge`で `purgePending` を先に保存して手動・自動同期をfail closedにし、`sync-next` alarmを止める。全storeを1 read-write transactionでclearし、同じtransactionで`purgePending`とschema情報だけを再作成する。repositoryの全書込みtransactionもsettings storeから同じguardを読み、別タブ・別DB connectionによる復元や設定変更を消去開始後は拒否する。transaction abortなら利用者recordを処理前のまま維持し、自己アンインストールしない。成功時だけ`uninstallSelf`へ進むため、確認ダイアログ中の終了や取消後もguardが残り、同期もDB書込みも再開しない。再起動後の再試行は有効なguardを解除せず消去と自己アンインストールをやり直し、新規guardを設定した今回の処理が消去前に失敗した場合だけ専用recoveryを許可する。
 
-この論理削除はSSD上の物理ブロック消去を保証しない。またダウンロード済みJSON、ZIP、展開フォルダーを探索・削除しない。認証情報を保存しないこと、OSアカウント保護、ブラウザプロファイル暗号化により残余リスクを軽減する。
+この論理削除はSSD上の物理ブロック消去を保証しない。また、ダウンロード済みJSON、Downloads内のインストーラー、Windowsの固定配置ファイルを拡張側から探索・削除しない。認証情報を保存しないこと、OSアカウント保護、ブラウザプロファイル暗号化により残余リスクを軽減する。
+
+正規の削除順序は、必要なJSONバックアップの保存、拡張UIの全消去と自己アンインストール、Windows側アンインストールの順とする。Windows側は固定app root内の `extension`、一時的な `extension.new` / `extension.old`、Inno Setup自身の固定ファイルだけを削除する。Chrome側の削除完了をプロフィールから判定せず、Chromeのプロフィール、Cookie、IndexedDB、JSONバックアップを削除しない。
 
 ## 11. ビルドと供給網
 
@@ -259,6 +270,9 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 - source map にローカル絶対 path、環境変数、秘密を含めない。公開配布物に不要なら含めない。
 - 配布 ZIP 作成前に `.env`、Cookie、token、実利用者 DB、ログ、テスト fixture の実データ、大容量生成物を検査する。
 - 公開 repository の CI secret は製品 runtime へ埋め込まない。
+- `npm run package` は検証済み `dist/extension` からChrome用ZIPとWindowsインストーラーを生成する。manifestと`package.json`のversion一致、manifestの`key`不在、同梱内容をインストーラー作成直前にも検査する。
+- WindowsインストーラーはInno Setup 6でコンパイルし、compilerの自動取得やruntime downloadを行わない。
+- インストーラーはコード署名しない。生成EXEのSHA-256を作成して別経路で利用者へ伝え、署名済みに見せる表現をしない。
 
 ## 12. セキュリティ検証
 
@@ -277,6 +291,10 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 11. 自動同期を有効にした成功、429、offline、5xx 上限、401、schema 不正、その他の各終了 fixture で、既存の名前付き alarm が正しい次回時刻の 1 件へ置換される。自動同期無効時は alarm が残らない。
 12. ビルド成果物と Git 差分を秘密情報パターンで検査する。
 13. 配布物のコードから許可 host 以外の `http://` / `https://` / `ws://` / `wss://` 文字列を列挙し、用途をレビューする。
+14. installer config に `PrivilegesRequired=lowest` と固定 `%LOCALAPPDATA%` path があり、install path変更UI、custom `[Registry]`、policy、force install、service、scheduled task、startup、telemetry、runtime download がないことを静的テストする。
+15. installer入力と `dist/extension` が一致し、manifestに`key`がなく、version一致、downgrade拒否、同版許可、単一`extension.old` rollback、app root限定削除が構成とテストで確認できる。
+16. Windows上のInno Setup 6 compileを完走し、生成EXEとSHA-256を確認する。
+17. 知人の実PCと実Chromeでfresh install、Downloadsのinstaller削除後の動作、同版再インストール、1回の上書き更新、更新前後のextension ID・履歴保持、正規順序のアンインストールを確認する。
 
 ## 13. 残余リスクと対応
 
@@ -287,3 +305,5 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 - **OS 通知は exactly-once ではない**: 本製品は通知前の永久 claim による厳密な at-most-once を選ぶ。claim 後 crash の曖昧な窓や通知 API の明示的失敗では通知が欠落し得るが、結果にかかわらず再 attempt して重複させず、履歴を正本とする。固定 `notificationError` は診断表示用であり再試行条件ではない。
 - **CurrentUser 仕様変更**: 現行 schema に credential / token / session field がないことが実装成立条件である。将来追加された場合は allowlist で値を捨てるだけで継続せず、同期を fail closed にして認証設計を再評価する。
 - **API 利用方針の変更**: Creator Guidelines をリリースごとに再確認する。利用禁止または安全な認証が成立しなくなった場合は API 同期を停止する更新を優先する。
+- **未署名インストーラー**: コード署名を行わないため、真正なビルドでもWindows SmartScreenが未認知の実行ファイルとして警告する可能性がある。ファイル名とSHA-256の別経路確認で改ざんリスクを下げるが、発行者証明と警告の解消は保証しない。
+- **限定した実機範囲**: 今回は知人の実PCと実Chrome 1環境をリリースゲートとし、Windows 10/11双方、Chrome/Edge双方、複数profile、ProcMon、複数AV、全障害点は網羅しない。

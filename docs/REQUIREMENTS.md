@@ -10,7 +10,7 @@
 
 第一の利用者は PC 操作に詳しくない 1 人の VRChat ユーザーとする。利用者がコマンド、設定ファイル、データベースを触らず、次を行えることを目標とする。
 
-1. Chrome または Edge に拡張機能を導入する。
+1. Windows 版 Google Chrome に拡張機能を導入する。
 2. VRChat 公式 Web サイトで普段どおりログインする。
 3. 「今すぐ確認」を押して、お気に入りワールドの初回記録を作る。
 4. 以降の名称変更、お気に入り一覧からの消失、現在アクセスできないワールドを通知と履歴で確認する。
@@ -18,7 +18,7 @@
 
 ## 3. 前提と制約
 
-- 対象ブラウザは Windows 版 Google Chrome と Microsoft Edge の Manifest V3 対応版とする。
+- 対象ブラウザは、第一の利用者が実際に使う Windows 版 Google Chrome の Manifest V3 対応版 1 種類とする。
 - データ、設定、履歴は拡張機能の IndexedDB にだけ保存する。開発者が運用するサーバーや DB は使用しない。
 - 利用者は VRChat 公式 Web サイト上でログインする。拡張機能はユーザー名、パスワード、2FA コード、Cookie、トークンの入力欄を持たない。
 - 拡張機能は `cookies` 権限を要求せず、Cookie 値を取得、表示、保存しない。API 通信時はブラウザが既存セッションを通常の HTTP Cookie として送信する。
@@ -47,6 +47,8 @@
 - **FR-ONB-03** VRChat 公式サイトを開く操作は `https://vrchat.com/home/login` を新しいタブで開く。拡張機能内にログイン画面を複製しない。
 - **FR-ONB-04** 未ログイン時は「VRChat 公式サイトでログインしてから、もう一度『今すぐ確認』を押してください」と次の操作を明示する。
 - **FR-ONB-05** 同期済みの VRChat ユーザー ID と現在のログインユーザー ID が異なる場合は履歴を混在させず、アカウント別の保存領域を作る。
+- **FR-ONB-06** Windows インストール完了時に Chrome の `chrome://extensions/` と固定配置した `extension` フォルダーを開き、「デベロッパー モード」「パッケージ化されていない拡張機能を読み込む」「開いたフォルダーを選択」の順を日本語で案内する。
+- **FR-ONB-07** Downloads 内のインストーラーは導入後に削除でき、固定配置した `extension` フォルダーは拡張を使用している間は移動・削除しないことを案内する。
 
 ### 5.2 認証と API 通信
 
@@ -155,7 +157,18 @@
 - **FR-PURGE-02** 操作開始後は新しい同期を禁止し、実行中なら消去を開始しない。名前付き alarm を停止し、拡張専用 IndexedDB の全利用者recordを1 transactionで消去して、`purgePending`とschema情報だけが残ったことを確認してから自己アンインストール API を呼ぶ。
 - **FR-PURGE-03** 消去 transaction が失敗した場合は全利用者recordを処理前のまま維持し、アンインストールせず再試行案内を出す。消去後に自己アンインストールが失敗または取り消された場合は、データ消去済みであることと手動削除方法を表示し、`purgePending`により同期を再開しない。ブラウザ再起動後の再試行は既存の`purgePending`を解除せず、原子的消去と自己アンインストールを冪等にやり直す。今回の操作が新しくguardを有効化し、かつ消去前に失敗した場合だけguardを解除して通常動作を修復する。
 - **FR-PURGE-04** `purgePending` は同期処理だけでなく、バックアップ復元、profile保存、履歴・未読・通知・設定更新を含む全DB書込み境界で、書込みと同じtransaction内から確認する。別タブや別connectionからの書込みでも、消去開始後に利用者recordを再生成できないようにする。
-- **FR-PURGE-05** 本拡張が作成した DB と実行予定だけを削除対象にする。利用者がダウンロードした JSON、手動配布版の ZIP・展開フォルダー、ブラウザ一般履歴は自動削除しない。
+- **FR-PURGE-05** 拡張側の全消去は、本拡張が作成した DB と実行予定だけを削除対象にする。利用者がダウンロードした JSON、Windows インストーラー、固定配置ファイル、Chrome のプロフィール・Cookie・一般履歴は自動削除しない。
+
+### 5.11 Windows インストーラー
+
+- **FR-INST-01** Inno Setup 6 の `PrivilegesRequired=lowest` を使い、管理者権限と UAC を要求しない Windows ユーザー単位のインストーラーとする。配置先は `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` に固定し、利用者による変更を許可しない。
+- **FR-INST-02** 検証済みの `dist/extension` だけを固定場所へ配置し、`package.json` と manifest の version 一致および配布内容をビルド時に再検査する。manifest に `key` を追加せず、認証、API、同期、IndexedDB、バックアップの実装を変更しない。
+- **FR-INST-03** Inno Setup 標準の現在ユーザー向けアンインストール登録だけを使う。custom `[Registry]` section、browser policy、force install、Chrome の Cookie・プロフィール・IndexedDBへのアクセスを使用しない。
+- **FR-INST-04** 更新前に Chrome の全ウィンドウを閉じるよう表示するが、プロセスの検出や強制終了は行わない。インストール済み manifest の semantic version より古い版への downgrade を拒否し、同じ版の再インストールは許可する。
+- **FR-INST-05** 新版を app root 内の `extension.new` へ先に展開する。成功後だけ現在の `extension` を `extension.old` へ一時退避して新版へ切り替え、新版配置の成功後に `extension.old` を削除する。切替または検証の失敗時だけ旧版を復元し、複数世代 rollback や電源断を網羅する状態機械は作らない。
+- **FR-INST-06** Windows 側のアンインストール前に、必要な JSON バックアップの保存と、拡張設定画面の「記録をすべて削除してアンインストール」を先に行うよう案内する。Chrome 側の削除完了をプロフィールから自動判定しない。
+- **FR-INST-07** Windows アンインストーラーは固定 app root 内の `extension`、`extension.new`、`extension.old` と Inno Setup 自身の固定ファイルだけを削除し、app root 外を削除しない。Chrome のプロフィール、Cookie、IndexedDB、および利用者が書き出した JSON バックアップを探索・削除しない。
+- **FR-INST-08** コード署名、自動更新、実行時ダウンロード、service、scheduled task、startup、telemetry を実装しない。
 
 ## 6. 非機能要件
 
@@ -188,7 +201,7 @@
 
 - **NFR-MNT-01** 差分検知、状態遷移、永続化、API、ブラウザ API、UI を分離し、API は偽実装へ差し替え可能にする。
 - **NFR-MNT-02** API 応答は必要フィールドだけを境界で検証・変換し、未知フィールド追加で壊れないようにする。
-- **NFR-MNT-03** Chrome と Edge で lint、型検査、単体テスト、結合テスト、配布 ZIP ビルドを再現できる。
+- **NFR-MNT-03** Chrome 向けに lint、型検査、単体テスト、結合テスト、配布 ZIP ビルドを再現できる。Windows では Inno Setup 6 を用いて同じ検証済み `dist/extension` からインストーラーを再現できる。
 
 ## 7. 非目標
 
@@ -200,6 +213,9 @@
 - ブラウザを OS ログイン時に自動起動する設定を変更すること。
 - ブラウザ終了中の常駐同期や通知を保証すること。
 - VRChat API の可用性や将来互換性を保証すること。
+- Chrome と Edge の双方、複数の Chrome プロフィール、Windows 10 と 11 の双方を今回の配布検証で網羅すること。
+- browser policy や force install による無人導入、ストア配布、自動更新を提供すること。
+- 複数世代 rollback、全障害点の fault injection、ProcMon、複数 AV 製品、コード署名を今回の完成条件に含めること。
 
 ## 8. 受け入れ条件
 
@@ -216,7 +232,7 @@
 11. **バックアップ**: エクスポート JSON に 1 profile だけが含まれ、Cookie、token、password、session の値がない。複数 profile を持つ DB へ復元すると対象 user の profile/worlds/favoriteGroups/events だけが一致する内容へ置換され、他 user の全データが保持され、安全な preferences だけが merge される。復元した過去 event は通知 attempt を発生させない。
 12. **原子性**: 差分反映または復元の途中で意図的にトランザクションを失敗させても、処理前の DB が読み出せる。
 13. **権限**: ビルド済み manifest に `cookies`、`webRequest`、`<all_urls>` がなく、`unlimitedStorage` があり、DNR の User-Agent 変更対象が拡張自身からの VRChat GET API 要求だけである。
-14. **配布物**: lint、型検査、単体・結合テスト、Chrome/Edge 用 Manifest V3 配布 ZIP の生成が成功する。
+14. **配布物**: lint、型検査、単体・結合テスト、Chrome 用 Manifest V3 配布 ZIP と Inno Setup 6 による Windows インストーラーの生成が成功する。
 15. **CurrentUser リリースゲート**: 最新仕様と実応答に credential、token、Cookie、session data の field がないことを確認できた場合だけ同期機能をリリースできる。禁止 field を含む fixture では API adapter が fail closed し、DB、ログ、バックアップへ値を残さない。
 16. **ページング終端**: 100 件未満の非空ページ後も実取得件数分だけ offset を進め、空ページまで取得する。同一非空 fingerprint、offset 停滞、10,000 件超過、101 要求内に空終端なしの各 fixture では状態を更新しない。
 17. **redirect 拒否**: 3xx fixture に対する fetch は `redirect: "manual"` で追従せず、redirect 先へ要求を送らず、既存履歴を変更しない。
@@ -228,3 +244,7 @@
 23. **確認優先度**: 20件以上の未確認候補が存在しても、前回404を1回確認済みのワールドが次回の20件に含まれ、2回目404で確定する。
 24. **保存量制御**: 101件目のプロフィール同期記録と21件目の匿名記録を追加すると、それぞれ最新100件・20件だけが残り、ワールドと変更履歴は削除されない。
 25. **データ消去**: 利用者recordの原子的消去成功前に自己アンインストールを呼ばない。transaction失敗時は全recordを維持し、成功時はprofile/world/group/event/syncRun/preferences/unreadが0で`purgePending`だけが残る。書き出し済みJSONは自動削除対象外と表示する。
+26. **インストーラー設定**: 静的テストで `PrivilegesRequired=lowest`、固定 `%LOCALAPPDATA%` 配置、変更不能な install path、custom `[Registry]` 不在、manifest の `key` 不在、service・scheduled task・startup・telemetry・runtime download 不在を確認できる。
+27. **初回導入**: 知人の実 PC と実 Chrome で fresh install すると、検証済み `dist/extension` が固定場所へ配置され、管理画面と Explorer が開き、日本語案内に従って unpacked 拡張を読み込める。Downloads のインストーラーを削除した後も動作する。
+28. **更新**: 同版再インストールと 1 回の上書き更新が成功し、downgrade は拒否される。更新前後で extension ID と履歴が保持され、失敗時だけ単一世代の `extension.old` が復元に使われる。
+29. **正規アンインストール**: 拡張側の全消去・自己アンインストールを先に行い、その後 Windows 側を削除できる。Windows アンインストーラーは app root 外、Chrome のプロフィール・Cookie・IndexedDB、JSON バックアップを削除せず、Chrome 側削除の自動判定もしない。

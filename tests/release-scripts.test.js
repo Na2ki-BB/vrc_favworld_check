@@ -12,7 +12,6 @@ import { assertPublicSourceHasNoSecrets, build } from "../scripts/build.mjs";
 import { packageExtension } from "../scripts/package.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ARCHIVE = path.join(ROOT, "artifacts", "vrc_favworld_check-v0.1.0.zip");
 
 test("public source scan detects a current GitHub fine-grained token without echoing it", async (context) => {
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "vrc-public-source-scan-"));
@@ -39,6 +38,12 @@ test("public source scan detects a current GitHub fine-grained token without ech
 
 test("extension ZIP is byte-identical across supported release time zones", async () => {
   await build();
+  const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
+  const archivePath = path.join(
+    ROOT,
+    "artifacts",
+    `vrc_favworld_check-v${String(packageJson.version)}.zip`
+  );
 
   /** @type {string[]} */
   const hashes = [];
@@ -47,10 +52,10 @@ test("extension ZIP is byte-identical across supported release time zones", asyn
     for (const timeZone of ["UTC", "Asia/Tokyo", "America/Los_Angeles"]) {
       process.env.TZ = timeZone;
       const result = await packageExtension(ROOT);
-      const archive = await readFile(ARCHIVE);
+      const archive = await readFile(archivePath);
       const hash = createHash("sha256").update(archive).digest("hex");
       hashes.push(hash);
-      assert.equal(result.outputPath, ARCHIVE);
+      assert.equal(result.outputPath, archivePath);
       assert.equal(result.digest, hash);
     }
   } finally {

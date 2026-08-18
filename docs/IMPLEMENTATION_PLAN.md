@@ -10,20 +10,21 @@
 - manifestに資格情報・閲覧履歴へアクセスする権限がない。
 - lint、strict typecheck、全テスト、coverage計測、build、公開物の秘密検査が成功し、未実行の主要分岐がないことをレビューする。
 - 800ワールド、8リスト、DB v1移行、backup v1互換、削除失敗の各fixtureが成功する。
-- 配布ZIPが複数タイムゾーンで同一になる。
+- 配布ZIPが複数タイムゾーンで同一になり、検証済み `dist/extension` から Inno Setup 6 の Windows インストーラーをコンパイルできる。
+- installer config の静的検査と、知人の実PC・実Chromeで限定した導入・更新・削除確認が成功する。
 - 実利用者のCookie、バックアップ、ログ、`.env`、ローカル専用文書がGit追跡対象にない。
 
 ## 2. 採用する構成
 
 | 領域 | 採用 | 理由 |
 | --- | --- | --- |
-| 実行環境 | Chrome / Edge Manifest V3拡張 | 公式Webログインをブラウザへ委ね、追加アプリなしでUI・定期実行・通知を提供できる |
+| 実行環境 | Windows版Google Chrome Manifest V3拡張 | 公式Webログインをブラウザへ委ね、常駐アプリなしでUI・定期実行・通知を提供できる |
 | 永続DB | 拡張origin内のIndexedDB `vrc-favworld-check` | サーバー費用と利用者によるDB導入が不要。transactionとschema migrationを利用できる |
 | 開発者DB | 使用しない | 利用者データと秘密を開発者が保持しない |
 | 認証 | VRChat公式サイトの既存セッション | パスワード、2FA、Cookie値、tokenを製品の管理対象にしない |
 | API | 読み取り専用GET | VRChat側の状態を変更しない |
 | 通知 | OS通知 + 永続未読バッジ | OS通知欠落時も履歴を正本として確認できる |
-| 配布 | Store用MV3 packageを正本 | 非IT利用者には自動更新できるStore配布が最終形。公開申請までは署名なしZIPで検証する |
+| 配布 | Chrome用MV3 package + Inno Setup 6 | 検証済み拡張をユーザー単位の固定LocalAppDataへ配置し、Downloadsの展開フォルダー保持を不要にする |
 
 ## 3. 実装順序と各出口条件
 
@@ -67,11 +68,15 @@
 ### Phase 5: 配布・実環境確認
 
 1. 再現可能なmanifest直下ZIPとSHA-256を作る。
-2. ChromeとEdgeの新規profileでsideload smoke testを行う。
-3. 利用者本人の環境で、公式ログイン、最大件数、リスト名、alarm、通知、backup、復元を確認する。
-4. 外部公開の承認後だけChrome Web Store / Edge Add-onsへ提出する。
+2. installer config の固定path、非昇格、禁止機能不在、単一世代rollback、app root限定削除を自動検査し、Inno Setup 6 compileを行う。
+3. 知人の実PC・実Chromeでfresh install、Downloadsのinstaller削除後の動作、同版再インストール、1回の上書き更新、extension ID・履歴保持を確認する。
+4. 拡張UIの全消去・自己アンインストール後にWindows側を削除する正規順序を確認する。
 
-Store審査、開発者登録、実アカウントでのAPI応答確認はローカル実装だけでは完了できないため、コードのrelease gateと分けて扱う。
+Windows 10/11双方、Chrome/Edge双方、複数profile、全障害点、ProcMon、複数AV、コード署名、自動更新は今回のrelease gateに含めない。実アカウントでのAPI応答確認もローカル実装だけでは完了できないため、コードのrelease gateと分けて扱う。
+
+2026-08-18 時点で手順 1・2 のローカル実装、Inno Setup 6.7.3 compile、全自動検証、レビューは完了した。
+手順 3・4 は知人の実 PC / 実 Chrome でのみ行う残作業であり、fresh install、Downloads の installer 削除後、
+同版再インストール、`0.1.0` より新しい版への 1 回の更新、extension ID・履歴保持、正規順序の削除を確認してから配布可能と判断する。
 
 ## 4. リスクの判断
 
@@ -84,8 +89,8 @@ Store審査、開発者登録、実アカウントでのAPI応答確認はロー
 | OS通知欠落 | 軽減 | IndexedDB履歴と未読バッジを正本にする |
 | 履歴の長期増加 | 保有・軽減 | core履歴は消さず、同期記録だけ整理し、容量警告と全消去を提供 |
 | ローカルDBが平文 | 保有 | 認証情報を保存せず、OSアカウント・ディスク保護を前提にする |
-| 手動配布の導入・更新 | 回避 | Store用packageを維持し、外部公開承認後にStoreを第一導線にする |
-| アンインストール後の残存 | 軽減 | DB論理削除を確認してから自己削除。外部JSON・物理痕跡は保証外と明示 |
+| 手動配布の導入・更新 | 軽減 | Inno Setupで固定pathへ配置し、同版再導入、downgrade拒否、単一世代rollbackを行う。自動更新はしない |
+| アンインストール後の残存 | 軽減 | DB論理削除とChrome側自己削除の後にWindows固定ファイルを削除。外部JSON・物理痕跡は保証外と明示 |
 
 ## 5. 変更管理
 
@@ -93,4 +98,4 @@ Store審査、開発者登録、実アカウントでのAPI応答確認はロー
 - API raw objectをrepositoryやloggerへ渡さない。
 - 依存追加、権限追加、通信先追加は個別の脅威レビューなしに行わない。
 - 修正は関連テストから始め、最後に全検証を一度通す。
-- push、Store提出、外部サービス送信は、ローカル検証と公開対象監査の後に明示承認を得て実行する。
+- push、GitHub Release、外部配布・外部サービス送信は、ローカル検証と公開対象監査の後に明示承認を得て実行する。

@@ -197,7 +197,7 @@ export async function build() {
     "host_permissions"
   );
 
-  for (const key of ["content_scripts", "externally_connectable", "optional_host_permissions"]) {
+  for (const key of ["content_scripts", "externally_connectable", "key", "optional_host_permissions"]) {
     if (key in manifest) {
       throw new Error(`manifest key is forbidden: ${key}`);
     }
