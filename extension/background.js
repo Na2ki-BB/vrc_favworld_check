@@ -1,6 +1,7 @@
 // @ts-check
 
 import { VrchatApi } from "./lib/api.js";
+import { AuthCookieBridge } from "./lib/auth-cookie-bridge.js";
 import { openDatabase } from "./lib/database.js";
 import { installUserAgentRule } from "./lib/dnr.js";
 import {
@@ -181,6 +182,7 @@ export function createBadgeUpdater(dependencies) {
  *   service: Pick<SyncService, "syncing" | "repairScheduleBestEffort">,
  *   repository: Pick<import("./lib/database.js").DatabaseRepository, "beginPurge" | "recoverFromFailedPurge" | "purgeAllData">,
  *   clearAlarm: () => Promise<boolean>,
+ *   cleanupAuthCookies: () => Promise<void>,
  *   clearBadge: () => Promise<void>,
  *   uninstallSelf: () => Promise<void>
  * }} dependencies
@@ -213,6 +215,7 @@ export function createPurgeController(dependencies) {
     try {
       guardEnabledByThisCall = await dependencies.repository.beginPurge();
       await dependencies.clearAlarm();
+      await dependencies.cleanupAuthCookies();
       await dependencies.repository.purgeAllData();
     } catch {
       if (guardEnabledByThisCall && await resetGuardBestEffort()) {
@@ -403,6 +406,7 @@ export function createMessageHandler(dependencies) {
 
 function registerChromeBackground() {
   const repositoryPromise = openDatabase();
+  const authCookieBridge = new AuthCookieBridge({ cookies: chrome.cookies });
   const alarmAdapter = {
     get: (/** @type {string} */ name) => chrome.alarms.get(name),
     create: async (
@@ -429,7 +433,8 @@ function registerChromeBackground() {
     notifications: {
       getPermissionLevel: () => chrome.notifications.getPermissionLevel(),
       create: (id, options) => chrome.notifications.create(id, options)
-    }
+    },
+    withApiSession: (operation) => authCookieBridge.withTemporaryApiCookies(operation)
   }));
 
   const badgeUpdaterPromise = repositoryPromise.then((repository) => createBadgeUpdater({
@@ -444,6 +449,7 @@ function registerChromeBackground() {
 
   const initialize = async () => {
     const ruleReady = installRule().catch(() => undefined);
+    const cookieCleanup = authCookieBridge.cleanupStaleCookies().catch(() => undefined);
     try {
       const service = await servicePromise;
       await service.repairScheduleBestEffort();
@@ -451,6 +457,7 @@ function registerChromeBackground() {
       // A later lifecycle event or user action retries initialization.
     }
     await ruleReady;
+    await cookieCleanup;
     try {
       await refreshBadge();
     } catch {
@@ -476,6 +483,7 @@ function registerChromeBackground() {
       service,
       repository,
       clearAlarm: () => chrome.alarms.clear(SYNC_ALARM_NAME),
+      cleanupAuthCookies: () => authCookieBridge.cleanupStaleCookies(),
       clearBadge: () => chrome.action.setBadgeText({ text: "" }),
       uninstallSelf: () => chrome.management.uninstallSelf({ showConfirmDialog: true })
     }));

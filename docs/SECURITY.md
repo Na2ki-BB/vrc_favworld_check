@@ -2,9 +2,9 @@
 
 ## 1. セキュリティ目標
 
-本製品の最優先事項は、利用者の VRChat 資格情報と既存セッションを製品の管理対象にしないことである。次を必須のセキュリティ目標とする。
+本製品の最優先事項は、利用者のVRChat資格情報を入力・永続保存・外部送信させず、既存セッションの利用範囲を同期中の固定APIへ限定することである。次を必須のセキュリティ目標とする。
 
-1. 利用者のユーザー名、パスワード、2FA コード、Cookie 値、auth token、session data を要求、読出し、保存、表示、送信しない。
+1. 利用者のユーザー名、パスワード、2FAコードを要求・読出し・保存しない。Cookie値は固定名2つを同期中だけ読み取り、拡張のDB、設定、ファイル、ログ、UI、通知、backup、開発者端末へ保存・表示・送信しない。
 2. VRChat API への通信は利用者のブラウザ、端末、IP から直接行い、開発者サーバーを経由しない。
 3. 履歴を利用者のブラウザ内に閉じ、利用者が明示的にエクスポートした場合だけファイルとして外へ出す。
 4. 不正または不完全な API 応答で履歴を壊したり、ワールドを誤って「削除済み」と断定したりしない。
@@ -15,7 +15,7 @@
 
 ## 2. 保護対象
 
-### 2.1 最重要: 製品が保持してはならない情報
+### 2.1 最重要: 永続保持または外部送信してはならない情報
 
 - VRChat パスワードとユーザー名の組合せ
 - 2FA コード、recovery code
@@ -23,7 +23,7 @@
 - auth token、session token、Authorization header
 - 将来の `/auth/user` 仕様変更で追加され得る認証関連フィールド
 
-これらは「暗号化して保存する」のではなく、そもそも取得経路と保存フィールドを作らない。
+これらの保存フィールド、export、ログ経路は作らない。`auth` と任意の `twoFactorAuth` だけは、公式WebセッションをAPIへ橋渡しする関数ローカル値および期限付き一時Cookieとして扱い、同期終了時と復旧時に削除する。
 
 ### 2.2 製品がローカルに保持する利用者データ
 
@@ -51,9 +51,9 @@
                                               IndexedDB transaction
 
 [認証境界]
- VRChat公式Web ── ブラウザが管理するCookie ── HTTPS request
-                         ▲                    （拡張は値を見ない）
-                         └── credentials: include
+ VRChat公式Web ─ ブラウザ管理Cookie ─ Auth Cookie Bridge ─ API用一時Cookie
+                                      │ 固定名2つだけ      │ 最大15分
+                                      └─ 値は保存・表示せず ─ HTTPS GET
 ```
 
 信頼するものは、配布パッケージに同梱されたコード、Chrome の拡張分離機構、IndexedDB の transaction、HTTPS 証明書検証である。VRChat API の内容、ワールド名、作者名、インポートファイル、時計、ネットワークは検証なしに信頼しない。
@@ -62,8 +62,11 @@
 
 | 脅威 | 想定経路 | 対策 | 残余リスク |
 | --- | --- | --- | --- |
-| 資格情報の窃取 | 偽ログイン UI、入力欄、Cookie API | ログイン UI を作らない。`cookies` 権限なし。公式サイトを固定 HTTPS URL で開く | 端末またはブラウザ自体が侵害された場合は防げない |
-| 将来の token field 追加 | `/auth/user` schema / 実応答の変更 | 現行 `CurrentUser` に credential field がないことをリリースゲートで確認。禁止 field 名を検出したら fail closed。`id` と `displayName` だけを新 object へコピーし raw object を即時破棄 | JavaScript heap 上には parse 中の一時値が存在する |
+| 資格情報の窃取 | 偽ログインUI、入力欄、広いCookie列挙・保存 | ログインUIを作らない。Cookie Bridgeを固定2名称・固定3host・短時間・非永続経路へ限定し、root hostは親domain競合検査だけに使い、値を呼出し元やloggerへ返さない | 拡張コード、端末、ブラウザ自体が侵害された場合、`cookies`権限によりVRChatセッションを盗まれ得る |
+| API側Cookieの衝突 | 既存APIセッションの上書き・誤削除 | root host permissionを含め、targetへ送信され得る固定名Cookieを親domain・全pathまで検査し、非秘密の所有マーカーがないものは上書きも削除もしない。削除直前にも値・属性を再確認し、partitioned Cookieも取得できた場合はfail closed | Chrome Cookie APIに原子的compare-and-deleteがないため、最終確認と削除の間の小さな競合窓は残る |
+| 一時Cookieの残留 | Service Worker・Chromeの強制終了、API応答による更新 | Secure/HttpOnly/SameSite=Strict、path `/api/1/`、設定時最大15分。通常終了は全対象と各削除直前に今回設定した値・属性の一致を確認し、中断後は誤削除せず失効を待つ | APIが同名Cookieを長い期限へ更新して直後にChromeが終了した場合は15分を超えて残り得るため、実機で更新不在をrelease gateにする |
+| CurrentUserに含まれるcredential-like field | `/auth/user` の `authToken` や将来field | bounded JSONから `id` と `displayName` だけを新objectへコピーし、その他は名前・値・階層を走査せずraw objectごと破棄。戻り値・DB・log・backupをallowlistで固定 | raw値はJSON parse後、GCされるまでJavaScript heap上へ一時的に存在し得る |
+| world metadataの非canonical ID | `/worlds/favorites` が従来の `wrld_` + UUID形式でないIDを返す | 実測endpointだけがnullable identityを明示opt-inし、非canonical IDを追加解釈・コピーせずmetadata出力前に除外。raw件数、他必須field、canonical ID重複、非空snapshot全体のcanonical metadata存在を検査する。除外IDは保存、UI、log、API URL、backupへ渡さず、canonicalな関係IDだけを正本にする | 除外行の名称metadataはその同期で利用できない。全件がnoncanonicalならsnapshotを拒否するため、API変更時は同期できない |
 | セッションの外部送信 | 開発者 API、分析 SDK、クラッシュ収集 | VRChat 以外のネットワーク endpoint を持たない。テレメトリ、自動更新、実行時ダウンロードなし | 悪意ある配布物を利用者が手動実行した場合は防げない |
 | 保存型 XSS | ワールド名・作者名に HTML / script | `textContent` 等の安全な DOM API、CSP、URL allowlist、`innerHTML` 禁止 | ブラウザ実装の未知の脆弱性 |
 | 悪意あるバックアップ | 巨大 JSON、prototype pollution、型偽装 | 1 profile に限定し、サイズ・深さ・件数・文字列長・ID・enum・日時を検証して plain data へ再構築 | 極端な入力による一時的メモリ負荷を上限で抑える |
@@ -71,7 +74,7 @@
 | 誤った削除判定 | 一時的ページ欠落、429、404 の曖昧性 | 全ページ完走、2 回連続確認、所属とアクセスの 2 軸、断定しない UI | API が一貫して誤った 200/404 を返す場合 |
 | API への過負荷 | 固定周期、個別全件 GET、再試行ループ | bulk API、2 秒間隔、12 時間+jitter、probe 最大20、429 即時停止、飽和 backoff | 非公式 API の未公開制限値は不明 |
 | User-Agent の広域書換え | 広すぎる DNR 条件 | extension ID、API host/path、GET、XHR に限定した動的 rule | Chrome の rule matching 仕様変更 |
-| 権限の過剰化 | `<all_urls>`、cookies、webRequest | manifest snapshot test と公開レビュー。必要 host を 1 つに固定 | host permission は対象 API 上の全 path への fetch 能力を持つ |
+| 権限の過剰化 | `<all_urls>`、広いcookies利用、webRequest | manifest snapshot testと公開レビュー。必要hostを `vrchat.com` / `vrchat.cloud` / `api.vrchat.cloud` に固定し、rootは親domain競合検査だけ、Cookie API使用箇所・名前・URLも静的検査 | `cookies` とhost permissionは侵害時に対象hostのCookieへ広くアクセスできるため、コード境界だけではChromeの権限自体を狭められない |
 | 依存関係侵害 | npm package の悪意ある更新 | lockfile 固定、最小依存、監査、配布物へリモートコードなし | build 端末・registry の侵害 |
 | 通知からの情報漏えい | OS ロック画面にワールド名表示 | 通知本文は既定で「お気に入りワールドに変化があります」と件数だけ。詳細は拡張画面 | OS 通知履歴に製品利用の事実は残り得る |
 | バックアップの漏えい | 利用者が JSON を共有・クラウド同期 | エクスポート前に内容と保存先注意を表示。秘密情報は含めない | 嗜好履歴自体は平文なので、ファイル管理は利用者責任 |
@@ -88,25 +91,29 @@
 1. 利用者が拡張画面の「VRChat 公式サイトを開く」を押す。
 2. 拡張は固定 URL `https://vrchat.com/home/login` を通常タブで開く。
 3. 利用者は VRChat が提供する画面でログインと 2FA を完了する。
-4. 拡張の Service Worker が `https://api.vrchat.cloud/api/1/auth/user` を `credentials: "include"`、`redirect: "manual"` で GET する。
-5. ブラウザは対象 host の Cookie をネットワーク層で処理する。拡張は Cookie API を呼ばない。
-6. 現行 `CurrentUser` 仕様に credential、token、Cookie、session data の field がないことを前提に、応答を `unknown` として禁止 field 名まで検査する。新しい object へ `id` と `displayName` だけをコピーし、未知 field の値を抽出せず raw 応答を直ちに破棄する。
+4. Service Workerは `https://vrchat.com/api/1/auth/user` に一致する `auth` と任意の `twoFactorAuth` を `chrome.cookies.get` で名前ごとに取得する。Promise版APIの未検出値 `undefined` を認証不足または任意Cookie不在として扱う。VRChatがsourceへSecure属性を付けていなくても、固定HTTPS URLからCookie APIで読むだけとし、値は関数ローカルから外へ返さない。
+5. API targetへ送信され得る既存の非partitioned同名Cookieが親domain・pathを問わずないことを検査する。値を含まない所有マーカーを先に作り、source属性を引き継がず、認証Cookieを `api.vrchat.cloud` のhost-only、path `/api/1/`、Secure、HttpOnly、SameSite=Strict、最長15分として一時設定する。
+6. 拡張自身のAPI GETだけに一致するUser-Agent用DNR ruleが完全な期待値で登録済みであることを検証する。不成立ならCookie Bridgeもfetchも開始しない。
+7. `https://api.vrchat.cloud/api/1/auth/user` を `credentials: "include"`、`redirect: "manual"` でGETする。応答のサイズ・media type・UTF-8・JSON・top-level object・必要2fieldを検査し、新しいobjectへ `id` と `displayName` だけをコピーする。現行仕様の `authToken`、`usesGeneratedPassword` を含むその他のfieldは列挙・再帰走査せずraw応答ごと破棄する。
+8. 以後の読み取り専用APIを同じ一時セッションで実行し、成功・API失敗・例外のすべてで今回設定した値・属性が一致する一時認証Cookieを先、所有マーカーを最後に削除する。途中終了後は認証Cookieを能動削除せず、失効による不在を確認してから孤立マーカーを削除する。
 
-Chrome の host permission 付き拡張要求における Cookie / SameSite の挙動は、[Storage and cookies](https://developer.chrome.com/docs/extensions/develop/concepts/storage-and-cookies) に従う。拡張は `document.cookie` も `chrome.cookies` も使用しない。
+ChromeのCookie APIとhost permissionは [chrome.cookies](https://developer.chrome.com/docs/extensions/reference/api/cookies) に従う。host permission付き拡張要求のSameSite挙動は [Storage and cookies](https://developer.chrome.com/docs/extensions/develop/concepts/storage-and-cookies) に従う。`document.cookie`、content script、全Cookie列挙は使用しない。
 
 ### 5.2 禁止するフロー
 
 - Basic 認証、OAuth を模した独自 token exchange
 - ユーザー名、パスワード、2FA、recovery code の入力欄
-- auth Cookie / token のコピー、export、暗号化保存
+- allowlist外Cookieの読取り・コピー、Cookie値のmessage受渡し、export、ログ、DB・設定・ファイルへの保存
 - WebSocket URL の query へ auth token を埋め込むこと
 - iframe や WebView に公式ログイン画面を埋め込むこと
-- ログイン状態を保つ目的で Cookie を更新・延命すること
+- ログイン状態を保つ目的でsource Cookieを更新・延命すること
 - ログアウト endpoint を呼ぶこと
 
 ### 5.3 認証失敗
 
 401 または認証失敗と判定できる 403 では、raw error を表示せず `AUTH_REQUIRED` へ変換する。自動でログインを試さず、既存 DB を変更せず、公式サイトを開く操作だけを提示する。
+
+source `auth` 欠落（Promise版APIの `undefined` を含む）も `AUTH_REQUIRED` とする。任意の `twoFactorAuth` が `undefined` なら不在として続行する。API側の既存Cookie競合は `AUTH_COOKIE_CONFLICT`、Cookie APIから返るpartitioned・権限・Cookie API・setup失敗は `AUTH_COOKIE_UNAVAILABLE`、終了後の残存は `AUTH_COOKIE_CLEANUP_FAILED` とし、Cookie値やブラウザ例外本文を表示・記録しない。cleanup失敗前に同期commitが完了している場合は履歴と最終成功時刻を正本として保持しつつ、Chromeの完全終了、15分待機、再起動を案内する。
 
 別の VRChat user ID が返った場合、以前の user の DB と混ぜない。利用者に「別の VRChat アカウントでログインしています」と表示し、別 profile として初回同期する。表示名だけで同一人物と判断しない。
 
@@ -120,18 +127,20 @@ Chrome の host permission 付き拡張要求における Cookie / SameSite の�
 | `notifications` | 確定変化の OS 通知 | generic な本文、利用者が無効化可能 |
 | `unlimitedStorage` | 履歴 IndexedDB の永続性 | IndexedDB を quota 制限と storage pressure による eviction から保護 |
 | `declarativeNetRequestWithHostAccess` | VRChat 指定形式の User-Agent | 動的 rule 1 件、extension initiator + API GET XHR のみ |
-| `https://api.vrchat.cloud/*` | API への cross-origin GET | API adapter で `/api/1/` と GET を再制限 |
+| `cookies` | 公式WebセッションをAPIへ一時橋渡し | Auth Cookie Bridge内の固定名2つと非秘密markerだけ。値を返却・永続化しない |
+| `https://vrchat.com/*` | source Cookie読取りと固定ログイン画面 | Cookie APIは固定source URLと名前へ再制限し、ページへcodeを注入しない |
+| `https://vrchat.cloud/*` | APIへ届き得る親domain Cookieの競合検査 | 固定名だけを列挙し、network fetch先にはしない |
+| `https://api.vrchat.cloud/*` | target一時CookieとAPI GET | Cookieは固定host/path、API adapterは `/api/1/` とGETへ再制限 |
 
 IndexedDB の API 利用自体に `storage` 権限は不要だが、Chrome 公式文書では `unlimitedStorage` が IndexedDB を quota 制限と eviction から除外する。消失後に再取得できない名称履歴を守るため、本製品では必須権限とする。これは端末故障、拡張削除、ブラウザプロファイル破損のバックアップ代替にはならない。
 
 ### 6.2 使用しない権限
 
-- `cookies`: Cookie 値へのアクセスを不要にする。
 - `webRequest` / `webRequestBlocking`: 通信の広域監視をしない。MV3 の限定 DNR rule を使う。
 - `tabs`: タブ URL や閲覧履歴を読む必要がない。
 - `history`, `downloads`, `clipboardRead`, `clipboardWrite`: 本機能に不要。
 - `scripting`, `activeTab`, content scripts: VRChat ページへコードを注入しない。
-- `<all_urls>` または wildcard host: VRChat API 以外を読む必要がない。
+- `<all_urls>` またはVRChat以外のwildcard host: 2つの固定host以外を読む必要がない。
 
 自己アンインストールは `chrome.management.uninstallSelf` だけを利用し、他拡張の管理を可能にする `management` 権限は追加しない。
 
@@ -190,11 +199,12 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - JSON parse は応答サイズ上限内で行う。
 - redirect response を JSON として parse しない。
 - 配列要素は `unknown` から必要 DTO へ 1 件ずつ検証する。
-- `id`、`favoriteId` の prefix と UUID 形式を検査する。
+- `id`、`favoriteId` の prefix と UUID 形式を検査する。例外は `/worlds/favorites` のページング境界だけが明示的にopt-inするnullable identityとする。canonical検査に一致しないIDは追加解釈・コピーせず `{ identity: null, metadata: null }` とし、raw件数だけをoffsetと総数上限へ含めてmetadata出力前に除外する。
 - favorite group は `fvgrp_` ID、本人 `ownerId`、一意な内部名、`world|vrcPlusWorld` type を検査する。avatar/friend groupは検証後に破棄し、raw objectを保存しない。
 - 名前と作者名は制御文字を除外し、表示・保存長を合理的な上限にする。ただし空白や Unicode 名を不必要に破壊しない。
-- 未知フィールドは無視する。必須フィールド欠落は page 全体を不正として同期を中止する。
-- 現行 OpenAPI `CurrentUser` に credential / token / session field がないことを release ごとに schema test する。実応答に禁止 field 名があれば値を抽出せず fail closed にする。
+- 未知フィールドは無視する。必須フィールド欠落はpage全体を不正として同期を中止する。noncanonical ID行もID以外の必須fieldをすべて検査する。null identityはglobal重複検査から除外し、canonical ID重複は中止する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、全件nullのpageを除外件数だけで反復判定しない。非空snapshot全体のcanonical metadataが0件なら中止する。
+- `/worlds/favorites` の `n=100` は要求件数であり、応答上限には使わない。100件超のraw pageは総数10,000件の残枠を投影前に検査し、他の一覧endpointは1ページ100件上限を維持する。
+- 現行OpenAPI `CurrentUser` の必要2fieldと追加fieldをreleaseごとに確認する。credential-like fieldを含むfixtureでも戻り値を `id` / `displayName` だけに固定し、必要2fieldの不正とbounded JSON境界だけをfail closedにする。
 - `/auth/user` raw object、未知 field、error body、header map を汎用 logger に渡さない。
 
 ### 9.2 DOM
@@ -255,11 +265,11 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 
 ### 10.4 全消去
 
-全消去開始時に冪等な`beginPurge`で `purgePending` を先に保存して手動・自動同期をfail closedにし、`sync-next` alarmを止める。全storeを1 read-write transactionでclearし、同じtransactionで`purgePending`とschema情報だけを再作成する。repositoryの全書込みtransactionもsettings storeから同じguardを読み、別タブ・別DB connectionによる復元や設定変更を消去開始後は拒否する。transaction abortなら利用者recordを処理前のまま維持し、自己アンインストールしない。成功時だけ`uninstallSelf`へ進むため、確認ダイアログ中の終了や取消後もguardが残り、同期もDB書込みも再開しない。再起動後の再試行は有効なguardを解除せず消去と自己アンインストールをやり直し、新規guardを設定した今回の処理が消去前に失敗した場合だけ専用recoveryを許可する。
+全消去開始時に冪等な`beginPurge`で `purgePending` を先に保存して手動・自動同期をfail closedにし、`sync-next` alarmを止める。今回の処理で所有を証明できる一時API Cookieの削除、または中断後の対象Cookie不在を確認してから、全storeを1 read-write transactionでclearし、同じtransactionで`purgePending`とschema情報だけを再作成する。repositoryの全書込みtransactionもsettings storeから同じguardを読み、別タブ・別DB connectionによる復元や設定変更を消去開始後は拒否する。Cookie cleanupまたはtransactionが失敗すれば利用者recordを処理前のまま維持し、自己アンインストールしない。成功時だけ`uninstallSelf`へ進むため、確認ダイアログ中の終了や取消後もguardが残り、同期もDB書込みも再開しない。再起動後の再試行は有効なguardを解除せずcleanup、消去、自己アンインストールをやり直し、新規guardを設定した今回の処理が消去前に失敗した場合だけ専用recoveryを許可する。
 
 この論理削除はSSD上の物理ブロック消去を保証しない。また、ダウンロード済みJSON、Downloads内のインストーラー、Windowsの固定配置ファイルを拡張側から探索・削除しない。認証情報を保存しないこと、OSアカウント保護、ブラウザプロファイル暗号化により残余リスクを軽減する。
 
-正規の削除順序は、必要なJSONバックアップの保存、拡張UIの全消去と自己アンインストール、Windows側アンインストールの順とする。Windows側は固定app root内の `extension`、一時的な `extension.new` / `extension.old`、Inno Setup自身の固定ファイルだけを削除する。Chrome側の削除完了をプロフィールから判定せず、Chromeのプロフィール、Cookie、IndexedDB、JSONバックアップを削除しない。
+正規の削除順序は、必要なJSONバックアップの保存、拡張UIによる一時Cookie不在確認・全消去・自己アンインストール、Windows側アンインストールの順とする。Windows側は固定app root内の `extension`、一時的な `extension.new` / `extension.old`、Inno Setup自身の固定ファイルだけを削除する。Chrome側の削除完了をプロフィールから判定せず、Chromeのプロフィール、公式Web側や他ソフトのCookie、IndexedDB、JSONバックアップを削除しない。
 
 ## 11. ビルドと供給網
 
@@ -278,32 +288,43 @@ OS 通知はロック画面へ表示され得るため、既定本文にワー�
 
 リリース前に少なくとも次を自動または手動で確認する。
 
-1. manifest snapshot に `cookies`、`webRequest`、`<all_urls>`、不要 host がなく、`unlimitedStorage` がある。
-2. DNR rule の host、path、initiator、resource type、method、User-Agent 形式が完全一致する。
-3. DNR 登録失敗時に fetch が呼ばれない。
-4. 最新 OpenAPI `CurrentUser` schema に credential、token、Cookie、session data の field がない。禁止 field を加えた `/auth/user` fixture では同期が fail closed し、IndexedDB、backup、log に値が残らない。
-5. `<img onerror=...>`、`<script>`、双方向 Unicode を含む world 名を表示しても code execution されない。
-6. 25 MiB 超、複数 profile、深い object、`__proto__`、重複 ID、壊れた参照の backup を拒否し、全 profile の旧 DB が残る。正常な復元では対象 user だけが置換される。
-7. 401、429、5xx、timeout、schema 不正で state transition が生じない。
-8. 429 後は同じ同期で要求せず、永続化した `backoffUntil` より前に新しい同期を開始しない。連続 429 で指数 delay と counter が上限に飽和する。
-9. `redirect: "manual"` により 3xx を追従せず、初期 URL 以外へ request を送らない。
-10. claim commit 後の crash または通知 API の明示的失敗を注入しても claim を解除せず、同じ event の通知 attempt が Service Worker 再起動後に増えない。明示的失敗では固定 `notificationError` が残り、いずれも履歴が表示できる。
-11. 自動同期を有効にした成功、429、offline、5xx 上限、401、schema 不正、その他の各終了 fixture で、既存の名前付き alarm が正しい次回時刻の 1 件へ置換される。自動同期無効時は alarm が残らない。
-12. ビルド成果物と Git 差分を秘密情報パターンで検査する。
-13. 配布物のコードから許可 host 以外の `http://` / `https://` / `ws://` / `wss://` 文字列を列挙し、用途をレビューする。
-14. installer config に `PrivilegesRequired=lowest` と固定 `%LOCALAPPDATA%` path があり、install path変更UI、custom `[Registry]`、policy、force install、service、scheduled task、startup、telemetry、runtime download がないことを静的テストする。
-15. installer入力と `dist/extension` が一致し、manifestに`key`がなく、version一致、downgrade拒否、同版許可、単一`extension.old` rollback、app root限定削除が構成とテストで確認できる。
-16. Windows上のInno Setup 6 compileを完走し、生成EXEとSHA-256を確認する。
-17. 知人の実PCと実Chromeでfresh install、Downloadsのinstaller削除後の動作、同版再インストール、1回の上書き更新、更新前後のextension ID・履歴保持、正規順序のアンインストールを確認する。
+1. manifest snapshotに必要な `cookies` と `unlimitedStorage` があり、`webRequest`、`<all_urls>`、不要hostがない。host permissionは `vrchat.com`、`vrchat.cloud`、`api.vrchat.cloud` の3つだけで、rootは親domain競合検査だけに使う。
+2. DNR rule の host、path、initiator、resource type、method、User-Agent 形式が API base と完全一致する。
+3. DNR登録失敗時にCookie bridgeとfetchが呼ばれない。
+4. Cookie bridgeがsourceの固定名2つだけを個別取得し、Promise版APIの未検出値とsourceの非Secure属性を実Chrome同様に扱いながら、targetのhost-only/path/Secure/HttpOnly/SameSite/TTL/storeIdを固定する。成功・401・429・例外で認証Cookie→markerの順に削除し、値をerror、DB、backup、DNRへ渡さない。
+5. source欠落、Chrome同等のhost権限フィルター、親domain・別pathを含むtarget競合、Cookie APIから返るpartitioned、set/remove失敗、古いmarker、並行呼出し、初回確認後の差替えを注入し、fetch 0または削除直前にも今回設定した値・属性が一致する場合だけ削除になる。異なる値・属性と再起動後の認証Cookieは削除せずcleanup失敗とする。
+6. 最新OpenAPI `CurrentUser` の `authToken`、`usesGeneratedPassword` とnestedのcredential-like fieldを加えた `/auth/user` fixtureでも同期でき、adapterの戻り値が `id` / `displayName` だけで、IndexedDB、backup、logに秘密値が残らない。必要2fieldの不正、top-level非object、誤Content-Type、巨大・不正JSONはfail closedになる。
+7. `<img onerror=...>`、`<script>`、双方向 Unicode を含む world 名を表示しても code execution されない。
+8. 25 MiB 超、複数 profile、深い object、`__proto__`、重複 ID、壊れた参照の backup を拒否し、全 profile の旧 DB が残る。正常な復元では対象 user だけが置換される。
+9. 401、429、5xx、timeout、schema 不正で state transition が生じない。
+10. 429 後は同じ同期で要求せず、永続化した `backoffUntil` より前に新しい同期を開始しない。連続 429 で指数 delay と counter が上限に飽和する。
+11. `redirect: "manual"` により 3xx を追従せず、初期 URL 以外へ request を送らない。
+12. claim commit 後の crash または通知 API の明示的失敗を注入しても claim を解除せず、同じ event の通知 attempt が Service Worker 再起動後に増えない。明示的失敗では固定 `notificationError` が残り、いずれも履歴が表示できる。
+13. 自動同期を有効にした成功、429、offline、5xx 上限、401、schema 不正、その他の各終了 fixture で、既存の名前付き alarm が正しい次回時刻の 1 件へ置換される。自動同期無効時は alarm が残らない。
+14. ビルド成果物と Git 差分を秘密情報パターンで検査する。
+15. 配布物のコードから許可 host 以外の `http://` / `https://` / `ws://` / `wss://` 文字列を列挙し、用途をレビューする。
+16. installer config に `PrivilegesRequired=lowest` と固定 `%LOCALAPPDATA%` path があり、install path変更UI、custom `[Registry]`、policy、force install、service、scheduled task、startup、telemetry、runtime download がないことを静的テストする。
+17. installer入力と `dist/extension` が一致し、manifestに`key`がなく、version一致、downgrade拒否、同版許可、単一`extension.old` rollback、app root限定削除が構成とテストで確認できる。
+18. Windows上のInno Setup 6 compileを完走し、生成EXEとSHA-256を確認する。
+19. `/worlds/favorites` の103件raw pageにIDだけがnoncanonicalな2行を含むfixtureで、IDを投影・分類せず2行をmetadata出力前に除外しつつ次を `offset=103` とする。nullable identityがこのendpointだけの明示opt-inで、nullがglobal重複検査から除外されること、canonical ID列と除外件数のfingerprint、全件nullの同数page、非空snapshot全体のcanonical metadata 0件を検査する。除外IDがadapter戻り値、DB、UI、log、backup、個別API URLに現れず、`/favorites` とbackupのcanonical検査が維持される。ID以外の不正とcanonical ID重複は引き続きfail closedになる。
+20. 対象の実PCと実Chromeでfresh install、Downloadsのinstaller削除後の動作、同版再インストール、`0.1.6`から`0.1.7`への上書き更新、`cookies`と3つのVRChat host権限、Service Workerからの `/auth/user` 200、`/worlds/favorites` の103件raw pageとnoncanonical ID行の非投影を含む完全同期、同期後の一時Cookie不在、更新前後のextension ID・履歴保持、正規順序のアンインストールを確認する。
+
+2026-08-24の対象実機では、`0.1.7`導入後の「今すぐお気に入りを確認」が成功し、`0.1.6`で `offset=0` の200応答後に発生していた `API_INCOMPATIBLE` は解消した。**推論**: 同期成功までの実装経路から、103件raw pageを処理して `offset=103` 以降へ進む経路も通過したと判断できる。項目20のうち、同期後の一時Cookie不在、extension ID・履歴保持、同版再インストール、正規順序のアンインストール、fresh install、Downloads削除後の動作は未確認であり、SmartScreenの実表示も確認していない。
 
 ## 13. 残余リスクと対応
 
 - **非公式 API**: endpoint、schema、認証 Cookie の挙動は予告なく変わり得る。不明な応答は fail closed とし、ワールド状態を更新せず、拡張更新を案内する。
+- **world metadataの非canonical ID**: 対象実機の `0.1.5` では103件のうちID形式だけ2件が従来検査に合わず、`0.1.6` では非canonical IDを安全な一時文字列として検査・identity利用した後も `offset=103` の要求前に完全同期未達となった。値は共有・記録されていない。`0.1.7` はこのendpointでcanonicalに一致しないIDを追加解釈・コピーせず除外し、対象実機の「今すぐお気に入りを確認」は成功した。該当行の名称等はその同期で利用できない。全件noncanonicalならfail closedとし、意味が公開仕様で確定できないIDを永続化・probeするより、canonicalな `/favorites` 関係IDと既存履歴を守る。
+- **source Cookieの属性**: 対象実機ではVRChatの `auth` と `twoFactorAuth` がSecure属性なしで保存されていた。これは本拡張が決める属性ではない。本拡張は固定HTTPS URLからだけ値を読み、sourceを変更・延命・HTTP送信せず、API側の一時Cookieには必ずSecureを付ける。
 - **404 の曖昧性**: 削除と非公開を区別できない。「現在アクセスできません」とだけ表示し、HTTP 404 と観測時刻を履歴根拠に残す。
-- **Cookie 制限設定**: ブラウザまたは企業ポリシーが第三者 Cookie を制限すると既存セッションを利用できない場合がある。制限を勝手に変更せず、公式サイト再ログインとブラウザ設定確認を案内する。
+- **Cookie制限・partitioning**: Bridgeはpartition keyを指定せず非partitioned Cookieだけを扱う。sourceがpartitionedだけなら通常は未ログインとして停止する一方、任意partitionを一括列挙するAPIは使わないため、すべてのpartitioned targetを事前検出する保証はない。設定を勝手に変更せず、対象実機で `/auth/user` 200と同期後のtarget Cookie不在をrelease gateにする。
+- **Cookie設定・削除の競合窓**: target不在の再確認と `cookies.set`、値・属性の最終確認と `cookies.remove` は、いずれも原子的なcompare-and-write/deleteではない。同じChrome profileの別拡張・別ツールが同じhost/name/pathへ同時操作した場合は競合が残る。対象利用者が同種ツールを併用しない前提とし、設定直前の再確認、設定結果の完全一致検査、全対象の事前検査、各削除直前の再比較で窓を縮め、異常はcleanup失敗にする。
+- **一時Cookie残留**: 通常終了では今回設定した値・属性の一致時だけ削除し、途中終了後は認証Cookieを誤削除せず、設定時点の最長15分の失効を待つ。APIが同名Cookieを長期更新する可能性はコードだけで排除できないため、対象実機で各API応答後も値・属性・期限が変わらず、同期後に不在となることをrelease gateにする。変化を検出した場合は配布せず認証設計を見直す。
+- **広いブラウザ権限**: Chromeは `cookies` 権限をCookie名単位に制限できない。実装と自動テストで固定名・固定hostへ狭めるが、悪意ある更新や拡張コード侵害時の影響は権限自体では防げない。配布物のSHA-256確認と公開レビューを前提とする。
+- **必須権限の変更**: `0.1.2` では `cookies` と `vrchat.com` / `api.vrchat.cloud`、`0.1.3`では親domain競合検査用のroot `vrchat.cloud` が追加で必要なため、Chromeが拡張を一時停止し、再承認を求める可能性がある。更新後に管理画面で対象host、拡張の有効状態、表示versionを利用者が確認する。インストーラーは権限を自動承認しない。
 - **ローカル平文データ**: 同一 OS アカウントの攻撃者からは保護できない。秘密情報は保存せず、嗜好履歴については OS の保護に依存する。
 - **OS 通知は exactly-once ではない**: 本製品は通知前の永久 claim による厳密な at-most-once を選ぶ。claim 後 crash の曖昧な窓や通知 API の明示的失敗では通知が欠落し得るが、結果にかかわらず再 attempt して重複させず、履歴を正本とする。固定 `notificationError` は診断表示用であり再試行条件ではない。
-- **CurrentUser 仕様変更**: 現行 schema に credential / token / session field がないことが実装成立条件である。将来追加された場合は allowlist で値を捨てるだけで継続せず、同期を fail closed にして認証設計を再評価する。
+- **CurrentUserのcredential-like field**: 現行schemaには任意の `authToken` と必須の `usesGeneratedPassword` がある。これらを含む未知fieldはbounded parse中に一時的にheapへ存在し得るが、名前・値・階層を走査せず、`id` / `displayName` 以外をadapter外へ渡さない。必要2fieldの契約が変わった場合はfail closedにして再評価する。
 - **API 利用方針の変更**: Creator Guidelines をリリースごとに再確認する。利用禁止または安全な認証が成立しなくなった場合は API 同期を停止する更新を優先する。
 - **未署名インストーラー**: コード署名を行わないため、真正なビルドでもWindows SmartScreenが未認知の実行ファイルとして警告する可能性がある。ファイル名とSHA-256の別経路確認で改ざんリスクを下げるが、発行者証明と警告の解消は保証しない。
-- **限定した実機範囲**: 今回は知人の実PCと実Chrome 1環境をリリースゲートとし、Windows 10/11双方、Chrome/Edge双方、複数profile、ProcMon、複数AV、全障害点は網羅しない。
+- **限定した実機範囲**: 今回は対象の実PCと実Chrome 1環境をリリースゲートとし、Windows 10/11双方、Chrome/Edge双方、複数profile、ProcMon、複数AV、全障害点は網羅しない。

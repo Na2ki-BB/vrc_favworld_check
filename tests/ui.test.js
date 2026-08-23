@@ -214,6 +214,10 @@ test("auth and failure status use actionable Japanese messages", () => {
   assert.match(commandErrorMessage("vrchat_unavailable"), /VRChat側/u);
   assert.match(commandErrorMessage("storage_unavailable"), /ブラウザ/u);
   assert.match(commandErrorMessage("sync_failed"), /保存済み/u);
+  assert.match(commandErrorMessage("auth_cookie_unavailable"), /Chrome/u);
+  assert.match(commandErrorMessage("auth_cookie_conflict"), /安全/u);
+  assert.match(commandErrorMessage("auth_cookie_cleanup_failed"), /終了/u);
+  assert.match(commandErrorMessage("auth_cookie_cleanup_failed"), /15分/u);
   assert.equal(formatDateTime("not-a-date"), "—");
 });
 
@@ -263,6 +267,9 @@ test("purge responses never claim deletion without explicit evidence", () => {
 test("every uppercase public sync error maps to actionable copy", () => {
   const expectedWords = new Map([
     ["AUTH_REQUIRED", "公式サイト"],
+    ["AUTH_COOKIE_UNAVAILABLE", "Chrome"],
+    ["AUTH_COOKIE_CONFLICT", "安全"],
+    ["AUTH_COOKIE_CLEANUP_FAILED", "終了"],
     ["RATE_LIMITED", "時間をあけ"],
     ["OFFLINE", "接続"],
     ["VRCHAT_UNAVAILABLE", "VRChat側"],

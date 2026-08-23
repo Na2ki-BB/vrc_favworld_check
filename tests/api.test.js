@@ -5,10 +5,12 @@ import assert from "node:assert/strict";
 
 import {
   API_ERROR_CODES,
+  API_MAX_ITEMS,
   API_MAX_PAGE_REQUESTS,
   API_MAX_RESPONSE_BYTES,
   API_MAX_TAGS,
   API_MAX_TEXT_CODE_POINTS,
+  API_PAGE_SIZE,
   ApiSchemaError,
   AuthRequiredError,
   NetworkError,
@@ -22,6 +24,7 @@ import {
 
 const USER_ID = "usr_00000000-0000-0000-0000-000000000001";
 const WORLD_ID = "wrld_00000000-0000-0000-0000-000000000001";
+const NONCANONICAL_WORLD_ID_1 = "noncanonical-world-id-1";
 
 /**
  * @typedef {(input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>} ResponseFactory
@@ -121,6 +124,7 @@ function favoriteGroup(number, type = "world", overrides = {}) {
 }
 
 test("getCurrentUser uses fixed read-only options and projects only safe fields", async () => {
+  assert.equal(VRCHAT_API_BASE_URL, "https://api.vrchat.cloud/api/1");
   const harness = createHarness([
     jsonResponse({
       id: USER_ID,
@@ -148,78 +152,59 @@ test("getCurrentUser uses fixed read-only options and projects only safe fields"
   assert.equal(headers.has("Authorization"), false);
 });
 
-test("getCurrentUser fails closed on a nested sensitive field without exposing it", async () => {
+test("getCurrentUser discards documented and nested credential-like fields", async () => {
   const secret = "do-not-copy-this-value";
   const harness = createHarness([
     jsonResponse({
       id: USER_ID,
       displayName: "利用者",
-      nested: { auth_token: secret }
+      authToken: secret,
+      usesGeneratedPassword: true,
+      nested: {
+        auth_token: secret,
+        cookie: secret,
+        session: secret,
+        password: secret,
+        privateKey: secret
+      }
     })
   ]);
 
-  await assert.rejects(harness.api.getCurrentUser(), (error) => {
-    assert.ok(error instanceof ApiSchemaError);
-    assert.equal(error.code, API_ERROR_CODES.API_INCOMPATIBLE);
-    assert.equal(error.category, "schema");
-    assert.equal(error.message.includes(secret), false);
-    assert.equal(JSON.stringify(error).includes(secret), false);
-    return true;
-  });
+  const user = await harness.api.getCurrentUser();
+
+  assert.deepEqual(user, { id: USER_ID, displayName: "利用者" });
+  assert.deepEqual(Object.keys(user), ["id", "displayName"]);
+  assert.equal(JSON.stringify(user).includes(secret), false);
   assert.equal(harness.calls.length, 1);
 });
 
-test("getCurrentUser rejects unknown credential-like keys but accepts known friendKey", async () => {
-  for (const field of ["accessKey", "privateKey", "authenticationKey", "signing_key"]) {
-    const harness = createHarness([
-      jsonResponse({
-        id: USER_ID,
-        displayName: "利用者",
-        nested: { [field]: "fixture-value" }
-      })
-    ]);
-
-    await assert.rejects(
-      harness.api.getCurrentUser(),
-      ApiSchemaError,
-      `credential-like field must be rejected: ${field}`
-    );
-    assert.equal(harness.calls.length, 1);
-  }
-
-  const compatible = createHarness([
-    jsonResponse({
-      id: USER_ID,
-      displayName: "利用者",
-      friendKey: "known-vrchat-field"
-    })
-  ]);
-  assert.deepEqual(await compatible.api.getCurrentUser(), {
-    id: USER_ID,
-    displayName: "利用者"
-  });
-
-  const misplacedKnownField = createHarness([
-    jsonResponse({
-      id: USER_ID,
-      displayName: "利用者",
-      nested: { friendKey: "unexpected-location" }
-    })
-  ]);
-  await assert.rejects(misplacedKnownField.api.getCurrentUser(), ApiSchemaError);
-});
-
-test("getCurrentUser rejects invalid and excessively deep schemas", async () => {
+test("getCurrentUser ignores unknown fields without traversing their structure", async () => {
   /** @type {Record<string, unknown>} */
-  const deep = { id: USER_ID, displayName: "利用者" };
+  const deep = {};
   /** @type {Record<string, unknown>} */
   let cursor = deep;
-  for (let index = 0; index < 10; index += 1) {
+  for (let index = 0; index < 20; index += 1) {
     const nested = {};
     cursor.next = nested;
     cursor = nested;
   }
 
+  const harness = createHarness([
+    jsonResponse({
+      id: USER_ID,
+      displayName: "利用者",
+      friendKey: "known-vrchat-field",
+      unknown: deep
+    })
+  ]);
+
+  assert.deepEqual(await harness.api.getCurrentUser(), {
+    id: USER_ID,
+    displayName: "利用者"
+  });
+});
+
+test("getCurrentUser still rejects invalid required fields", async () => {
   const invalidIdHarness = createHarness([
     jsonResponse({ id: "not-a-user-id", displayName: "利用者" })
   ]);
@@ -228,8 +213,27 @@ test("getCurrentUser rejects invalid and excessively deep schemas", async () => 
     ApiSchemaError
   );
 
-  const deepHarness = createHarness([jsonResponse(deep)]);
-  await assert.rejects(deepHarness.api.getCurrentUser(), ApiSchemaError);
+  const invalidPayloads = [
+    {},
+    { id: USER_ID },
+    { displayName: "利用者" },
+    { id: USER_ID, displayName: "" },
+    null,
+    []
+  ];
+  for (const payload of invalidPayloads) {
+    const harness = createHarness([jsonResponse(payload)]);
+    await assert.rejects(harness.api.getCurrentUser(), ApiSchemaError);
+    assert.equal(harness.calls.length, 1);
+  }
+
+  const invalidJsonHarness = createHarness([
+    new Response("{not-json", {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    })
+  ]);
+  await assert.rejects(invalidJsonHarness.api.getCurrentUser(), ApiSchemaError);
 });
 
 test("successful responses require bounded JSON and bounded text fields", async () => {
@@ -334,6 +338,183 @@ test("favorite world pagination includes releaseStatus=all and validates metadat
     invalidHarness.api.listAllFavoriteWorlds(),
     ApiSchemaError
   );
+});
+
+test("favorite world pagination accepts an over-returned page and advances by its actual length", async () => {
+  const overReturnedPage = Array.from(
+    { length: API_PAGE_SIZE + 3 },
+    (_, index) => favoriteWorld(index + 1)
+  );
+  overReturnedPage[1] = {
+    ...favoriteWorld(2),
+    id: NONCANONICAL_WORLD_ID_1
+  };
+  overReturnedPage[API_PAGE_SIZE + 1] = {
+    ...favoriteWorld(API_PAGE_SIZE + 2),
+    id: NONCANONICAL_WORLD_ID_1
+  };
+  const harness = createHarness([
+    jsonResponse(overReturnedPage),
+    jsonResponse([favoriteWorld(API_PAGE_SIZE + 4)]),
+    jsonResponse([])
+  ]);
+
+  const result = await harness.api.listAllFavoriteWorlds();
+
+  assert.equal(result.length, API_PAGE_SIZE + 2);
+  assert.equal(result[0]?.id, worldId(1));
+  assert.equal(result.at(-1)?.id, worldId(API_PAGE_SIZE + 4));
+  assert.equal(JSON.stringify(result).includes(NONCANONICAL_WORLD_ID_1), false);
+  assert.deepEqual(
+    harness.calls.map((call) => call.url),
+    [
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=0&releaseStatus=all`,
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=103&releaseStatus=all`,
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=104&releaseStatus=all`
+    ]
+  );
+});
+
+test("favorite world pagination ignores unusable ID values without copying them", async () => {
+  const unusableIds = [
+    undefined,
+    null,
+    42,
+    "",
+    " leading-space",
+    "trailing-space ",
+    "opaque\u0000world",
+    "x".repeat(201),
+    { nested: "object" },
+    ["array"]
+  ];
+  const harness = createHarness([
+    jsonResponse([
+      ...unusableIds.map((id, index) => ({
+        ...favoriteWorld(index + 1),
+        id
+      })),
+      favoriteWorld(100)
+    ]),
+    jsonResponse([])
+  ]);
+
+  assert.deepEqual(await harness.api.listAllFavoriteWorlds(), [
+    favoriteWorld(100)
+  ]);
+  assert.equal(
+    harness.calls[1]?.url,
+    `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=11&releaseStatus=all`
+  );
+});
+
+test("favorite world pagination validates skipped rows and ignores duplicate unusable IDs", async () => {
+  const invalidMetadata = createHarness([
+    jsonResponse([{
+      ...favoriteWorld(1),
+      id: NONCANONICAL_WORLD_ID_1,
+      favoriteGroup: null
+    }])
+  ]);
+  await assert.rejects(
+    invalidMetadata.api.listAllFavoriteWorlds(),
+    ApiSchemaError
+  );
+
+  const duplicateId = createHarness([
+    jsonResponse([
+      { ...favoriteWorld(1), id: NONCANONICAL_WORLD_ID_1 },
+      { ...favoriteWorld(2), id: NONCANONICAL_WORLD_ID_1 },
+      favoriteWorld(3)
+    ]),
+    jsonResponse([])
+  ]);
+  assert.deepEqual(
+    await duplicateId.api.listAllFavoriteWorlds(),
+    [favoriteWorld(3)]
+  );
+  assert.equal(
+    duplicateId.calls[1]?.url,
+    `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=3&releaseStatus=all`
+  );
+});
+
+test("unidentifiable-only pages advance by raw count until canonical metadata appears", async () => {
+  const harness = createHarness([
+    jsonResponse([{
+      ...favoriteWorld(1),
+      id: NONCANONICAL_WORLD_ID_1
+    }]),
+    jsonResponse([{
+      ...favoriteWorld(2),
+      id: NONCANONICAL_WORLD_ID_1
+    }]),
+    jsonResponse([favoriteWorld(3)]),
+    jsonResponse([])
+  ]);
+
+  assert.deepEqual(
+    await harness.api.listAllFavoriteWorlds(),
+    [favoriteWorld(3)]
+  );
+  assert.deepEqual(
+    harness.calls.map((call) => call.url),
+    [
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=0&releaseStatus=all`,
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=1&releaseStatus=all`,
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=2&releaseStatus=all`,
+      `${VRCHAT_API_BASE_URL}/worlds/favorites?n=100&offset=3&releaseStatus=all`
+    ]
+  );
+});
+
+test("a non-empty snapshot with no canonical world metadata fails closed", async () => {
+  const harness = createHarness([
+    jsonResponse([{ ...favoriteWorld(1), id: null }]),
+    jsonResponse([])
+  ]);
+
+  await assert.rejects(
+    harness.api.listAllFavoriteWorlds(),
+    ApiSchemaError
+  );
+  assert.equal(harness.calls.length, 2);
+});
+
+test("canonical favorite world IDs still reject duplicates across pages", async () => {
+  const harness = createHarness([
+    jsonResponse([
+      favoriteWorld(1),
+      { ...favoriteWorld(2), id: null }
+    ]),
+    jsonResponse([favoriteWorld(1)])
+  ]);
+
+  await assert.rejects(
+    harness.api.listAllFavoriteWorlds(),
+    PaginationError
+  );
+  assert.equal(harness.calls.length, 2);
+});
+
+test("noncanonical world IDs stay forbidden in relations and probe paths", async () => {
+  const relationHarness = createHarness([
+    jsonResponse([{
+      ...relation(1),
+      favoriteId: NONCANONICAL_WORLD_ID_1
+    }])
+  ]);
+  await assert.rejects(
+    relationHarness.api.listAllFavoriteRelations(),
+    ApiSchemaError
+  );
+
+  const probeHarness = createHarness([]);
+  await assert.rejects(
+    probeHarness.api.getWorld(NONCANONICAL_WORLD_ID_1),
+    ApiSchemaError
+  );
+  assert.equal(probeHarness.calls.length, 0);
 });
 
 test("favorite groups use owner-scoped paging and expose only minimal world metadata", async () => {
@@ -450,6 +631,33 @@ test("pagination makes at most 101 requests without an empty terminator", async 
     PaginationError
   );
   assert.equal(harness.calls.length, API_MAX_PAGE_REQUESTS);
+});
+
+test("favorite world pagination rejects a page above the global item limit before projection", async () => {
+  const harness = createHarness([
+    jsonResponse(Array.from({ length: API_MAX_ITEMS + 1 }, () => null))
+  ]);
+
+  await assert.rejects(
+    harness.api.listAllFavoriteWorlds(),
+    PaginationError
+  );
+  assert.equal(harness.calls.length, 1);
+});
+
+test("other paged endpoints retain the requested page-size response limit", async () => {
+  const harness = createHarness([
+    jsonResponse(Array.from(
+      { length: API_PAGE_SIZE + 1 },
+      (_, index) => relation(index + 1)
+    ))
+  ]);
+
+  await assert.rejects(
+    harness.api.listAllFavoriteRelations(),
+    ApiSchemaError
+  );
+  assert.equal(harness.calls.length, 1);
 });
 
 test("getWorld returns only 200 metadata or a 404 observation", async () => {

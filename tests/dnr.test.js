@@ -14,6 +14,7 @@ import {
 const RUNTIME_ID = "abcdefghijklmnopabcdefghijklmnop";
 
 test("User-Agent rule is limited to extension-originated VRChat API GET XHR", () => {
+  assert.equal(API_RULE_URL_FILTER, "|https://api.vrchat.cloud/api/1/");
   const rule = createUserAgentRule({ runtimeId: RUNTIME_ID, version: "1.2.3" });
 
   assert.equal(rule.id, USER_AGENT_RULE_ID);
@@ -41,7 +42,7 @@ test("rule installation replaces only its owned fixed rule ID", async () => {
   let installed = [];
   await installUserAgentRule({
     runtimeId: RUNTIME_ID,
-    version: "0.1.0",
+    version: "0.1.7",
     updateDynamicRules: async (update) => {
       observed.push(update);
       installed = update.addRules ?? [];
@@ -60,7 +61,7 @@ test("rule installation fails closed when Chrome does not retain the exact rule"
   await assert.rejects(
     installUserAgentRule({
       runtimeId: RUNTIME_ID,
-      version: "0.1.0",
+      version: "0.1.7",
       updateDynamicRules: async () => {},
       getDynamicRules: async () => []
     }),
@@ -74,7 +75,7 @@ test("rule verification rejects a broadened retained condition", async () => {
   await assert.rejects(
     installUserAgentRule({
       runtimeId: RUNTIME_ID,
-      version: "0.1.0",
+      version: "0.1.7",
       updateDynamicRules: async (update) => {
         const intended = update.addRules?.[0];
         assert.ok(intended);

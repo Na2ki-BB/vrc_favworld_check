@@ -27,13 +27,17 @@ Creator Guidelines の「API Usage / Bots」が本製品に直接関係する。
 
 - [VRChat.community トップ](https://vrchat.community/)
 - [Login and/or Get Current User Info](https://vrchat.community/reference/get-current-user)
+- [CurrentUser schema](https://raw.githubusercontent.com/vrchatapi/specification/main/openapi/components/schemas/CurrentUser.yaml)
 - [List Favorites](https://vrchat.community/reference/get-favorites)
 - [List Favorite Groups](https://vrchat.community/reference/get-favorite-groups)
 - [FavoriteGroup schema](https://raw.githubusercontent.com/vrchatapi/specification/main/openapi/components/schemas/FavoriteGroup.yaml)
 - [List Favorited Worlds](https://vrchat.community/reference/get-favorited-worlds)
+- [WorldID schema](https://raw.githubusercontent.com/vrchatapi/specification/main/openapi/components/schemas/WorldID.yaml)
+- [FavoritedWorld schema](https://raw.githubusercontent.com/vrchatapi/specification/main/openapi/components/schemas/FavoritedWorld.yaml)
 - [Get World by ID](https://vrchat.community/reference/get-world)
 - [Websocket API / Pipeline](https://vrchat.community/websocket)
 - [コミュニティ OpenAPI specification](https://github.com/vrchatapi/specification)
+- [生成 SDK のブラウザ利用説明](https://github.com/vrchatapi/vrchatapi-dart/blob/main/vrchat_dart_generated/README.md)
 
 これらは VRChat 公式 API ドキュメントではない。Creator Guidelines 自身が community の非公式ドキュメントに言及し、「正確で規則を尊重する傾向がある」が利用は自己責任である旨を説明している。
 
@@ -98,7 +102,7 @@ Creator Guidelines の「API Usage / Bots」が本製品に直接関係する。
 
 - extension Service Worker と extension page は、manifest の host permission があれば extension origin 外へ `fetch` できる。
 - content script は host permission があっても page origin の same-origin policy に従う。
-- `https://api.vrchat.cloud/*` の host permission は API fetch に必要だが、`<all_urls>` は不要である。
+- `https://vrchat.com/*` と `https://api.vrchat.cloud/*` のhost permissionは固定source Cookieの読取りとAPI fetchに使い、`https://vrchat.cloud/*` はAPIへ届き得る親domain Cookieを競合として検出するためだけに使う。`<all_urls>` は不要である。
 - host permission は対象 host に対する fetch 能力を与えるため、最小 host に限定する必要がある。
 
 ### 4.3 Cookie
@@ -107,8 +111,12 @@ Creator Guidelines の「API Usage / Bots」が本製品に直接関係する。
 - この特例は network request に対するもので、`document.cookie` による値の読出しとは別である。
 - third-party Cookie のブラウザ設定やポリシーの影響は残る。
 - `chrome.cookies` API で Cookie を取得・変更する場合は `cookies` permission が必要である。
+- `partitionKey` を指定しないCookie API操作は非partitioned Cookieだけを対象とし、任意partitionを一括列挙する指定はない。
+- Promise版 `chrome.cookies.get` はCookie未検出時に `undefined` を返す。`auth` の未検出は認証不足、任意の `twoFactorAuth` の未検出は不在として扱い、API故障へ誤分類しない。
 
-したがって本製品は、Cookie API を使わず、host permission と `fetch(..., { credentials: "include" })` によってブラウザへ通常の Cookie 送信を依頼できる。ただし enterprise policy や厳しい Cookie 設定で成立しない環境はあり得る。
+対象実機で確認した307→401により、host permissionと `credentials: "include"` だけでは `vrchat.com` のCookieを別domainのAPIへ送れないことが分かった。本製品は `cookies` permissionを追加し、固定名 `auth` と任意の `twoFactorAuth` だけを同期中の `api.vrchat.cloud/api/1/` 用Cookieへ一時複製する。全Cookie列挙、値の永続化、環境変数化、ログ出力は行わない。
+
+2026-08-23の対象実機では、sourceの両Cookieは `vrchat.com` のhost-only、path `/`、HttpOnly、SameSite=Lax、非partitionedとして確認できた一方、Secure属性は付いていなかった。`0.1.2`はsourceにもSecureを必須として同期前に停止したため、`0.1.3`ではsourceを固定HTTPS URLから読むだけとし、API側の一時Cookieだけを常にSecure・HttpOnly・SameSite=Strictへ固定する。Cookie値は確認・記録していない。
 
 ### 4.4 保存
 
@@ -131,7 +139,11 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 ### 5.1 API base
 
-資料の例は `https://api.vrchat.cloud/api/1` を server base としている。本製品はこの HTTPS origin だけを使用する。
+OpenAPI 資料の server base は `https://api.vrchat.cloud/api/1` である。一方、生成 SDK のブラウザ利用説明は、`https://vrchat.com/home` へログインしたブラウザでは `https://vrchat.com/api/1/auth/user` を開くよう案内している。
+
+2026-08-23の対象Chrome実機では、公式Webログイン後の通常タブで `https://vrchat.com/api/1/auth/user` を開くとcurrent userが表示された一方、拡張Service Workerから同URLをGETすると `https://api.vrchat.cloud/api/1/auth/user` への307となった。`redirect: "manual"` を維持して追従しなかった場合も、API hostを直接GETした場合も401 `Missing Credentials` だった。Cookie値や利用者情報本文は記録していない。
+
+この結果とOpenAPIのserver baseを合わせ、本製品はAPI baseを `https://api.vrchat.cloud/api/1` に戻し、origin差だけを限定Cookie Bridgeで埋める。CORSの失敗ではなく、ログインCookieのdomainが異なることによる資格情報欠落への対処である。
 
 ### 5.2 採用 endpoint
 
@@ -145,14 +157,14 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 ### 5.3 `/auth/user`
 
-非公式資料は、有効な `auth` Cookie がある場合は追加の認証操作をせず current user を返すと説明している。2026-08-17 に確認した現行の機械可読 OpenAPI `CurrentUser` schema には credential、auth token、Cookie、session data の field は定義されていない。これが、既存 Cookie の値を拡張コードで取得せず本方式を採用できる実装成立条件である。
+非公式資料は、有効な `auth` Cookieがある場合は追加の認証操作をせずcurrent userを返すと説明し、生成SDKはCookie名 `auth` と `twoFactorAuth` を定義している。2026-08-23に再確認した機械可読OpenAPI `CurrentUser` schemaには、新規登録時だけとの説明がある任意の `authToken` と、真偽値の `usesGeneratedPassword` が定義されている。field名だけを見てtoken/passwordを拒否する方式は正常応答を停止させ、秘密値の一時的なJSON parseも防げない。
 
 このため本製品は次を行う。
 
 - `Authorization: Basic` を一切送らない。
-- 応答を `unknown` として field 名を検査し、200 応答から新しい object へ `id` と `displayName` だけを allowlist でコピーする。未知 field の値は抽出しない。
+- 応答をサイズ制限付きの `unknown` としてparseし、top-level objectと必要2fieldを検査して、新しいobjectへ `id` と `displayName` だけをallowlistでコピーする。その他のfieldは名前・値・階層を走査しない。
 - raw response を直ちに破棄し、repository、logger、backup へ渡さない。
-- 最新 OpenAPI schema と実応答に credential / token / Cookie / session field がないことを release gate とする。将来これらが追加された場合は同期を fail closed にし、認証設計を再評価する。
+- 最新OpenAPI schemaで必要2fieldの契約と追加fieldを確認し、credential-like fieldを含むfixtureでもadapter外へ2field以外が出ないことをrelease gateとする。必要2fieldの契約変更はfail closedにする。
 - 401 は公式 Web への再ログイン案内へ変換する。
 
 ### 5.4 `/favorites`
@@ -164,6 +176,16 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 ### 5.5 `/worlds/favorites`
 
 非公式資料では、お気に入り world の検索・一覧 endpoint であり、`n` は最大 100、`offset` を受ける。`releaseStatus` の既定値は `public` で、`all` を指定できる。
+
+2026-08-24の対象実機では、`n=100&offset=0` に対して正常な200 JSON arrayが103件返った。`0.1.5`はこの103件を受け入れたが、必須5fieldのうちID形式だけ2件が従来のcanonicalな `wrld_` + UUID検査に一致せず、完全同期には到らなかった。同じ診断で、名称、作者名、お気に入りグループ、公開状態の不正は0件と確認した。利用者は実値を共有しておらず、ID、ワールド名、作者名、Cookie、raw応答はこの確認記録へ保存していない。
+
+コミュニティOpenAPIの `WorldID` schemaは文字列と例を示すが、UUID形式の `pattern` は宣言していない。実機の2値の意味や長期的な安定性は公開資料から確定できないため、canonical検査を製品全体で緩めない。`0.1.6`はこのendpointに限って非canonical IDを安全な一時文字列として追加検査し、ページングの重複identityとfingerprintへ残したが、対象実機では `/auth/user`、グループ、お気に入り関係、`/worlds/favorites?offset=0` がすべて200になった後、`offset=103` を要求する前に再び `API_INCOMPATIBLE` となった。値を追加収集せずに判断できる原因候補は、この追加検査または非canonical値をidentityへ残す過剰防御である。実値、ID、ワールド名、作者名、Cookie、raw応答は記録していない。
+
+`0.1.7`では `/worlds/favorites` に限り、IDがcanonical検査に一致しない行について、そのIDを追加で型・値分類せず、コピーもしない。ページング内部の明示的にopt-inした投影だけを `{ identity: null, metadata: null }` とし、raw行自体はoffsetと総数10,000件の上限に含める。ID以外の必須fieldは全行で厳格に検査し、canonical IDの重複は拒否する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、null identityはglobalな重複検査から除外する。全行がnull identityのpageは除外件数だけで同一pageと断定せず、raw offsetの単調増加、最大100非空要求と空終端確認1要求、総数10,000件上限で終了を保証する。非空snapshot全体にcanonical metadataが1件もなければ `API_INCOMPATIBLE` とし、空の正常snapshotと混同しない。
+
+2026-08-24の対象実機では、`0.1.7`導入後の「今すぐお気に入りを確認」が成功し、`0.1.6`で `offset=0` の200応答後に発生していた `API_INCOMPATIBLE` は再現しなかった。**推論**: 同期成功までの実装経路から、103件raw pageを処理して `offset=103` 以降へ進む経路も通過したと判断できる。ただし、同期後の一時Cookie不在はこの結果だけでは確認していない。
+
+除外したIDはadapter内でも投影せず、IndexedDB、UI、ログ、個別API URL、JSON backupへ渡さない。`/favorites` のお気に入り関係ID、`GET /worlds/{worldId}` のURL、JSON backupは引き続きcanonical World IDだけを受け入れ、IndexedDBへ渡すIDもcanonicalなadapter出力に限定する。
 
 本製品は `releaseStatus=all` を明示し、資料上取得可能な hidden / private を意図せず public filter で落とす可能性を減らす。ただし `all` は利用者にアクセス権のない world まで必ず返すという保証ではない。
 
@@ -196,7 +218,7 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 - private / deleted / moderation / access control の各場合に、2 endpoint と個別 GET がそれぞれ何を返すか。
 - Favorite relation が world 削除後も残る期間。
 - 404 と 403 の厳密な意味、および今後追加される status。
-- API Cookie の SameSite / Partitioned 属性が将来も現在のブラウザ挙動と両立するか。
+- `vrchat.com` の `auth` / `twoFactorAuth` の名前、Secure、expiry、Partitioned属性が将来も限定Bridgeと両立するか。
 - Chrome と Edge のすべての Cookie policy / enterprise policy で既存セッション送信が成功するか。
 - endpoint / response schema の将来互換性。
 
@@ -208,7 +230,7 @@ JavaScript `fetch` の任意 header として User-Agent を直接扱わず、�
 
 ### 7.1 Chrome / Edge 拡張を選ぶ
 
-**推論**: 公式 Web ログインの既存 Cookie を値として取り扱わず利用でき、`unlimitedStorage` で保護した IndexedDB、alarm、通知、UI、JSON download を 1 package で実現できる。利用者へ別アプリの credential 入力や開発者 DB を要求しないため、本要件では native app やスマートフォン app より適する。
+**推論**: 公式Webログインの固定Cookie名だけをブラウザ内で短時間橋渡しし、`unlimitedStorage`で保護したIndexedDB、alarm、通知、UI、JSON downloadを1 packageで実現できる。利用者へcredential入力、環境変数、別アプリ、開発者DBを要求しないため、本要件ではnative appやスマートフォンappより適する。
 
 **限界**: ブラウザ終了中は動かず、Store 公開前の sideload は初心者に難しい。製品配布は Chrome Web Store / Edge Add-ons を第一経路にする。
 
@@ -266,13 +288,13 @@ Chrome 公式の [Migrate to a service worker: Keep the service worker alive](ht
 
 ### 7.8 raw auth response を保存しない
 
-**推論**: 現行 `CurrentUser` schema に credential / token / session field がないことを前提にしても、汎用 DTO の丸ごと保存や JSON debug log は将来の field 追加時に Creator Guidelines 違反と漏えいにつながる。allowlist projection を認証 adapter 内で直ちに行い、禁止 field 名を検出したら値を抽出せず fail closed にする。
+**推論**: `CurrentUser` にはcredential-like fieldが存在し得るため、汎用DTOの丸ごと保存やJSON debug logは漏えいにつながる。bounded parse後、認証adapter内で `id` と `displayName` だけをallowlist projectionし、その他を走査せず破棄する。JSON parse中のraw値はGCまでJavaScript heapへ一時的に存在し得るが、現行の後段denylistでもこれは防げない。
 
 ### 7.9 ページング終端
 
-**推論**: 非公式資料は `n` と `offset` を定義するが、短い page が終端であるとは保証していない。したがって、100 件未満でも非空なら offset を実取得件数だけ増やして継続し、空 page だけを終端とする。
+**推論**: 非公式資料は `n` と `offset` を定義するが、短い page が終端であることも、実APIが厳密に `n` 件以下を返すことも保証していない。したがって、100件未満でも、実機で確認した `/worlds/favorites` の100件超でも、非空ならoffsetをraw実取得件数だけ増やして継続し、空pageだけを終端とする。noncanonical ID行を投影せず除外しても、offsetには除外後の件数を使わない。
 
-各 endpoint は最大 10,000 データ件、100 非空要求、その後の空終端確認 1 要求を上限とする。最大 101 要求で空 page を確認できない場合、同一非空 fingerprint が反復した場合、offset が停滞した場合は完全 snapshot とみなさない。
+各endpointは最大10,000データ件、100非空要求、その後の空終端確認1要求を上限とする。`/worlds/favorites` の過剰返却は残り総数枠を投影前に検査し、他endpointは1ページ100件上限を維持する。最大101要求で空pageを確認できない場合、canonical IDを含む同一非空fingerprintが反復した場合、canonical IDが重複した場合、offsetが停滞した場合は完全snapshotとみなさない。全件が除外対象のpageは除外件数だけをfingerprintとして重複判定せず、raw offsetと上限で停止を保証する。
 
 ### 7.10 リスト表示名を安定IDと分離する
 
@@ -328,9 +350,12 @@ error body の文言は不安定で機密を含む可能性があるため、UI 
 
 - manifest に不要権限がないこと。
 - manifest に履歴 IndexedDB 保護用 `unlimitedStorage` があること。
+- `cookies` permissionとhost permissionが `vrchat.com` / `vrchat.cloud` / `api.vrchat.cloud` だけで、Cookie API利用が固定名2つと非秘密markerのBridge境界に隔離されていること。root `vrchat.cloud` は親domain競合検査だけに使われ、network fetch先ではないこと。
+- source欠落、target競合、partitioned、set/remove失敗、古いmarker、並行呼出しをfake Cookie APIで検査し、値がerror、DB、backup、DNRに現れないこと。
 - DNR rule が extension 自身の VRChat GET API にだけ一致すること。
 - fake API による pagination、429、401、404、schema change の処理。
-- 現行 OpenAPI `CurrentUser` schema に credential / token / Cookie / session field がないこと。token field を加えた `/auth/user` fixture では同期が fail closed し、DB / log / backup に残らないこと。
+- `/worlds/favorites` の103件raw pageにnoncanonical IDを2件含むfixtureで、値を投影・分類せず2件をメタデータ出力から除外しつつ次を `offset=103` とすること。nullable identityは明示opt-inしたこのendpointだけで使い、nullをglobal重複検査から除外すること。canonical IDを含むpageはcanonical ID列と除外件数でfingerprintを作り、全件nullの同数pageは誤って反復判定せずraw offsetと上限で終了すること。除外IDが戻り値、DB、UI、log、backup、個別API URLに現れず、他の必須field不正、canonical ID重複、非空snapshot全体のcanonical metadata 0件はfail closedになること。
+- 現行OpenAPIの `authToken`、`usesGeneratedPassword` とnestedのcredential-like fieldを含む `/auth/user` fixtureで同期が成功し、adapterの戻り値が `id` / `displayName` だけで、DB / log / backupに秘密値が残らないこと。必要2fieldの不正とbounded JSON境界はfail closedになること。
 - 2 回確認、復帰、名称変更、transaction rollback。通知は成功、明示的失敗、claim 後 crash の各 fixture で claim を解除せず、Service Worker 再起動後も同一 event の attempt が最大 1 回であること。
 - 短い非空 page の継続、空 page 終端、101要求上限、fingerprint 反復、offset 停滞を確認すること。
 - 3xx fixture を `redirect: "manual"` で追従しないこと。
@@ -339,8 +364,11 @@ error body の文言は不安定で機密を含む可能性があるため、UI 
 
 ### 10.2 利用者本人の環境でだけ確認する項目
 
-- 公式 Web ログイン後、Cookie 値を読まず `/auth/user` が 200 になること。
-- 実応答の field 名に credential、token、Cookie、session data がなく、raw body を保存せず release gate の pass / fail だけを記録できること。
+- `0.1.5`で `/auth/user` 200、`/worlds/favorites` 103件の受信まで進み、ID形式だけ2件不一致で完全同期未達だったという匿名・集計の観測を維持すること。実値やraw応答は記録しない。
+- `0.1.6`ではService Workerからの `/auth/user`、グループ、お気に入り関係、`/worlds/favorites?offset=0` はすべて200だったが、`offset=103` の要求前に `API_INCOMPATIBLE` となった匿名・集計の観測を維持すること。実値やraw応答は記録せず、`0.1.6`を完全同期候補にしないこと。
+- 公式Webログイン後、`0.1.7`でService Workerから `https://api.vrchat.cloud/api/1/auth/user` が200となり、`/worlds/favorites` の103件raw pageとnoncanonical ID行の非投影を含む全ページを空終端まで取得して完全同期に成功すること。
+- 同期中だけtargetの一時Cookieが存在し、同期後に認証Cookieとmarkerが残らないこと。Chrome完全終了後は認証Cookieを能動削除せず、設定時の期限切れ後に古いmarkerだけを回収できること。
+- 実応答にcredential-like fieldがあっても値やraw bodyを撮影・記録せず、完全同期が成功し、adapter外、DB、backup、logへ `id` / `displayName` 以外が流れない設計と自動テストが維持されていること。
 - `/favorites` と `/worlds/favorites?releaseStatus=all` が現在のお気に入り件数を取得できること。
 - third-party Cookie を厳しく制限した Chrome / Edge での案内が適切か。
 - 実データ数で同期が 5 分以内に終わり、429 を誘発しないこと。
@@ -353,6 +381,7 @@ error body の文言は不安定で機密を含む可能性があるため、UI 
 
 - Creator Guidelines の更新日と「API Usage / Bots」の変更。
 - community OpenAPI の `/auth/user`、`/favorite/groups`、`/favorites`、`/worlds/favorites`、`/worlds/{id}` の差分。
+- 公式Webのsource Cookie名 `auth` / `twoFactorAuth` とAPI base `api.vrchat.cloud/api/1` が限定Bridgeで引き続き利用できること。
 - Chrome の Cookie / partitioning、DNR header modification、Manifest V3 Service Worker lifecycle の変更。
 - Edge の使用 API 対応状況。
 

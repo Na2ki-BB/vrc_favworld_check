@@ -8,6 +8,7 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import {
   KEEPALIVE_INTERVAL_MS,
   MESSAGE_TYPES,
+  VRCHAT_LOGIN_URL,
   createAlarmEventHandler,
   createBadgeUpdater,
   createGatedSyncRunner,
@@ -15,7 +16,19 @@ import {
   createPurgeController,
   keepServiceWorkerAlive
 } from "../extension/background.js";
-import { ApiSchemaError, NetworkError, RateLimitedError } from "../extension/lib/api.js";
+import {
+  ApiSchemaError,
+  NetworkError,
+  RateLimitedError,
+  VRCHAT_API_BASE_URL
+} from "../extension/lib/api.js";
+import {
+  AuthCookieCleanupError,
+  AuthCookieConflictError,
+  AuthCookiePartitionedError,
+  AuthCookieRequiredError,
+  AuthCookieSetupError
+} from "../extension/lib/auth-cookie-bridge.js";
 import { DatabaseRepository } from "../extension/lib/database.js";
 import {
   MANUAL_SYNC_COOLDOWN_MS,
@@ -41,6 +54,12 @@ Object.defineProperty(globalThis, "IDBKeyRange", {
   value: IDBKeyRange
 });
 
+test("VRChat login and API use the two reviewed fixed origins", () => {
+  assert.equal(new URL(VRCHAT_LOGIN_URL).origin, "https://vrchat.com");
+  assert.equal(new URL(VRCHAT_API_BASE_URL).origin, "https://api.vrchat.cloud");
+  assert.notEqual(new URL(VRCHAT_LOGIN_URL).origin, new URL(VRCHAT_API_BASE_URL).origin);
+});
+
 /** @typedef {import("../extension/lib/api.js").VrchatApi} VrchatApi */
 /** @typedef {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} ApiPort */
 
@@ -56,6 +75,8 @@ class FakeApi {
   groupDisplayName = "いつもの場所";
   relationTags = ["worlds1"];
   metadataFavoriteGroup = "worlds1";
+  /** @type {Record<string, unknown>} */
+  currentUserExtra = {};
   /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>> | null} */
   favoriteGroupsOverride = null;
   /** @type {(() => Promise<void>) | null} */
@@ -68,7 +89,11 @@ class FakeApi {
       await this.beforeUser();
     }
     this.#throwAt("user");
-    return { id: USER_ID, displayName: "テストユーザー" };
+    return {
+      ...this.currentUserExtra,
+      id: USER_ID,
+      displayName: "テストユーザー"
+    };
   }
 
   /** @returns {ReturnType<VrchatApi["listAllFavoriteGroups"]>} */
@@ -208,7 +233,8 @@ async function createRepository() {
  *   api: FakeApi,
  *   alarms?: FakeAlarms,
  *   notifications?: FakeNotifications,
- *   now?: {value: number}
+ *   now?: {value: number},
+ *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>
  * }} input
  */
 function createService(input) {
@@ -222,7 +248,10 @@ function createService(input) {
     notifications,
     clock: () => time.value,
     random: () => 0,
-    idGenerator: () => `test-${++syncSequence}`
+    idGenerator: () => `test-${++syncSequence}`,
+    ...(input.withApiSession === undefined
+      ? {}
+      : { withApiSession: input.withApiSession })
   });
   return { service, alarms, notifications, time };
 }
@@ -264,6 +293,31 @@ test("successful snapshots commit with revisions and claim before one notificati
   assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "success");
   assert.equal((await repository.listFavoriteGroups(USER_ID))[0]?.displayName, "いつもの場所");
   assert.equal(await repository.getUnreadCount(USER_ID), 1);
+});
+
+test("sync never persists extra CurrentUser fields", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const secret = "current-user-secret-sentinel";
+  api.currentUserExtra = {
+    authToken: secret,
+    usesGeneratedPassword: true,
+    nested: { sessionToken: secret }
+  };
+  const { service } = createService({ repository, api });
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+
+  const profile = await repository.getProfile(USER_ID);
+  assert.ok(profile);
+  assert.deepEqual(Object.keys(profile).sort(), [
+    "createdBySchemaVersion",
+    "displayName",
+    "firstSeenAt",
+    "lastSuccessfulSyncAt",
+    "userId"
+  ]);
+  assert.equal(JSON.stringify(await repository.getBackupSnapshot(USER_ID)).includes(secret), false);
 });
 
 test("favorite-list moves stay unread history but never enter the OS notification outbox", async () => {
@@ -523,6 +577,104 @@ test("network failure records only the run and leaves world/event state unchange
   assert.equal(await repository.getSetting(SETTING_KEYS.lastSyncResult), "offline");
   assert.equal(alarms.scheduledAt, NOW + RECOVERY_MIN_DELAY_MS);
   assert.equal(api.calls.at(-1), "relations");
+});
+
+test("the API session boundary wraps the complete sync and records bridge failures", async (context) => {
+  await context.test("successful bridge", async () => {
+    const repository = await createRepository();
+    const api = new FakeApi();
+    /** @type {string[]} */
+    const order = [];
+    const { service } = createService({
+      repository,
+      api,
+      withApiSession: async (operation) => {
+        order.push("bridge-start");
+        const result = await operation();
+        order.push("bridge-finish");
+        return result;
+      }
+    });
+
+    assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+    assert.deepEqual(order, ["bridge-start", "bridge-finish"]);
+    assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
+  });
+
+  const cases = [
+    [new AuthCookieRequiredError(), "AUTH_REQUIRED", "auth_required"],
+    [new AuthCookieConflictError(), "AUTH_COOKIE_CONFLICT", "failed"],
+    [new AuthCookiePartitionedError(), "AUTH_COOKIE_UNAVAILABLE", "failed"],
+    [new AuthCookieSetupError(), "AUTH_COOKIE_UNAVAILABLE", "failed"]
+  ];
+  for (const [failure, publicCode, runResult] of cases) {
+    await context.test(String(publicCode), async () => {
+      const repository = await createRepository();
+      const api = new FakeApi();
+      const { service } = createService({
+        repository,
+        api,
+        withApiSession: async () => {
+          throw failure;
+        }
+      });
+
+      assert.deepEqual(await service.start("alarm"), {
+        ok: false,
+        error: publicCode
+      });
+      assert.deepEqual(api.calls, []);
+      assert.equal(await repository.getSetting(SETTING_KEYS.lastSyncResult), runResult);
+      assert.deepEqual(await repository.listWorlds(USER_ID), []);
+    });
+  }
+});
+
+test("a cleanup failure after commit reports recovery without discarding history", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service, alarms } = createService({
+    repository,
+    api,
+    withApiSession: async (operation) => {
+      await operation();
+      throw new AuthCookieCleanupError();
+    }
+  });
+
+  assert.deepEqual(await service.start("alarm"), {
+    ok: false,
+    error: "AUTH_COOKIE_CLEANUP_FAILED"
+  });
+  assert.equal((await repository.listWorlds(USER_ID)).length, 1);
+  assert.equal(await repository.getSetting(SETTING_KEYS.lastSyncResult), "success");
+  assert.equal(alarms.scheduledAt, NOW + REGULAR_INTERVAL_MS);
+});
+
+test("a Cookie preflight failure does not impose manual cooldown after login is repaired", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  let sourceReady = false;
+  const { service } = createService({
+    repository,
+    api,
+    withApiSession: async (operation) => {
+      if (!sourceReady) {
+        throw new AuthCookieRequiredError();
+      }
+      return operation();
+    }
+  });
+
+  assert.deepEqual(await service.start("manual"), {
+    ok: false,
+    error: "AUTH_REQUIRED"
+  });
+  assert.equal(await repository.getSetting(SETTING_KEYS.lastManualSyncAt), null);
+
+  sourceReady = true;
+  assert.deepEqual(await service.start("manual"), { ok: true, changes: 0 });
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
 });
 
 test("schedule failure after an API failure preserves the safe fixed API result", async () => {
@@ -1059,6 +1211,9 @@ test("purge clears user records before uninstall and never uninstalls after a pu
       order.push("clear-alarm");
       return true;
     },
+    cleanupAuthCookies: async () => {
+      order.push("cleanup-auth-cookies");
+    },
     clearBadge: async () => {
       order.push("clear-badge");
     },
@@ -1070,6 +1225,7 @@ test("purge clears user records before uninstall and never uninstalls after a pu
   assert.deepEqual(order, [
     "begin-purge:new",
     "clear-alarm",
+    "cleanup-auth-cookies",
     "purge",
     "clear-badge",
     "uninstall"
@@ -1095,6 +1251,7 @@ test("purge clears user records before uninstall and never uninstalls after a pu
       }
     },
     clearAlarm: async () => true,
+    cleanupAuthCookies: async () => {},
     clearBadge: async () => {},
     uninstallSelf: async () => {
       uninstallCalls += 1;
@@ -1133,6 +1290,7 @@ test("a resumed purge keeps its existing guard on failure and retries deletion o
       }
     },
     clearAlarm: async () => true,
+    cleanupAuthCookies: async () => {},
     clearBadge: async () => {},
     uninstallSelf: async () => {
       uninstallCalls += 1;
@@ -1162,6 +1320,7 @@ test("a resumed purge keeps its existing guard on failure and retries deletion o
       }
     },
     clearAlarm: async () => true,
+    cleanupAuthCookies: async () => {},
     clearBadge: async () => {},
     uninstallSelf: async () => {
       uninstallCalls += 1;
@@ -1176,6 +1335,48 @@ test("a resumed purge keeps its existing guard on failure and retries deletion o
   assert.equal(purgeCalls, 2);
 });
 
+test("purge never deletes records or uninstalls when owned Cookie cleanup fails", async () => {
+  let purgeCalls = 0;
+  let uninstallCalls = 0;
+  let recoveries = 0;
+  let repairs = 0;
+  const controller = createPurgeController({
+    service: {
+      syncing: false,
+      repairScheduleBestEffort: async () => {
+        repairs += 1;
+      }
+    },
+    repository: {
+      beginPurge: async () => true,
+      recoverFromFailedPurge: async () => {
+        recoveries += 1;
+      },
+      purgeAllData: async () => {
+        purgeCalls += 1;
+      }
+    },
+    clearAlarm: async () => true,
+    cleanupAuthCookies: async () => {
+      throw new AuthCookieCleanupError();
+    },
+    clearBadge: async () => {},
+    uninstallSelf: async () => {
+      uninstallCalls += 1;
+    }
+  });
+
+  assert.deepEqual(await controller.purgeAndUninstall(), {
+    ok: false,
+    error: "DELETE_FAILED",
+    dataDeleted: false
+  });
+  assert.equal(purgeCalls, 0);
+  assert.equal(uninstallCalls, 0);
+  assert.equal(recoveries, 1);
+  assert.equal(repairs, 1);
+});
+
 test("failed self-uninstall reports purged data while the durable gate remains closed", async () => {
   const controller = createPurgeController({
     service: { syncing: false, repairScheduleBestEffort: async () => {} },
@@ -1185,6 +1386,7 @@ test("failed self-uninstall reports purged data while the durable gate remains c
       purgeAllData: async () => {}
     },
     clearAlarm: async () => true,
+    cleanupAuthCookies: async () => {},
     clearBadge: async () => {},
     uninstallSelf: async () => {
       throw new Error("user cancelled");

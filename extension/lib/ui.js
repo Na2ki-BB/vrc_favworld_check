@@ -248,6 +248,12 @@ export function commandErrorMessage(code, retryAt = null) {
   switch (code) {
     case "auth_required":
       return "VRChat公式サイトでログインしてから、もう一度押してください。";
+    case "auth_cookie_unavailable":
+      return "VRChatのログイン情報を安全に一時利用できませんでした。Chromeをすべて終了して起動し直し、拡張の権限を確認してからもう一度お試しください。";
+    case "auth_cookie_conflict":
+      return "API側に別のログイン情報があるため、安全のため確認を始めませんでした。Chromeをすべて終了して起動し直してから、もう一度お試しください。";
+    case "auth_cookie_cleanup_failed":
+      return "一時的なログイン情報を削除できたことを確認できませんでした。確認結果は保存済みの場合があります。Chromeをすべて終了し、15分待ってから起動し直してください。";
     case "rate_limited":
     case "cooldown":
     case "manual_cooldown":

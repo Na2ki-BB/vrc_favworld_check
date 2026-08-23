@@ -21,7 +21,7 @@
 - 対象ブラウザは、第一の利用者が実際に使う Windows 版 Google Chrome の Manifest V3 対応版 1 種類とする。
 - データ、設定、履歴は拡張機能の IndexedDB にだけ保存する。開発者が運用するサーバーや DB は使用しない。
 - 利用者は VRChat 公式 Web サイト上でログインする。拡張機能はユーザー名、パスワード、2FA コード、Cookie、トークンの入力欄を持たない。
-- 拡張機能は `cookies` 権限を要求せず、Cookie 値を取得、表示、保存しない。API 通信時はブラウザが既存セッションを通常の HTTP Cookie として送信する。
+- 拡張機能は `cookies` 権限を、公式Webの固定名 `auth` と任意の `twoFactorAuth` をAPI用hostへ同期中だけ一時複製する目的に限定して使用する。値は拡張のDB、設定、ファイル、ログ、UI、通知、バックアップへ渡さない。
 - API 利用は VRChat Creator Guidelines に従い、識別可能な User-Agent、キャッシュ、要求間隔、429 応答時の待機、固定時刻に集中しない定期実行を実装する。
 - ブラウザが終了している間は同期も通知も行えない。次回ブラウザ起動後に再開する。
 - API の互換性は VRChat から保証されない。API 変更時には拡張機能の更新が必要になり得る。
@@ -30,7 +30,7 @@
 
 | 用語 | 定義 |
 | --- | --- |
-| 完全スナップショット | 認証確認、お気に入り関係 ID の全ページ、お気に入りワールド情報の全ページを欠落なく取得できた 1 回分の同期結果 |
+| 完全スナップショット | 認証確認、お気に入り関係 ID の全ページ、お気に入りワールド情報の全rawページを空終端まで取得・検査できた 1 回分の同期結果。`/worlds/favorites` のnoncanonical ID行はIDを投影せず除外できるが、非空snapshot全体のcanonical metadataが0件なら不完全とする |
 | お気に入り関係 | API の `Favorite` レコードとして確認した、利用者とワールド ID の関係 |
 | お気に入りリスト | `FavoriteGroup` のうち本人が所有する `world` または `vrcPlusWorld`。内部名と利用者が変更できる表示名を分けて扱う |
 | 消失候補 | 直前まで存在したお気に入り関係が、1 回の完全スナップショットで見つからなかった状態 |
@@ -53,26 +53,32 @@
 ### 5.2 認証と API 通信
 
 - **FR-AUTH-01** `GET /auth/user` は既存セッションの有効性と利用者 ID の確認にだけ使う。Basic 認証ヘッダーを生成しない。
-- **FR-AUTH-02** API の `fetch` は `credentials: "include"` と `redirect: "manual"` を明示し、HTTPS の `https://api.vrchat.cloud/api/1/` だけを対象にする。redirect 応答は追従せず同期を失敗させる。
-- **FR-AUTH-03** 現行の `CurrentUser` 仕様に credential、token、session data のフィールドが存在しないことを実装成立条件とする。`/auth/user` の応答は `unknown` として検査し、新しい object へ利用者 ID と表示名だけをコピーした直後に raw 応答を破棄する。未知フィールドの値を抽出せず、ログ、DB、バックアップへ渡さない。
+- **FR-AUTH-02** API の `fetch` は `credentials: "include"` と `redirect: "manual"` を明示し、HTTPS `https://api.vrchat.cloud/api/1/` だけを対象にする。redirect 応答は追従せず同期を失敗させる。
+- **FR-AUTH-03** `/auth/user` の応答はサイズ・Content-Type・UTF-8・JSON・top-level objectを検査した後、新しいobjectへ利用者IDと表示名だけをコピーする。現行 `CurrentUser` に定義される任意の `authToken`、必須の `usesGeneratedPassword` を含め、その他のfieldは名前・値・階層を解釈せず破棄し、ログ、DB、バックアップ、UIへ渡さない。
 - **FR-AUTH-04** API 要求は GET の読み取り専用操作に限定する。お気に入りの追加・削除、ワールド更新、ログアウトを行わない。
 - **FR-AUTH-05** API 要求に `vrc_favworld_check/<version> https://github.com/Na2ki-BB/vrc_favworld_check` 形式の User-Agent を付ける。
-- **FR-AUTH-06** リリース前に最新の非公式 OpenAPI `CurrentUser` schema と実応答の field 名を確認する。将来 credential、token、Cookie、session data に該当する field が仕様または実応答へ追加された場合、同期を fail closed（通信結果を採用せず停止）にし、認証設計を再評価するまでリリースしない。
+- **FR-AUTH-06** リリース前に最新の非公式OpenAPI `CurrentUser` schemaを確認し、必要fieldの契約と出力allowlistを再評価する。credential、token、Cookie、session dataに見える追加fieldがあっても値を走査せず破棄し、戻り値が利用者IDと表示名だけであることをfixtureで確認する。必要2fieldの契約が変わった場合はfail closedにする。
+- **FR-AUTH-07** 同期開始前に `https://vrchat.com/api/1/auth/user` に一致する非partitioned `auth` Cookieを個別取得し、存在する非partitioned `twoFactorAuth` も同時に扱う。それ以外の認証Cookie名を列挙・転送しない。Promise版Cookie APIの未検出値 `undefined` は、`auth` なら `AUTH_REQUIRED`、任意の `twoFactorAuth` なら不在として扱う。VRChatがsourceへSecure属性を付けていない場合も固定HTTPS URLから読み取るが、sourceを変更・延命・HTTP送信しない。
+- **FR-AUTH-08** 転送先CookieはsourceのSecure属性を引き継がず、`api.vrchat.cloud` のhost-only、固定path `/api/1/`、Secure、HttpOnly、SameSite=Strictとし、元Cookieの期限または作成から15分の早い方で失効させる。元Cookieを変更せず、同期の成否にかかわらず、今回設定した値・属性が保たれている場合は終了時に削除する。
+- **FR-AUTH-09** 値を持たない固定名の所有マーカーをAPI path外へ先に作成し、通常終了時は今回設定した値・属性が一致する一時認証Cookieを先、マーカーを最後に削除する。Service WorkerまたはChromeの途中終了後は値を復元・永続化せず、同名target Cookieを能動削除しない。設定時点の一時Cookieは最長15分、マーカーは作成から20分で失効させ、target Cookieがなくなったことを確認してから孤立マーカーだけを削除する。
+- **FR-AUTH-10** 所有マーカーがない状態で、`api.vrchat.cloud` へ送信され得る同名の非partitioned Cookieがhost-only、親domain、pathを問わず存在する場合は、上書きも削除もせず停止する。Bridgeはpartition keyを指定せず非partitioned Cookieだけを対象とし、Cookie APIからpartitioned Cookieが返された場合も自動変換せず停止する。
+- **FR-AUTH-11** 同期終了時にtarget Cookieの値または属性が今回設定した内容から変わっている場合は、他の主体が更新した可能性を優先して削除せず `AUTH_COOKIE_CLEANUP_FAILED` とする。API応答の `Set-Cookie` を一律に除去せず、対象実機で認証Cookieが更新されないことをrelease gateとして確認する。
 
 ### 5.3 同期
 
 - **FR-SYNC-01** お気に入り関係は `GET /favorites?type=world&n=100&offset=...` を空配列のページが返るまでページングして取得する。100 件未満の短いページだけでは終端と判定しない。
-- **FR-SYNC-02** ワールド名などのメタデータは `GET /worlds/favorites?n=100&offset=...&releaseStatus=all` を空配列のページが返るまでページングして一括取得する。offset は直前ページの実取得件数だけ増加させる。
+- **FR-SYNC-02** ワールド名などのメタデータは `GET /worlds/favorites?n=100&offset=...&releaseStatus=all` を空配列のページが返るまでページングして一括取得する。`n=100` は要求件数として扱い、APIが100件を超えて返しても総数上限内なら切り捨てず、offset はmetadataの採用件数ではなく直前ページのraw実取得件数だけ増加させる。
 - **FR-SYNC-03** `GET /worlds/{worldId}` は、一括一覧から消えた既知 ID の再確認にだけ使う。通常同期で全ワールドを個別取得しない。
 - **FR-SYNC-04** 各 API 要求の開始間隔は原則 2 秒以上とする。同時並列要求を行わない。
 - **FR-SYNC-05** 初回同期はベースラインを保存し、名称変更、消失、復帰として通知しない。
-- **FR-SYNC-06** 2 系統のページングのいずれかが未完了、同一非空ページ fingerprint の反復、offset の停滞、10,000 データ件超過、空ページによる終端未確認、形式不正になった場合、その結果を完全スナップショットとして扱わない。
+- **FR-SYNC-06** 2 系統のページングのいずれかが未完了、同一非空ページ fingerprint の反復、offset の停滞、10,000 データ件超過、空ページによる終端未確認、不許可の形式不正になった場合、その結果を完全スナップショットとして扱わない。`FR-SYNC-13` の限定除外は不許可の形式不正に含めず、全件null identity pageは除外件数だけではfingerprintを成立させない。
 - **FR-SYNC-07** 同期の多重実行を禁止する。実行中の手動要求は新しい同期を開始せず、現在の進捗を表示する。
 - **FR-SYNC-08** 2 系統のページング結果は同期中だけメモリに保持し、両方の全ページが完走した場合だけ 1 トランザクションで反映する。中断または未完了なら本体データを変更しない。
 - **FR-SYNC-09** 個別ワールドの再確認は 1 同期につき最大 20 件とする。上限を超えた候補は `pending` として保存し、次回以降の同期で順番に再確認する。
 - **FR-SYNC-10** 2 秒間隔の直列取得が Manifest V3 Service Worker の idle 終了を超える場合に備え、同期 promise の実行中だけ Chrome 公式推奨の 25 秒間隔 keep-alive を使い、同期の `finally` で必ず停止する。常駐目的では使用しない。
 - **FR-SYNC-11** 404 を 1 回確認済みのワールドは、未確認候補より先に次の個別確認へ回す。20 件上限は維持し、画面に個別確認待ち件数を表示する。
 - **FR-SYNC-12** 8 リスト各 100 件、合計 800 ワールドを欠落なく取得・保存・比較できる。関係一覧からの消失検知は個別確認枠に依存せず、全 800 件を毎回比較する。
+- **FR-SYNC-13** `/worlds/favorites` に限り、ID以外の必須fieldがすべて正常でもIDがcanonicalな `wrld_` + UUIDでない行は、IDを追加で型・値分類せず、コピーもせず、明示的にopt-inした `{ identity: null, metadata: null }` としてmetadata出力前に除外する。raw行数はoffsetと総数10,000件上限へ含め、null identityはglobal重複検査から除外する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、全件nullのpageは同数だけで反復と判定しない。非空snapshot全体のcanonical metadataが0件なら拒否する。除外IDは保存、UI、ログ、個別API URL、backupへ渡さない。ID以外の必須field不正とcanonical ID重複は拒否し、`/favorites` 関係IDと `GET /worlds/{worldId}` URL、backupのID検査は緩めず、DBにはcanonicalなadapter出力だけを渡す。
 
 ### 5.4 お気に入りリスト
 
@@ -157,24 +163,25 @@
 - **FR-PURGE-02** 操作開始後は新しい同期を禁止し、実行中なら消去を開始しない。名前付き alarm を停止し、拡張専用 IndexedDB の全利用者recordを1 transactionで消去して、`purgePending`とschema情報だけが残ったことを確認してから自己アンインストール API を呼ぶ。
 - **FR-PURGE-03** 消去 transaction が失敗した場合は全利用者recordを処理前のまま維持し、アンインストールせず再試行案内を出す。消去後に自己アンインストールが失敗または取り消された場合は、データ消去済みであることと手動削除方法を表示し、`purgePending`により同期を再開しない。ブラウザ再起動後の再試行は既存の`purgePending`を解除せず、原子的消去と自己アンインストールを冪等にやり直す。今回の操作が新しくguardを有効化し、かつ消去前に失敗した場合だけguardを解除して通常動作を修復する。
 - **FR-PURGE-04** `purgePending` は同期処理だけでなく、バックアップ復元、profile保存、履歴・未読・通知・設定更新を含む全DB書込み境界で、書込みと同じtransaction内から確認する。別タブや別connectionからの書込みでも、消去開始後に利用者recordを再生成できないようにする。
-- **FR-PURGE-05** 拡張側の全消去は、本拡張が作成した DB と実行予定だけを削除対象にする。利用者がダウンロードした JSON、Windows インストーラー、固定配置ファイル、Chrome のプロフィール・Cookie・一般履歴は自動削除しない。
+- **FR-PURGE-05** 拡張側の全消去は、本拡張が作成した DB、実行予定、今回設定した値・属性で所有を証明できる一時API Cookieだけを削除対象にする。中断後の同名Cookieは能動削除せず、不在を確認できるまで全消去と自己アンインストールを進めない。利用者がダウンロードした JSON、Windows インストーラー、固定配置ファイル、Chrome のプロフィール、公式Web側や他ソフトが作成したCookie、一般履歴は自動削除しない。
 
 ### 5.11 Windows インストーラー
 
 - **FR-INST-01** Inno Setup 6 の `PrivilegesRequired=lowest` を使い、管理者権限と UAC を要求しない Windows ユーザー単位のインストーラーとする。配置先は `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` に固定し、利用者による変更を許可しない。
-- **FR-INST-02** 検証済みの `dist/extension` だけを固定場所へ配置し、`package.json` と manifest の version 一致および配布内容をビルド時に再検査する。manifest に `key` を追加せず、認証、API、同期、IndexedDB、バックアップの実装を変更しない。
+- **FR-INST-02** 検証済みの `dist/extension` だけを固定場所へ配置し、`package.json` と manifest の version 一致および配布内容をビルド時に再検査する。manifest に `key` を追加しない。インストーラー自身は拡張の認証、API、同期、IndexedDB、バックアップ処理を呼び出したり、Chrome の認証状態や保存データを変更したりしない。
 - **FR-INST-03** Inno Setup 標準の現在ユーザー向けアンインストール登録だけを使う。custom `[Registry]` section、browser policy、force install、Chrome の Cookie・プロフィール・IndexedDBへのアクセスを使用しない。
 - **FR-INST-04** 更新前に Chrome の全ウィンドウを閉じるよう表示するが、プロセスの検出や強制終了は行わない。インストール済み manifest の semantic version より古い版への downgrade を拒否し、同じ版の再インストールは許可する。
 - **FR-INST-05** 新版を app root 内の `extension.new` へ先に展開する。成功後だけ現在の `extension` を `extension.old` へ一時退避して新版へ切り替え、新版配置の成功後に `extension.old` を削除する。切替または検証の失敗時だけ旧版を復元し、複数世代 rollback や電源断を網羅する状態機械は作らない。
 - **FR-INST-06** Windows 側のアンインストール前に、必要な JSON バックアップの保存と、拡張設定画面の「記録をすべて削除してアンインストール」を先に行うよう案内する。Chrome 側の削除完了をプロフィールから自動判定しない。
 - **FR-INST-07** Windows アンインストーラーは固定 app root 内の `extension`、`extension.new`、`extension.old` と Inno Setup 自身の固定ファイルだけを削除し、app root 外を削除しない。Chrome のプロフィール、Cookie、IndexedDB、および利用者が書き出した JSON バックアップを探索・削除しない。
 - **FR-INST-08** コード署名、自動更新、実行時ダウンロード、service、scheduled task、startup、telemetry を実装しない。
+- **FR-INST-09** 初回導入後と更新後に `chrome://extensions/` を開く。更新で必須 host permission が変わった場合は、利用者が接続先を確認して拡張の再有効化または権限承認を行い、表示版が古い場合だけ同じ固定 path の拡張を 1 回再読み込みするよう日本語で案内する。インストーラーは Chrome の権限を自動承認せず、拡張の削除や別 path からの再読込みも行わない。
 
 ## 6. 非機能要件
 
 ### 6.1 セキュリティとプライバシー
 
-- **NFR-SEC-01** `cookies`、`webRequest`、`tabs`、`<all_urls>` の権限を要求しない。権限は `alarms`、`notifications`、`unlimitedStorage`、User-Agent 付与用の限定的な Declarative Net Request 権限、`https://api.vrchat.cloud/*` の host permission に限定する。`unlimitedStorage` は履歴 IndexedDB を quota 制限と eviction から保護するため必須とする。
+- **NFR-SEC-01** 権限は `alarms`、`cookies`、`notifications`、`unlimitedStorage`、User-Agent付与用の限定的なDeclarative Net Request権限、および `https://vrchat.com/*`、`https://vrchat.cloud/*`、`https://api.vrchat.cloud/*` のhost permissionに限定する。root `vrchat.cloud` はAPIへ届き得る親domain Cookieの競合検査だけに使用し、network fetch先にしない。`webRequest`、`tabs`、`<all_urls>` は要求しない。manifestのhost permissionはpath単位に制限できないため、Cookie bridgeは固定名と固定URL、API adapterとDNR ruleは固定 `/api/1/` とGETだけへ再制限する。`unlimitedStorage` は履歴IndexedDBをquota制限とevictionから保護するため必須とする。
 - **NFR-SEC-02** リモートコード、CDN スクリプト、`eval`、インラインスクリプトを使用しない。
 - **NFR-SEC-03** API 由来の文字列とインポート JSON は信頼せず、DOM へはテキストとして挿入する。
 - **NFR-SEC-04** テレメトリ、広告、外部分析、クラッシュ自動送信を実装しない。
@@ -185,7 +192,7 @@
 - **NFR-REL-01** ワールド状態とイベントの確定は IndexedDB の同一 read-write トランザクションで行う。中断時に片方だけ残さない。
 - **NFR-REL-02** API 取得中の不完全なページング結果を永続化済みワールドへ反映せず、完全スナップショットの検証後にだけ反映する。
 - **NFR-REL-03** イベント ID、ワールド改訂番号、`notificationClaimedAt` により差分処理を冪等（同じ入力を何度処理しても同じ結果）にし、同一イベントの OS 通知 attempt を最大 1 回にする。
-- **NFR-REL-04** 各一覧 endpoint について最大 10,000 データ件に加えて空終端確認 1 要求、すなわち `n=100` で最大 101 要求までを防御的に扱う。同一非空ページ fingerprint の反復、offset 停滞、10,000 件超過時は状態更新を中止する。
+- **NFR-REL-04** 各一覧 endpoint について最大 10,000 rawデータ件、最大100回の非空要求に加えて空終端確認1要求までを防御的に扱う。`/worlds/favorites` では要求した `n=100` を応答件数上限とはみなさず、受信済み総数の残枠を投影前に検査し、offsetは除外後でなくraw件数で進める。canonical IDを含む同一非空page fingerprintの反復、canonical ID重複、offset停滞、10,000件超過、101要求内に空終端がない場合は状態更新を中止する。全件null identityのpageは除外件数だけで同一と判定せず、raw offsetと同じ要求・総数上限で終了を保証する。
 - **NFR-REL-05** 同期計画は profile、worlds、単調増加 generation を同一 snapshot で読み、成功 commit は generation と各 world revision の双方を同一 transaction で比較する。復元・初期化との競合では古い計画を反映しない。
 
 ### 6.3 性能と操作性
@@ -219,7 +226,7 @@
 
 ## 8. 受け入れ条件
 
-1. **初回記録**: VRChat 公式サイトにログイン済みのテスト環境で「今すぐ確認」を押すと、資格情報の入力なしで全お気に入り ID と取得可能な名称が保存され、変更通知は出ない。
+1. **初回記録**: VRChat公式サイトにログイン済みのテスト環境で「今すぐ確認」を押すと、許可した2つ以外の認証Cookieを扱わず `https://api.vrchat.cloud/api/1/auth/user` が200となり、資格情報の入力なしでcanonicalな全お気に入り関係IDと取得可能な名称が保存され、変更通知は出ない。同期後は一時Cookieと所有マーカーが残らない。
 2. **認証切れ**: API が 401 を返すと、既存ワールド、連続消失回数、履歴は変化せず、公式サイトを開くボタンが表示される。
 3. **名称変更**: 同じ ID の名前を A から B に変えた偽 API の完全スナップショットを処理すると、A と B を持つイベントが 1 件だけ作られ、再処理しても増えない。
 4. **一時欠落**: 1 回欠落して次回復帰した ID は「確認中」から通常へ戻り、消失イベントも通知も作られない。
@@ -231,10 +238,10 @@
 10. **通知 attempt 上限**: 同一 event の通知 attempt は Service Worker 再起動後も最大 1 回である。claim 後 crash を注入した場合は通知が欠落しても event 履歴が残り、再 attempt しない。
 11. **バックアップ**: エクスポート JSON に 1 profile だけが含まれ、Cookie、token、password、session の値がない。複数 profile を持つ DB へ復元すると対象 user の profile/worlds/favoriteGroups/events だけが一致する内容へ置換され、他 user の全データが保持され、安全な preferences だけが merge される。復元した過去 event は通知 attempt を発生させない。
 12. **原子性**: 差分反映または復元の途中で意図的にトランザクションを失敗させても、処理前の DB が読み出せる。
-13. **権限**: ビルド済み manifest に `cookies`、`webRequest`、`<all_urls>` がなく、`unlimitedStorage` があり、DNR の User-Agent 変更対象が拡張自身からの VRChat GET API 要求だけである。
+13. **権限**: ビルド済みmanifestに必要な `cookies` と `unlimitedStorage` があり、`webRequest`、`<all_urls>`、不要hostがない。Cookie API利用箇所、固定名、source/target、DNRのUser-Agent変更対象がレビュー済みのAPI GET境界だけに限定される。
 14. **配布物**: lint、型検査、単体・結合テスト、Chrome 用 Manifest V3 配布 ZIP と Inno Setup 6 による Windows インストーラーの生成が成功する。
-15. **CurrentUser リリースゲート**: 最新仕様と実応答に credential、token、Cookie、session data の field がないことを確認できた場合だけ同期機能をリリースできる。禁止 field を含む fixture では API adapter が fail closed し、DB、ログ、バックアップへ値を残さない。
-16. **ページング終端**: 100 件未満の非空ページ後も実取得件数分だけ offset を進め、空ページまで取得する。同一非空 fingerprint、offset 停滞、10,000 件超過、101 要求内に空終端なしの各 fixture では状態を更新しない。
+15. **CurrentUser リリースゲート**: 最新仕様に定義される `authToken`、`usesGeneratedPassword` とnestedのcredential-like fieldを含むfixtureでも、API adapterの戻り値が検証済みの利用者IDと表示名だけで、DB、ログ、バックアップへfixtureの秘密値を残さない。必須2fieldの欠落・不正、top-level非object、誤Content-Type、巨大・不正JSONはfail closedにする。
+16. **ページング終端**: 100 件未満の非空ページ後もraw実取得件数分だけ offset を進め、空ページまで取得する。`/worlds/favorites` が `n=100` に対して103件返し、そのうちIDだけがnoncanonicalな2行があるfixtureでは、IDを投影・分類せず、ID以外の必須fieldとraw全103件を検証し、2行をmetadata出力から除外して次を `offset=103` とする。nullable identityがこのendpointだけの明示opt-inで、nullがglobal重複検査から除外されること、canonical ID列と除外件数のfingerprint、全件nullの同数page、非空snapshot全体のcanonical metadata 0件を確認する。除外IDが戻り値、DB、UI、log、backup、個別API URLに現れないことを確認する。ID以外の必須field不正、canonical ID重複、10,000件超の単一ページ、他endpointの101件ページ、canonical IDを含む同一非空 fingerprint、offset停滞、101要求内に空終端なしの各fixtureでは状態を更新しない。
 17. **redirect 拒否**: 3xx fixture に対する fetch は `redirect: "manual"` で追従せず、redirect 先へ要求を送らず、既存履歴を変更しない。
 18. **通知の明示的失敗**: notification API が明示的失敗を返しても claim は解除されず、固定 `notificationError` が残る。成功、明示的失敗、claim 後 crash のすべてで、Service Worker 再起動後も同じ event の通知 attempt は 1 回を超えず、履歴は表示できる。
 19. **alarm 再登録**: 自動同期を有効にした各終了 fixture で、既存の名前付き alarm がちょうど 1 件へ置換される。予定時刻は success=12時間+jitter、429=`backoffUntil`、offline/5xx上限=30〜60分後、401/schema/other=12時間+jitter と一致し、自動同期無効時は alarm が残らない。
@@ -245,6 +252,6 @@
 24. **保存量制御**: 101件目のプロフィール同期記録と21件目の匿名記録を追加すると、それぞれ最新100件・20件だけが残り、ワールドと変更履歴は削除されない。
 25. **データ消去**: 利用者recordの原子的消去成功前に自己アンインストールを呼ばない。transaction失敗時は全recordを維持し、成功時はprofile/world/group/event/syncRun/preferences/unreadが0で`purgePending`だけが残る。書き出し済みJSONは自動削除対象外と表示する。
 26. **インストーラー設定**: 静的テストで `PrivilegesRequired=lowest`、固定 `%LOCALAPPDATA%` 配置、変更不能な install path、custom `[Registry]` 不在、manifest の `key` 不在、service・scheduled task・startup・telemetry・runtime download 不在を確認できる。
-27. **初回導入**: 知人の実 PC と実 Chrome で fresh install すると、検証済み `dist/extension` が固定場所へ配置され、管理画面と Explorer が開き、日本語案内に従って unpacked 拡張を読み込める。Downloads のインストーラーを削除した後も動作する。
-28. **更新**: 同版再インストールと 1 回の上書き更新が成功し、downgrade は拒否される。更新前後で extension ID と履歴が保持され、失敗時だけ単一世代の `extension.old` が復元に使われる。
+27. **初回導入**: 対象の実 PC と実 Chrome で fresh install すると、検証済み `dist/extension` が固定場所へ配置され、管理画面と Explorer が開き、日本語案内に従って unpacked 拡張を読み込める。Downloads のインストーラーを削除した後も動作する。
+28. **更新**: 同版再インストールと `0.1.6` から `0.1.7` への上書き更新が成功し、downgradeは拒否される。更新後に管理画面が開き、Chromeが `cookies` と `vrchat.com` / `vrchat.cloud` / `api.vrchat.cloud` の必須権限の承認または再有効化を求める場合は利用者が完了できる。表示版が古い場合だけ同じ固定pathの拡張を1回再読み込みし、更新前後でextension IDと履歴が保持される。失敗時だけ単一世代の `extension.old` が復元に使われる。
 29. **正規アンインストール**: 拡張側の全消去・自己アンインストールを先に行い、その後 Windows 側を削除できる。Windows アンインストーラーは app root 外、Chrome のプロフィール・Cookie・IndexedDB、JSON バックアップを削除せず、Chrome 側削除の自動判定もしない。

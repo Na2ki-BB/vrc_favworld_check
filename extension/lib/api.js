@@ -26,24 +26,9 @@ export const API_ERROR_CODES = /** @type {const} */ ({
 const DEFAULT_TIMEOUT_MS = 15_000;
 const RETRY_BASE_DELAY_MS = 2_000;
 const RETRY_JITTER_RATIO = 0.25;
-const CURRENT_USER_MAX_DEPTH = 8;
-const CURRENT_USER_MAX_OBJECTS = 10_000;
 const WORLD_ID_PATTERN = /^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const USER_ID_PATTERN = /^usr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FAVORITE_GROUP_ID_PATTERN = /^fvgrp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SENSITIVE_FIELD_PATTERN = /(credential|password|passwd|token|cookie|session|authorization|secret|apikey)/;
-const SENSITIVE_FIELD_NAMES = new Set([
-  "auth",
-  "otp",
-  "totp",
-  "2facode",
-  "twofactorcode"
-]);
-const SAFE_CURRENT_USER_KEY_FIELDS = new Set([
-  // Documented VRChat CurrentUser compatibility field. It is never projected
-  // into local storage, but its presence must not make every login fail.
-  "friendkey"
-]);
 const RELEASE_STATUSES = new Set(["public", "private", "hidden"]);
 const FAVORITE_GROUP_TYPES = new Set(["avatar", "friend", "world", "vrcPlusWorld"]);
 const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
@@ -65,6 +50,10 @@ const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
  *   favoriteGroup: string,
  *   releaseStatus: "public" | "private" | "hidden"
  * }} FavoriteWorldMetadata
+ * @typedef {{
+ *   identity: string | null,
+ *   metadata: FavoriteWorldMetadata | null
+ * }} FavoriteWorldPageItem
  * @typedef {{
  *   id: string,
  *   name: string,
@@ -218,11 +207,12 @@ export class VrchatApi {
       throw new ApiSchemaError();
     }
 
-    assertCurrentUserHasNoSensitiveFields(response.body);
     if (!isRecord(response.body)) {
       throw new ApiSchemaError();
     }
 
+    // CurrentUser can contain fields such as authToken. Never enumerate or
+    // interpret unknown fields: only copy the two values this extension uses.
     const id = response.body.id;
     const displayName = response.body.displayName;
     if (!isUserId(id) || !isNonEmptyString(displayName)) {
@@ -243,11 +233,20 @@ export class VrchatApi {
 
   /** @returns {Promise<FavoriteWorldMetadata[]>} */
   async listAllFavoriteWorlds() {
-    return this.#listAll(
+    const pageItems = await this.#listAll(
       (offset) => `/worlds/favorites?n=${API_PAGE_SIZE}&offset=${offset}&releaseStatus=all`,
-      projectFavoriteWorld,
-      (world) => world.id
+      projectFavoriteWorldPageItem,
+      (item) => item.identity,
+      { allowNullIdentity: true, allowOverfilledPage: true }
     );
+
+    const metadata = pageItems.flatMap((item) => (
+      item.metadata === null ? [] : [item.metadata]
+    ));
+    if (pageItems.length > 0 && metadata.length === 0) {
+      throw new ApiSchemaError();
+    }
+    return metadata;
   }
 
   /**
@@ -270,7 +269,7 @@ export class VrchatApi {
       ),
       (value) => projectFavoriteGroup(value, ownerId),
       (group) => group.id,
-      true
+      { duplicateItemIsSchemaError: true }
     );
 
     const seenNames = new Set();
@@ -316,16 +315,25 @@ export class VrchatApi {
    * @template T
    * @param {(offset: number) => string} pathForOffset
    * @param {(value: unknown) => T} projectItem
-   * @param {(value: T) => string} itemIdentity
-   * @param {boolean} [duplicateItemIsSchemaError]
+   * @param {(value: T) => string | null} itemIdentity
+   * @param {{
+   *   allowNullIdentity?: boolean,
+   *   allowOverfilledPage?: boolean,
+   *   duplicateItemIsSchemaError?: boolean
+   * }} [options]
    * @returns {Promise<T[]>}
    */
   async #listAll(
     pathForOffset,
     projectItem,
     itemIdentity,
-    duplicateItemIsSchemaError = false
+    options = {}
   ) {
+    const {
+      allowNullIdentity = false,
+      allowOverfilledPage = false,
+      duplicateItemIsSchemaError = false
+    } = options;
     /** @type {T[]} */
     const items = [];
     const pageFingerprints = new Set();
@@ -344,34 +352,52 @@ export class VrchatApi {
       if (response.status !== 200 || !Array.isArray(response.body)) {
         throw new ApiSchemaError();
       }
-      if (response.body.length > API_PAGE_SIZE) {
+      if (!allowOverfilledPage && response.body.length > API_PAGE_SIZE) {
         throw new ApiSchemaError();
+      }
+      if (response.body.length === 0) {
+        return items;
+      }
+      // For an opted-in endpoint, `n` is a requested page size rather than a
+      // trustworthy response limit. Bound the accumulated snapshot and
+      // advance by the number actually received.
+      if (response.body.length > API_MAX_ITEMS - items.length) {
+        throw new PaginationError();
       }
 
       const page = response.body.map(projectItem);
-      if (page.length === 0) {
-        return items;
-      }
 
       nonEmptyRequestCount += 1;
       if (nonEmptyRequestCount > API_MAX_PAGE_REQUESTS - 1) {
         throw new PaginationError();
       }
-      if (items.length + page.length > API_MAX_ITEMS) {
-        throw new PaginationError();
-      }
 
       const pageIds = page.map(itemIdentity);
-      const fingerprint = JSON.stringify([...pageIds].sort());
-      if (pageFingerprints.has(fingerprint)) {
-        if (duplicateItemIsSchemaError) {
-          throw new ApiSchemaError();
-        }
-        throw new PaginationError();
+      if (!allowNullIdentity && pageIds.includes(null)) {
+        throw new ApiSchemaError();
       }
-      pageFingerprints.add(fingerprint);
+      // If every identity is deliberately omitted, raw offset and the global
+      // request/item caps still guarantee termination. Treating equal null
+      // counts as equal pages would reject distinct unusable metadata rows.
+      if (pageIds.some((itemId) => itemId !== null)) {
+        const fingerprint = JSON.stringify([...pageIds].sort());
+        if (pageFingerprints.has(fingerprint)) {
+          if (duplicateItemIsSchemaError) {
+            throw new ApiSchemaError();
+          }
+          throw new PaginationError();
+        }
+        pageFingerprints.add(fingerprint);
+      }
 
       for (const itemId of pageIds) {
+        // A null identity represents a deliberately omitted raw row. Its
+        // placeholder remains in a mixed page fingerprint and always counts
+        // toward the raw item total, but an unusable identifier cannot
+        // participate in duplicate checks.
+        if (itemId === null) {
+          continue;
+        }
         if (seenItemIds.has(itemId)) {
           if (duplicateItemIsSchemaError) {
             throw new ApiSchemaError();
@@ -575,18 +601,41 @@ function projectFavoriteRelation(value) {
 
 /**
  * @param {unknown} value
- * @returns {FavoriteWorldMetadata}
+ * `/worlds/favorites` can contain metadata rows whose ID is not a
+ * canonical World ID. Do not interpret or copy that unusable identifier:
+ * retain only a null placeholder so the raw row still counts toward paging,
+ * then omit it before anything can reach storage, UI, or an API path. Every
+ * other required field remains schema-validated.
+ *
+ * @returns {FavoriteWorldPageItem}
  */
-function projectFavoriteWorld(value) {
+function projectFavoriteWorldPageItem(value) {
   if (!isRecord(value)) {
     throw new ApiSchemaError();
   }
-  const world = projectWorld(value);
+
+  const id = value.id;
+  const name = value.name;
+  const authorName = value.authorName;
   const favoriteGroup = value.favoriteGroup;
-  if (!isNonEmptyString(favoriteGroup)) {
+  const releaseStatus = value.releaseStatus;
+  if (
+    !isNonEmptyString(name)
+    || !isNonEmptyString(authorName)
+    || !isNonEmptyString(favoriteGroup)
+    || !isReleaseStatus(releaseStatus)
+  ) {
     throw new ApiSchemaError();
   }
-  return { ...world, favoriteGroup };
+
+  if (!isWorldId(id)) {
+    return { identity: null, metadata: null };
+  }
+
+  return {
+    identity: id,
+    metadata: { id, name, authorName, favoriteGroup, releaseStatus }
+  };
 }
 
 /**
@@ -645,48 +694,6 @@ function projectWorld(value) {
   }
 
   return { id, name, authorName, releaseStatus };
-}
-
-/** @param {unknown} value */
-function assertCurrentUserHasNoSensitiveFields(value) {
-  const visited = new WeakSet();
-  let objectCount = 0;
-
-  /**
-   * @param {unknown} current
-   * @param {number} depth
-   */
-  function visit(current, depth) {
-    if (current === null || typeof current !== "object") {
-      return;
-    }
-    if (depth > CURRENT_USER_MAX_DEPTH || visited.has(current)) {
-      throw new ApiSchemaError();
-    }
-
-    objectCount += 1;
-    if (objectCount > CURRENT_USER_MAX_OBJECTS) {
-      throw new ApiSchemaError();
-    }
-    visited.add(current);
-
-    for (const [key, nestedValue] of Object.entries(current)) {
-      const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-      if (
-        SENSITIVE_FIELD_PATTERN.test(normalizedKey)
-        || SENSITIVE_FIELD_NAMES.has(normalizedKey)
-        || (
-          normalizedKey.endsWith("key")
-          && !(depth === 0 && SAFE_CURRENT_USER_KEY_FIELDS.has(normalizedKey))
-        )
-      ) {
-        throw new ApiSchemaError();
-      }
-      visit(nestedValue, depth + 1);
-    }
-  }
-
-  visit(value, 0);
 }
 
 /**

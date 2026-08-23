@@ -53,7 +53,7 @@ Type: filesandordirs; Name: "{app}\extension.new"
 Source: "..\dist\extension\*"; DestDir: "{app}\extension.new"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Run]
-Filename: "{code:GetChromeExecutable}"; Parameters: "--new-window ""chrome://extensions/"""; Description: "Chrome の拡張機能管理画面を開く"; Flags: postinstall nowait skipifsilent shellexec; Check: ShouldRunFirstInstallActions
+Filename: "{code:GetChromeExecutable}"; Parameters: "--new-window ""chrome://extensions/"""; Description: "Chrome でバージョンと権限を確認する"; Flags: postinstall nowait skipifsilent shellexec; Check: ShouldOpenChromeExtensions
 Filename: "{app}\extension"; Description: "選択する extension フォルダーをエクスプローラーで開く"; Flags: postinstall nowait skipifsilent shellexec; Check: ShouldRunFirstInstallActions
 
 [UninstallDelete]
@@ -472,8 +472,23 @@ begin
       '次の順番で拡張機能をChromeへ追加してください。',
       '1. Chromeの拡張機能画面で「デベロッパー モード」をオンにします。' + #13#10 +
       '2. 「パッケージ化されていない拡張機能を読み込む」を押します。' + #13#10 +
-      '3. エクスプローラーで開いた extension フォルダーを選択します。' + #13#10 + #13#10 +
+      '3. エクスプローラーで開いた extension フォルダーを選択します。' + #13#10 +
+      '4. Chromeが権限を表示した場合は、Cookie利用の対象 vrchat.com / vrchat.cloud / api.vrchat.cloud を確認します。' + #13#10 + #13#10 +
       'インストール完了後、Downloads内のこのインストーラーは削除できます。'
+    );
+    GuidePage.RichEditViewer.ReadOnly := True;
+  end;
+  if not FreshInstall then
+  begin
+    GuidePage := CreateOutputMsgMemoPage(
+      wpWelcome,
+      'Chromeで更新を確認',
+      'インストール完了後にChromeの拡張機能画面を開きます',
+      '更新後に次の内容を確認してください。',
+      '1. VRC Favorite World History が有効で、バージョンが {#AppVersion} であることを確認します。' + #13#10 +
+      '2. ChromeがCookie利用や接続権限を確認した場合は、vrchat.com / vrchat.cloud / api.vrchat.cloud が対象であることを確認して許可します。' + #13#10 +
+      '3. 古いバージョンが表示される場合だけ、拡張の「再読み込み」を1回押します。' + #13#10 + #13#10 +
+      '拡張を削除したり、別のフォルダーから読み込み直したりしないでください。'
     );
     GuidePage.RichEditViewer.ReadOnly := True;
   end;
@@ -534,6 +549,11 @@ end;
 function ShouldRunFirstInstallActions: Boolean;
 begin
   Result := FreshInstall and SwapCompleted;
+end;
+
+function ShouldOpenChromeExtensions: Boolean;
+begin
+  Result := SwapCompleted;
 end;
 
 function InitializeUninstall: Boolean;

@@ -10,6 +10,7 @@ const outputDir = path.join(root, "dist", "extension");
 
 const expectedPermissions = [
   "alarms",
+  "cookies",
   "declarativeNetRequestWithHostAccess",
   "notifications",
   "unlimitedStorage"
@@ -17,7 +18,6 @@ const expectedPermissions = [
 
 const forbiddenPermissions = new Set([
   "activeTab",
-  "cookies",
   "debugger",
   "history",
   "scripting",
@@ -193,7 +193,7 @@ export async function build() {
   }
   assertExactSet(
     assertStringArray(manifest.host_permissions),
-    ["https://api.vrchat.cloud/*"],
+    ["https://api.vrchat.cloud/*", "https://vrchat.cloud/*", "https://vrchat.com/*"],
     "host_permissions"
   );
 
@@ -214,6 +214,7 @@ export async function build() {
 
   await Promise.all([
     assertSourceFile("background.js"),
+    assertSourceFile("lib/auth-cookie-bridge.js"),
     assertSourceFile(action.default_popup),
     assertSourceFile("dashboard.html"),
     assertSourceFile("icons/icon128.png")

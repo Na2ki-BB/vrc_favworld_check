@@ -958,7 +958,7 @@ export async function createBackup(repository, userId, options = {}) {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
     exportedAt: options.exportedAt ?? new Date().toISOString(),
-    appVersion: options.appVersion ?? "0.1.0",
+    appVersion: options.appVersion ?? "0.1.7",
     profile: snapshot.profile,
     worlds: snapshot.worlds,
     favoriteGroups: snapshot.favoriteGroups,

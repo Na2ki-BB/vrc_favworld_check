@@ -20,10 +20,10 @@
   │
   ├─ VRChat公式サイト ── ログイン・2FA ── VRChat
   │       │  ブラウザ管理の既存Cookie
-  │       └────────────────────┐
-  │                            │
+  │       └──── Cookie Bridge ──┐
+  │             同期中だけ      │
   └─ 拡張UI ─ message ─ Service Worker ─ HTTPS GET ─ VRChat API
-                         │      credentials: include
+                         │      api.vrchat.cloud/api/1
                          │
                          ├─ Sync Coordinator
                          ├─ Domain Reconciler
@@ -45,6 +45,7 @@
 - 同期を単一 flight（同時に 1 実行だけ）として調停する。
 - VRChat API adapter、差分検知、IndexedDB transaction、通知を順に呼び、同期のアプリケーション制御下にある全終了経路の `finally` で次回 alarm を置換する。
 - install / startup 時に User-Agent 用の動的 Declarative Net Request ルールを再登録する。
+- install / startup 時に値を持たない所有マーカーを確認し、認証Cookieが残っていれば誤削除せず同期を止め、失効後に孤立マーカーだけを削除する。
 - install / startup 時に自動同期が有効なのに次回 alarm がなければ、永続化した `nextSyncAt` と直近結果から 1 件を修復登録する。
 - 数十秒を超え得る同期イベントだけは、Chrome 公式資料の `waitUntil` 例に従い `chrome.runtime.getPlatformInfo()` を 25 秒間隔で呼んで idle timer を更新する。同期 promise の `finally` で interval を必ず破棄し、常時稼働には使わない。
 - DOM や画面状態を持たない。プロセス内変数はキャッシュとしてだけ扱う。
@@ -61,35 +62,47 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 
 ### 3.3 API Adapter
 
-- ベース URL を `https://api.vrchat.cloud/api/1` に固定する。
+- ベース URL を `https://api.vrchat.cloud/api/1` に固定する。認証Cookieの一時複製はAPI adapterではなく、同期単位のCookie Bridgeだけが担当する。
 - `fetch` は `method: "GET"`、`credentials: "include"`、`cache: "no-store"`、`redirect: "manual"` を使用する。3xx を追従せず同期失敗へ変換する。
 - 応答本文をログへ渡さず、endpoint ごとの allowlist schema で必要フィールドだけを抽出する。
 - ページング、2 秒の要求間隔、タイムアウト、5xx / network error の短い再試行を実装する。429 は再試行せず同期全体を停止する。
-- 現行 `CurrentUser` schema に credential / token / session field がないことを前提とし、`/auth/user` の raw 応答から禁止 field 名を検査した後、新しい object へ `id` と `displayName` だけをコピーして raw 応答を破棄する。
+- 現行 `CurrentUser` schemaには任意の `authToken` と必須の `usesGeneratedPassword` がある。`/auth/user` はbounded JSONとしてparseした後、未知fieldを列挙・再帰走査せず、新しいobjectへ `id` と `displayName` だけをコピーしてraw応答を破棄する。
+- `/worlds/favorites` だけは、他の必須fieldが正常でもIDがcanonical World IDでない行について、そのIDを追加解釈・コピーせず、明示的にopt-inしたページング投影の `{ identity: null, metadata: null }` として扱う。raw行はoffsetと総数上限へ含めるが、null identityはglobal重複検査から除外し、adapter外へ出さない。他endpointはnullable identityを許可しない。
 - HTTP の詳細を `AuthenticatedUser`、`FavoriteGroupMetadata`、`FavoriteRelation`、`WorldMetadata`、`WorldProbe`、`ApiFailure` に変換する。
 
-### 3.4 Domain Reconciler
+### 3.4 Auth Cookie Bridge
+
+- `cookies` 権限を使う唯一の認証境界とし、sourceは `https://vrchat.com/api/1/auth/user`、targetは `https://api.vrchat.cloud/api/1/` に固定する。
+- sourceから `auth` を個別取得し、存在する場合だけ `twoFactorAuth` も取得する。Promise版Cookie APIの未検出値 `undefined` は、`auth` ならログイン不足、`twoFactorAuth` なら任意Cookieの不在として扱う。値は関数ローカル変数からAPI用ブラウザCookieへ直接渡し、呼出し元、Sync Coordinator、DB、UI、ログ、backupへ返さない。
+- VRChatがsource CookieへSecure属性を付けていない実機も受け入れるが、sourceは固定HTTPS URLからCookie APIで読むだけで、変更・延命・HTTP送信しない。targetはsource属性を引き継がず、domainを指定しないhost-only、path `/api/1/`、Secure、HttpOnly、SameSite=Strict、期限はsource期限と15分後の早い方とする。
+- API pathと一致しない専用pathへ、固定名・固定値・20分期限の非秘密所有マーカーを認証Cookieより先に作る。終了時は認証Cookieを先、マーカーを最後に削除し、削除後の不在も検査する。
+- 通常終了時は、今回設定してメモリ内に保持している値・属性を全対象で検査し、各削除の直前にも一致を再確認したtarget Cookieだけを削除する。Chrome Cookie APIに原子的なcompare-and-deleteはないため、再確認と削除の間の残余競合窓はセキュリティ文書へ明記する。同期開始前に古い所有マーカーがあり認証Cookieも残っている場合は、再起動後には所有を証明できないため削除せずcleanup失敗とする。認証Cookieがなくなった後に孤立マーカーだけを削除する。
+- マーカーがないのにtarget hostへ送信され得る同名Cookieが親domainや別pathを含めて存在する場合は他のAPIセッションとみなし、上書きも削除もせず停止する。root `vrchat.cloud` のhost permissionは親domain CookieをChromeの権限フィルター越しに列挙するためだけに使い、通信先にはしない。
+- Cookie APIはpartition keyを指定せず非partitioned Cookieだけを対象にし、partitioned Cookieをコピーしない。APIから返された場合は防御的に停止するが、全partitionの列挙は行わない。同一同期はSyncServiceのsingle-flight内でbridge全体を包むため、setup中も全消去と競合しない。
+- 正規アンインストールは、今回の処理で所有を証明できる一時Cookieの削除、または中断残骸の失効による不在確認を、利用者記録の消去と自己アンインストールへ進む前提にする。
+
+### 3.5 Domain Reconciler
 
 - 現在の永続状態と完全スナップショットから、次の `WorldRecord`、`FavoriteGroupRecord`、`HistoryEvent` を純粋計算する。
 - 認証、HTTP、IndexedDB、Chrome API を参照しない。
 - 同じ入力と同じ現在状態から常に同じ結果を返す。
 - 初回ベースライン、2 回連続確認、復帰、名称変更、イベント ID の決定を担当する。
 
-### 3.5 Repository
+### 3.6 Repository
 
 - IndexedDB の schema migration、照会、単一 read-write transaction を隠蔽する。
 - ワールド・お気に入りリスト更新、イベント追加、未読件数、通知 outbox、同期結果を同じ transaction で確定する。
 - 検索用に正規化名と複合 index を管理する。
 - 1 profile 単位のバックアップ読出しと、検証済み復元データによる対象 user の record だけの置換を担当する。他 profile を保持し、安全な global preferences だけを merge する。
 
-### 3.6 Alarm / Notification Adapter
+### 3.7 Alarm / Notification Adapter
 
 - 定期同期には繰り返し alarm ではなく、固定名 `sync-next` の 1 回限り alarm を使う。自動同期が有効なら同期の全終了経路の `finally` で既存 alarm を次の 1 件へ置換し、無効なら解除する。
 - 次回時刻は、成功なら現在から 12 時間 + 0〜60 分 jitter、429 なら `backoffUntil`、offline または 5xx の最大再試行後なら 30〜60 分後、401・schema 不正・その他の失敗なら現在から 12 時間 + 0〜60 分 jitter とする。
 - デスクトップ通知は transaction で生成された未 claim event のうち、名称変更、確定したお気に入り消失・復帰、アクセス不可・復帰だけを同期単位で集約する。`favorite_group_changed`は履歴と未読件数には含めるが、OS通知outboxへ入れない。
 - OS 通知は exactly-once にできないため、通知 API の attempt を最大 1 回にする厳密な at-most-once とする。API 呼出し前の transaction で `notificationClaimedAt` を確定し、以後は成功、明示的失敗、crash のいずれでも claim を解除しない。成功時は `notifiedAt`、明示的失敗時は固定コード `notificationError` を記録し、結果不明時は claim だけを残す。通知の成否にかかわらず履歴 event を正本とする。
 
-### 3.7 Windows Installer
+### 3.8 Windows Installer
 
 Inno Setup 6 は実行時コンポーネントではなく、検証済みの `dist/extension` を第一の利用者の端末へ固定配置する配布境界である。
 
@@ -98,6 +111,7 @@ Inno Setup 6 は実行時コンポーネントではなく、検証済みの `di
 - 初回導入後に `chrome://extensions/` と固定 `extension` フォルダーを開き、Developer Mode、Load unpacked、フォルダー選択を日本語で案内する。Downloads のインストーラー自体は導入後に削除できる。
 - manifest に `key` を追加しない。同じ Windows ユーザー、Chrome プロフィール、固定 path を維持して同じ unpacked 拡張として読み込まれる前提とし、実機更新試験で extension ID と IndexedDB 履歴の保持を確認する。
 - 更新前に Chrome の全ウィンドウを閉じるよう表示するが、プロセス検出や強制終了はしない。semantic version の downgrade は拒否し、同版再インストールは許可する。
+- 更新後にも `chrome://extensions/` を開き、必須 host permission の変更に伴う再有効化・権限承認、表示 version、必要時だけの 1 回の再読み込みを利用者が確認できるようにする。インストーラーは権限を自動承認せず、拡張の削除や別 path からの再読込みも行わない。
 - 新版は app root 内の `extension.new` へ展開・検証してから、現行 `extension` を `extension.old` へ移し、新版を固定 path へ切り替える。成功後は `extension.old` を削除し、失敗時だけ元へ戻す。退避は 1 世代に限定する。
 - Windows アンインストール前に、必要なら JSON をバックアップし、拡張 UI の「記録をすべて削除してアンインストール」を先に実行するよう案内する。Chrome 側の完了をプロフィールから自動判定しない。
 - Windows アンインストーラーの削除範囲は固定 app root 内に限定する。Chrome のプロフィール、Cookie、IndexedDB、書き出した JSON backup は探索も削除もしない。
@@ -110,12 +124,12 @@ Inno Setup 6 は実行時コンポーネントではなく、検証済みの `di
 | 宣言 | 用途 |
 | --- | --- |
 | `manifest_version: 3` | Manifest V3 Service Worker と権限制御 |
-| `permissions: ["alarms", "notifications", "unlimitedStorage", "declarativeNetRequestWithHostAccess"]` | 定期起動、デスクトップ通知、IndexedDB の quota / eviction 保護、User-Agent の限定変更 |
-| `host_permissions: ["https://api.vrchat.cloud/*"]` | 拡張コンテキストから API へ HTTPS fetch |
+| `permissions: ["alarms", "cookies", "notifications", "unlimitedStorage", "declarativeNetRequestWithHostAccess"]` | 定期起動、限定Cookie bridge、デスクトップ通知、IndexedDBのquota / eviction保護、User-Agentの限定変更 |
+| `host_permissions: ["https://vrchat.com/*", "https://vrchat.cloud/*", "https://api.vrchat.cloud/*"]` | 公式Webの固定認証Cookie読取り、親domain Cookieの競合検査、API hostへの一時Cookie設定・読み取り専用HTTPS GET。root hostへは通信せず、bridgeとadapterが名前・path・methodを再制限 |
 | `background.service_worker` | 同期と alarm のイベント処理 |
 | `action` | 初心者向けの入口 |
 
-`cookies`、`webRequest`、`tabs`、`scripting`、`activeTab`、`<all_urls>` は宣言しない。`chrome.tabs.create` で固定 URL を開く操作は `tabs` 権限なしで行える。
+`webRequest`、`tabs`、`scripting`、`activeTab`、`<all_urls>` は宣言しない。`cookies` はAuth Cookie Bridgeだけが固定名2つと所有マーカーに使用する。`chrome.tabs.create` で固定 URL を開く操作は `tabs` 権限なしで行える。
 
 対象とする Chrome 版で `declarativeNetRequestWithHostAccess` が利用できない場合だけ、同等の限定ルールを保ったまま `declarativeNetRequest` を使う。必要最低ブラウザ版はビルド時に固定し、無条件に広い権限へフォールバックしない。
 
@@ -145,7 +159,7 @@ JavaScript の `fetch` から `User-Agent` を直接設定することはでき�
 }
 ```
 
-登録時は本製品が所有する固定 rule ID だけを置換する。他拡張の通信、VRChat 公式サイト自身の通信、画像、WebSocket、POST には一致させない。
+登録時は本製品が所有する固定 rule ID だけを置換し、登録後のrule全体が期待値と一致することを検証する。他拡張の通信、VRChat 公式サイト自身の通信、画像、WebSocket、POST には一致させない。
 
 ## 5. API 取得設計
 
@@ -153,26 +167,30 @@ JavaScript の `fetch` から `User-Agent` を直接設定することはでき�
 
 1. 単一 flight lock を取得する。すでに実行中ならその状態を返す。
 2. 永続化された `backoffUntil` と手動クールダウンを検査する。
-3. `GET /auth/user` でセッションを確認する。raw `CurrentUser` に credential / token / Cookie / session data の field がないことを検査し、新しい object へ `id` と `displayName` だけをコピーして raw 応答を破棄する。禁止 field があれば fail closed にする。
-4. 同一 read-only transaction で profile、worlds、favoriteGroups、profile 世代番号を同期計画用 snapshot として読む。
-5. `GET /favorite/groups?n=100&offset=k&ownerId={userId}` を空ページまで取得し、全レコードの schema、owner、一意な ID・内部名を検証した後、`world` と `vrcPlusWorld` だけを採用する。
-6. `GET /favorites?type=world&n=100&offset=k` を空ページが返るまで取得する。短い非空ページでも止めず、`k` は直前ページの実取得件数だけ増やす。
-7. `GET /worlds/favorites?n=100&offset=k&releaseStatus=all` を同じ終端規則で取得する。
-8. ワールド2一覧の ID、型、ページ進行、要求数、総データ件数を検証する。各 endpoint で 10,000 データ件または 100 非空要求を上限とし、その後の空終端確認 1 要求を含む最大 101 要求とする。不完全なら本体を更新しない。
-9. 既知ワールドと今回一覧を比較し、個別再確認候補を優先度順に最大 20 件選ぶ。
-10. 候補だけ `GET /worlds/{worldId}` で再確認する。20 件を超える候補は `probeState: "pending"` として次回へ送る。
-11. Domain Reconciler を実行する。IndexedDB の 1 transaction で世代番号と world revision を再検査し、ワールド、お気に入りリスト、イベント、未読件数、同期結果、成功時の必須 settings を反映して世代番号を増やす。
-12. 通知対象kindの未 claim イベントだけをkind indexから取得し、transaction で永久 claim してから集約通知を 1 回だけ attempt する。今回の event に加え、前回 commit 後に通知処理へ進めなかった対象 event もここで回収する。成功した event に `notifiedAt`、明示的に失敗した event に固定 `notificationError` を設定する。いずれの結果でも claim は解除しない。リスト移動など非通知kindはこの走査にもclaimにも含めない。
-13. 成否や例外にかかわらず `finally` で lock を解放し、自動同期が有効なら終了結果に対応する次回の名前付き one-shot alarm へ置換する。無効なら既存 alarm を解除する。
+3. Auth Cookie Bridgeが古いmarker残骸と、親domain・別pathを含む非partitioned target競合を検査し、`vrchat.com` の固定名Cookieを `api.vrchat.cloud/api/1/` 用へ一時複製する。`auth` 欠落、Cookie APIから返るpartitioned、既存target競合、setup失敗ではAPI要求を開始しない。
+4. `GET /auth/user` でセッションを確認する。応答のサイズ・media type・UTF-8・JSON・top-level objectと必要2fieldを検査し、新しいobjectへ `id` と `displayName` だけをコピーする。`authToken`、`usesGeneratedPassword`、nested objectを含むその他のfieldは名前も値も走査せず、adapter外へ渡さない。
+5. 同一 read-only transaction で profile、worlds、favoriteGroups、profile 世代番号を同期計画用 snapshot として読む。
+6. `GET /favorite/groups?n=100&offset=k&ownerId={userId}` を空ページまで取得し、全レコードの schema、owner、一意な ID・内部名を検証した後、`world` と `vrcPlusWorld` だけを採用する。
+7. `GET /favorites?type=world&n=100&offset=k` を空ページが返るまで取得する。短い非空ページでも止めず、`k` は直前ページの実取得件数だけ増やす。
+8. `GET /worlds/favorites?n=100&offset=k&releaseStatus=all` を同じ終端規則で取得する。このendpointでは `n=100` を要求件数とし、100件を超える応答も総数上限内ならraw全件を検証して、除外後のmetadata件数ではなくraw実取得件数だけoffsetを進める。ID以外の必須fieldは全行で検査し、noncanonical ID行はIDを追加解釈・コピーせず、明示的なnullable identity投影でmetadata出力前に除外する。
+9. ワールド2一覧の ID、型、ページ進行、要求数、総データ件数を検証する。各 endpoint で 10,000 データ件または 100 非空要求を上限とし、その後の空終端確認 1 要求を含む最大 101 要求とする。不完全なら本体を更新しない。
+10. 既知ワールドと今回一覧を比較し、個別再確認候補を優先度順に最大 20 件選ぶ。
+11. 候補だけ `GET /worlds/{worldId}` で再確認する。20 件を超える候補は `probeState: "pending"` として次回へ送る。
+12. Domain Reconciler を実行する。IndexedDB の 1 transaction で世代番号と world revision を再検査し、ワールド、お気に入りリスト、イベント、未読件数、同期結果、成功時の必須 settings を反映して世代番号を増やす。
+13. 通知対象kindの未 claim イベントだけをkind indexから取得し、transaction で永久 claim してから集約通知を 1 回だけ attempt する。今回の event に加え、前回 commit 後に通知処理へ進めなかった対象 event もここで回収する。成功した event に `notifiedAt`、明示的に失敗した event に固定 `notificationError` を設定する。いずれの結果でも claim は解除しない。リスト移動など非通知kindはこの走査にもclaimにも含めない。
+14. 成否や例外にかかわらずAuth Cookie Bridgeの `finally` で、今回設定した値・属性と一致する一時認証Cookieと所有マーカーを削除する。値・属性が変化した場合や削除を確認できない場合は削除を広げず、Chromeを終了して設定時点の最長15分を待つよう案内する。同期結果が既にcommit済みなら最終成功時刻を正本として保持する。
+15. `finally` でlockを解放し、自動同期が有効なら終了結果に対応する次回の名前付きone-shot alarmへ置換する。無効なら既存alarmを解除する。
 
-ページング結果は手順 10 の commit 完了までメモリ上にだけ置く。Service Worker 中断時は結果を捨て、確定データは変更しない。同期中だけ25秒間隔の限定 keep-alive を使い、開始時には同じ名前の復旧用 one-shot alarm を先に登録する。正常終了時は通常の次回時刻へ置換し、中断時は復旧 alarm から認証確認を含む完全同期をやり直す。
+ページング結果は手順12のcommit完了までメモリ上にだけ置く。Service Worker 中断時は結果を捨て、確定データは変更しない。同期中だけ25秒間隔の限定 keep-alive を使い、開始時には同じ名前の復旧用 one-shot alarm を先に登録する。正常終了時は通常の次回時刻へ置換し、中断時は復旧 alarm から認証確認を含む完全同期をやり直す。
 
 ### 5.2 ページングの完全性
 
-- `offset` は 0 から直前ページの実取得件数だけ単調増加させる。request の `n=100` より少ない非空ページでも継続する。
+- `offset` は 0 から直前ページのraw実取得件数だけ単調増加させる。request の `n=100` より少ない非空ページでも継続し、`/worlds/favorites` が100件を超えて返した場合も切り捨てず同じ規則で進める。非canonical ID行をmetadataから除外してもoffsetを除外後件数へ戻さない。
 - 空ページだけを正常終端とする。短いページは終端にせず、空ページでは offset を増やさない。
-- 異なる offset で同一の非空ページ fingerprint が返る、または非空ページ後に offset が増えない場合は異常として同期を中止する。
-- 各 endpoint はデータ 10,000 件、非空ページ 100 要求を安全上限とし、ちょうど上限に達した場合も空終端確認を 1 回だけ許可する。最大 101 要求で空ページを確認できなければ中止する。
+- 異なる offset で同一の非空ページ fingerprint が返る、または非空ページ後に offset が増えない場合は異常として同期を中止する。ただし `/worlds/favorites` の全件null identity pageは除外件数だけではfingerprintを成立させず、次項のraw件数による境界を使う。
+- 各 endpoint はデータ10,000件、非空ページ100要求を安全上限とし、ちょうど上限に達した場合も空終端確認を1回だけ許可する。`/worlds/favorites` の各raw pageは残り総数枠を投影前に検査する。他endpointは観測根拠がないため1ページ100件上限を維持する。最大101要求で空ページを確認できなければ中止する。
+- `/worlds/favorites` のnullable identityはendpoint単位で明示的に許可し、nullはglobalなID重複検査から除外する。canonical IDが1件以上あるpageのfingerprintはcanonical ID列と除外件数から作る。全件nullのpageは同数という理由だけで反復と判定せず、raw offsetの単調増加、最大100非空要求と空終端確認1要求、総数10,000件上限で終了を保証する。非空snapshot全体にcanonical metadataが1件もなければ中止する。
+- canonical IDの重複とID以外の必須field不正はpage全体の不正として中止する。canonical IDのみが `WorldMetadata` となり、`/favorites` 関係IDと `GET /worlds/{worldId}` の入力検査、backupのID検査を緩めず、DB、UI、logへnoncanonical IDを渡さない。
 - API に snapshot token はないため、ページング中のサーバー側更新による一時的な抜けは完全には防げない。2 回連続確認が誤判定を緩和する。
 
 ### 5.3 候補の優先順位
@@ -486,7 +504,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - 拡張アイコンは未読イベント数を `1`〜`99+` で表示し、履歴画面を開いたときだけ DB の未読件数を0へする。
 - OS通知の本体または「履歴を見る」ボタンは、外部入力を混ぜない固定の`dashboard.html#events`を開く。dashboardはhashをallowlistで解釈し、DB読込み後に履歴タブを選択して既読化する。
 - 最終正常同期から36時間、8,000ワールド、80,000イベント、または概算20MiBを超えた場合だけ行動案内を表示する。通常の800件では利用者へメンテナンスを要求しない。
-- 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、clearと`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSON、Downloadsのインストーラー、Windowsの固定配置ファイルは拡張側の削除対象外と明示し、続けてWindows側のアンインストールを案内する。
+- 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止とAuth Cookie Bridge対象Cookieの不在確認後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、cleanup、clear、`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSON、Downloadsのインストーラー、Windowsの固定配置ファイルは拡張側の削除対象外と明示し、続けてWindows側のアンインストールを案内する。
 
 ## 12. テスト可能性
 
@@ -496,6 +514,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - `Clock` / `RandomSource`: 時刻、jitter、backoff を固定可能。
 - `WorldRepository`: fake と fake-indexeddb 相当の結合実装。
 - `BrowserAlarm` / `BrowserNotification`: alarm の置換と通知 attempt を記録し、各同期終了結果、明示的通知失敗、claim 後 crash を注入できる spy。
+- `AuthCookieBridge`: Cookie APIと時計を注入し、固定名だけの取得、target競合、marker復旧、partitioned拒否、setup/cleanup失敗、値非露出を検査できるfake。
 - `Reconciler`: HTTP なしの表形式単体テスト。
 
 主要 invariant は property test または反復テストで確認する。
@@ -509,8 +528,9 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - event の before と直前 state、after と直後 state が一致する。
 - どの例外点で transaction を abort しても world と event の revision が食い違わない。
 - 8リスト各100件の800ワールドを空終端まで取得し、先頭・中間・末尾の欠落、リスト名変更、ワールド移動、200件単位の全件表示、backup round-tripを確認する。
+- `/worlds/favorites` が `n=100` に対して103件返し、そのうちIDだけがnoncanonicalな行が2件あるfixtureでは、IDを投影・分類せず2件をmetadata出力前に除外しても次を `offset=103` とする。nullable identityがこのendpoint以外では拒否され、nullがglobal重複検査から除外されること、canonical ID列と除外件数のfingerprint、全件nullの同数page、非空snapshot全体のcanonical metadata 0件を検査する。除外IDはDB、UI、log、backup、個別API URLに現れず、他必須field不正、canonical ID重複、他endpointの101件応答、10,000件超の応答は部分結果を返さず拒否する。
 - version 1 DB migration と version 1 backup import が既存ワールド・イベントを保持し、version 2の空グループ状態へ安全に移行する。
 - 101件目のプロフィールrunと21件目の匿名run追加後に上限だけが残り、履歴は減らない。
-- purge transactionの注入abortでは自己アンインストールを呼ばず全利用者recordが残る。成功時だけ順序が `gate → alarm停止 → 全store原子的clear+gate再作成 → uninstall` となる。
+- purge transactionまたはowned Cookie cleanupの注入失敗では自己アンインストールを呼ばず全利用者recordが残る。成功時だけ順序が `gate → alarm停止 → owned Cookie cleanup → 全store原子的clear+gate再作成 → uninstall` となる。
 - installer config の静的テストで、ユーザー単位の固定 path、custom registry 不在、`key` 不在、禁止機能不在、downgrade 拒否、単一世代 rollback、app root 限定削除を確認する。
-- Windows 上の Inno Setup 6 compile と、知人の実 PC / 実 Chrome による fresh install、Downloads 削除後の動作、同版再インストール、1 回の上書き更新、ID・履歴保持、正規順序のアンインストールは手動リリースゲートとする。
+- Windows上のInno Setup 6 compileと、対象の実PC / 実Chromeによるfresh install、Downloads削除後の動作、同版再インストール、`0.1.6`から`0.1.7`への上書き更新と103件raw pageを含む完全同期、`cookies`と3つのVRChat host権限、一時Cookie消去、ID・履歴保持、正規順序のアンインストールは手動リリースゲートとする。

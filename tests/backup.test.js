@@ -233,6 +233,16 @@ test("one-profile backup round-trips without replacing another profile", async (
   assert.equal(await target.getDataGeneration(USER_B), 1);
 });
 
+test("backup default app version matches the current bugfix release", async (context) => {
+  const source = await repository(`backup-version-${context.name}`);
+  context.after(() => source.close());
+  await seed(source, USER_A, WORLD_A, "Alice", "保存するワールド");
+
+  const backup = validateBackup(await createBackup(source, USER_A, { exportedAt: AT_2 }));
+
+  assert.equal(backup.appVersion, "0.1.7");
+});
+
 test("fractional timestamps normalize before restore max and immediate re-export", async (context) => {
   const source = await repository(`backup-future-source-${context.name}`);
   const target = await repository(`backup-future-target-${context.name}`);
@@ -337,6 +347,10 @@ test("malicious, inconsistent, future, and corrupt backups are rejected before w
     ...valid,
     profile: { ...valid.profile, userId: "usr_not-a-vrchat-id" }
   });
+  const invalidWorldId = JSON.stringify({
+    ...valid,
+    worlds: [{ ...valid.worlds[0], worldId: "noncanonical-world-id-1" }]
+  });
   const invalidDate = JSON.stringify({ ...valid, exportedAt: "2026-02-31T00:00:00.000Z" });
   const oversizedName = JSON.stringify({
     ...valid,
@@ -361,6 +375,7 @@ test("malicious, inconsistent, future, and corrupt backups are rejected before w
     futureVersion,
     wrongFormat,
     invalidUserId,
+    invalidWorldId,
     invalidDate,
     oversizedName,
     unsafePreference,

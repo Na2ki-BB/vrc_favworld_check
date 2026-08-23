@@ -62,16 +62,23 @@ test("installer stages one verified extension generation and restores only on sw
   assert.doesNotMatch(source, /CurInstallProgressChanged/u);
 });
 
-test("installer guides first install and confines uninstall deletion to its app root", async () => {
+test("installer guides install and update while confining uninstall deletion to its app root", async () => {
   const source = await readFile(INSTALLER_PATH, "utf8");
   const run = section(source, "Run");
   const uninstallDelete = section(source, "UninstallDelete");
 
   assert.match(run, /chrome:\/\/extensions\//u);
+  assert.match(run, /Check: ShouldOpenChromeExtensions/u);
   assert.match(run, /Filename: "\{app\}\\extension"/u);
+  assert.match(source, /function ShouldOpenChromeExtensions: Boolean;/u);
+  assert.match(source, /Result := SwapCompleted;/u);
   assert.match(source, /デベロッパー モード/u);
   assert.match(source, /パッケージ化されていない拡張機能を読み込む/u);
   assert.match(source, /Downloads内のこのインストーラーは削除できます/u);
+  assert.match(source, /Cookie利用や接続権限/u);
+  assert.match(source, /vrchat\.com \/ vrchat\.cloud \/ api\.vrchat\.cloud/u);
+  assert.match(source, /拡張の「再読み込み」を1回押します/u);
+  assert.match(source, /別のフォルダーから読み込み直したりしないでください/u);
   assert.match(source, /インストーラーはChromeを強制終了しません/u);
   assert.match(source, /記録をすべて削除してアンインストール/u);
 

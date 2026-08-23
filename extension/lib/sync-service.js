@@ -12,6 +12,14 @@ import {
   VrchatApi
 } from "./api.js";
 import {
+  AuthCookieBusyError,
+  AuthCookieCleanupError,
+  AuthCookieConflictError,
+  AuthCookiePartitionedError,
+  AuthCookieRequiredError,
+  AuthCookieSetupError
+} from "./auth-cookie-bridge.js";
+import {
   DATABASE_VERSION,
   GenerationConflictError,
   RevisionConflictError
@@ -62,7 +70,7 @@ export const SETTING_KEYS = Object.freeze({
  *   changes?: number
  * } | {
  *   ok: false,
- *   error: "AUTH_REQUIRED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "MANUAL_COOLDOWN" | "SYNC_CONFLICT" | "SYNC_FAILED" | "STORAGE_UNAVAILABLE" | "MAINTENANCE_IN_PROGRESS",
+ *   error: "AUTH_REQUIRED" | "AUTH_COOKIE_UNAVAILABLE" | "AUTH_COOKIE_CONFLICT" | "AUTH_COOKIE_CLEANUP_FAILED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "MANUAL_COOLDOWN" | "SYNC_CONFLICT" | "SYNC_FAILED" | "STORAGE_UNAVAILABLE" | "MAINTENANCE_IN_PROGRESS",
  *   retryAt?: string
  * }} PublicSyncResult
  */
@@ -107,6 +115,8 @@ export class SyncService {
   #random;
   /** @type {() => string} */
   #idGenerator;
+  /** @type {<T>(operation: () => Promise<T>) => Promise<T>} */
+  #withApiSession;
   /** @type {Promise<PublicSyncResult> | null} */
   #activeSync = null;
 
@@ -118,7 +128,8 @@ export class SyncService {
    *   notifications: NotificationAdapter,
    *   clock?: () => number,
    *   random?: () => number,
-   *   idGenerator?: () => string
+   *   idGenerator?: () => string,
+   *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>
    * }} dependencies
    */
   constructor(dependencies) {
@@ -129,6 +140,7 @@ export class SyncService {
     this.#clock = dependencies.clock ?? Date.now;
     this.#random = dependencies.random ?? Math.random;
     this.#idGenerator = dependencies.idGenerator ?? (() => crypto.randomUUID());
+    this.#withApiSession = dependencies.withApiSession ?? (async (operation) => operation());
   }
 
   get syncing() {
@@ -496,7 +508,10 @@ export class SyncService {
     /** @type {number | null} */
     let scheduledBackoff = null;
     /** @type {PublicSyncResult} */
-    let publicResult;
+    let publicResult = /** @type {PublicSyncResult} */ ({
+      ok: false,
+      error: "SYNC_FAILED"
+    });
     /** @type {string | null} */
     let userId = null;
     let favoriteCount = 0;
@@ -507,6 +522,7 @@ export class SyncService {
 
     try {
       await this.#armWatchdog(startedAtMs);
+      await this.#withApiSession(async () => {
       const user = await this.#api.getCurrentUser();
       userId = user.id;
       const initialSnapshot = await this.#repository.getSyncSnapshot(user.id);
@@ -603,8 +619,11 @@ export class SyncService {
       scheduleResult = "success";
       publicResult = { ok: true, changes: committedPlan.changeCount };
       await this.#deliverNotifications(user.id, syncId, committedPlan.generation);
+      });
     } catch (error) {
-      if (!committed) {
+      if (committed && error instanceof AuthCookieCleanupError) {
+        publicResult = { ok: false, error: "AUTH_COOKIE_CLEANUP_FAILED" };
+      } else if (!committed) {
         const failure = await this.#recordFailure({
           error,
           syncId,
@@ -787,7 +806,10 @@ export class SyncService {
       });
     } else {
       await this.#repository.setSettings({
-        [SETTING_KEYS.lastSyncResult]: classified.runResult
+        [SETTING_KEYS.lastSyncResult]: classified.runResult,
+        ...(input.trigger === "manual" && isAuthCookiePreflightFailure(input.error)
+          ? { [SETTING_KEYS.lastManualSyncAt]: null }
+          : {})
       });
     }
 
@@ -1034,6 +1056,22 @@ function isFavoriteGroupSnapshotConsistent(input) {
 
 /** @param {unknown} error */
 function classifyFailure(error) {
+  if (error instanceof AuthCookieRequiredError) {
+    return failureClassification("auth", "auth_required", "AUTH_REQUIRED");
+  }
+  if (error instanceof AuthCookieConflictError) {
+    return failureClassification("other", "failed", "AUTH_COOKIE_CONFLICT");
+  }
+  if (error instanceof AuthCookieCleanupError) {
+    return failureClassification("other", "failed", "AUTH_COOKIE_CLEANUP_FAILED");
+  }
+  if (
+    error instanceof AuthCookiePartitionedError
+    || error instanceof AuthCookieSetupError
+    || error instanceof AuthCookieBusyError
+  ) {
+    return failureClassification("other", "failed", "AUTH_COOKIE_UNAVAILABLE");
+  }
   if (error instanceof AuthRequiredError) {
     return failureClassification("auth", "auth_required", "AUTH_REQUIRED");
   }
@@ -1060,10 +1098,19 @@ function classifyFailure(error) {
   return failureClassification("other", "failed", "SYNC_FAILED");
 }
 
+/** @param {unknown} error */
+function isAuthCookiePreflightFailure(error) {
+  return error instanceof AuthCookieRequiredError
+    || error instanceof AuthCookieConflictError
+    || error instanceof AuthCookiePartitionedError
+    || error instanceof AuthCookieSetupError
+    || error instanceof AuthCookieBusyError;
+}
+
 /**
  * @param {ScheduleResult} scheduleResult
  * @param {"success" | "auth_required" | "rate_limited" | "offline" | "api_incompatible" | "failed"} runResult
- * @param {"AUTH_REQUIRED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "SYNC_CONFLICT" | "SYNC_FAILED"} error
+ * @param {"AUTH_REQUIRED" | "AUTH_COOKIE_UNAVAILABLE" | "AUTH_COOKIE_CONFLICT" | "AUTH_COOKIE_CLEANUP_FAILED" | "RATE_LIMITED" | "OFFLINE" | "VRCHAT_UNAVAILABLE" | "API_INCOMPATIBLE" | "SYNC_CONFLICT" | "SYNC_FAILED"} error
  */
 function failureClassification(scheduleResult, runResult, error) {
   return {

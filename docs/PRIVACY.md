@@ -1,6 +1,6 @@
 # プライバシー方針
 
-最終更新: 2026-08-18
+最終更新: 2026-08-24
 
 VRC Favorite World History（以下「本拡張」）は、VRChatのお気に入りワールド履歴を利用者自身のブラウザ内へ保存するローカルファーストの拡張機能です。
 
@@ -21,21 +21,25 @@ VRC Favorite World History（以下「本拡張」）は、VRChatのお気に入
 
 これらは、利用者がお気に入り履歴を検索・確認し、変化の通知を受ける目的だけで使います。
 
+`/worlds/favorites` が返すIDのうち、製品が保存対象とするcanonical World ID形式に一致しないものは、値を追加分類したり別の識別子としてコピーしたりせず、その行のID以外の必須項目とraw件数だけを検査してメタデータ出力から除外します。除外したIDはIndexedDB、画面、ログ、個別APIのURL、バックアップへ渡しません。お気に入り関係として保存するWorld ID、個別取得に使うWorld ID、バックアップのID検査は緩めません。
+
 ## 認証情報
 
-本拡張は、パスワードや2FAコードの入力を要求しません。`cookies` 権限を要求せず、Cookie値、認証トークン、セッションデータを読み取り・保存・表示・バックアップしません。
+本拡張は、パスワードや2FAコードの入力を要求しません。公式WebログインをAPIでも利用するため、`cookies` 権限で `vrchat.com` の `auth` と、存在する場合だけ `twoFactorAuth` の値を同期開始時に読み取り、`api.vrchat.cloud` のブラウザCookieへ一時的に複製します。それ以外の認証Cookieは読み取りません。元Cookieは変更せず、API側の一時Cookieは元の属性にかかわらずSecure・HttpOnlyとして作成します。復旧用には値が固定された非秘密の所有マーカーだけを確認します。
 
-利用者がVRChat公式サイトで作成済みのログイン状態を、ブラウザ自身がVRChat APIリクエストへ自動的に適用します。本拡張はその値へアクセスしません。
+Cookie値は同期処理中の関数ローカル変数と一時Cookie以外へ渡さず、拡張のIndexedDB、設定、ファイル、ログ、画面、通知、バックアップへ保存・表示・送信しません。通常終了時は、今回設定した値・属性と一致する一時Cookieだけを削除します。途中終了後は値を復元・永続化していないため同名Cookieを能動削除せず、設定時点で最長15分の期限切れを確認してから非秘密マーカーだけを削除します。API側に既存の同名Cookieがある場合は親domainやpathを問わず削除・上書きしません。
+
+`/auth/user` の応答には仕様上 `authToken` など本拡張が不要とするfieldが含まれ得ます。本拡張は応答サイズとJSON形式を検査した後、User IDと表示名だけを新しいobjectへコピーし、その他のfieldは名前・値・階層を走査せず破棄します。raw応答はJSON parse中に一時的にブラウザのメモリへ存在しますが、IndexedDB、ログ、画面、通知、バックアップへ渡しません。
 
 ## 外部通信
 
-機能上のAPI通信先は `https://api.vrchat.cloud/` に限定し、読み取り専用のGETリクエストだけを使います。「VRChat公式サイトを開く」を利用者が押した場合は、固定URLの公式ログインページを新しいタブで開きます。
+機能上の通信先は、固定ログインURL `https://vrchat.com/home/login` と、読み取り専用API `https://api.vrchat.cloud/api/1/` に限定します。APIにはGETリクエストだけを使います。
 
 取得データを開発者や第三者のサーバーへ転送しません。VRChat側でのデータ処理には、VRChatの規約とプライバシーポリシーが適用されます。
 
 ## Windowsインストーラー
 
-知人1名向けのInno Setupインストーラーは、検証済みの拡張ファイルを現在のWindowsユーザーの `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` へ固定配置します。管理者権限を使わず、Inno Setup標準の現在ユーザー向けアンインストール登録以外のregistry、browser policy、force install、service、scheduled task、startupを使用しません。
+Inno Setupインストーラーは、検証済みの拡張ファイルを現在のWindowsユーザーの `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` へ固定配置します。管理者権限を使わず、Inno Setup標準の現在ユーザー向けアンインストール登録以外のregistry、browser policy、force install、service、scheduled task、startupを使用しません。
 
 インストーラーはChromeのプロフィール、Cookie、IndexedDBを読み取りません。テレメトリ、自動更新、実行時ダウンロードはなく、認証情報、API応答、履歴、バックアップを収集・送信しません。
 
@@ -43,7 +47,7 @@ VRC Favorite World History（以下「本拡張」）は、VRChatのお気に入
 
 ワールドと変更履歴は、利用者が明示的に全消去するまでブラウザ内に残ります。障害調査用の同期記録だけは、プロフィールごと直近100件、認証前は直近20件へ自動整理します。
 
-設定画面の「記録をすべて削除してアンインストール」は、新しい同期を止め、拡張専用IndexedDB内のprofile、ワールド、リスト、履歴、設定を1つの処理で消去します。利用者記録を含まない削除中フラグとschema情報だけを残し、消去成功後にだけ自己アンインストールします。処理が中断・失敗した場合は一部だけ消さず、アンインストールせずに再試行を案内します。必要に応じて、操作前にJSONバックアップを書き出してください。
+設定画面の「記録をすべて削除してアンインストール」は、新しい同期を止め、本拡張が作成した一時認証Cookieの残骸がないことを確認してから、拡張専用IndexedDB内のprofile、ワールド、リスト、履歴、設定を1つの処理で消去します。利用者記録を含まない削除中フラグとschema情報だけを残し、消去成功後にだけ自己アンインストールします。処理が中断・失敗した場合は一部だけ消さず、アンインストールせずに再試行を案内します。必要に応じて、操作前にJSONバックアップを書き出してください。
 
 正規のアンインストールでは、この拡張側の操作を先に完了し、その後にWindowsの「インストールされているアプリ」から固定配置ファイルを削除します。Windows側はChromeからの削除完了をプロフィールから自動判定せず、固定app root外を削除しません。
 
@@ -63,9 +67,12 @@ Windows側のアンインストーラーはChromeのプロフィール、Cookie�
 | `notifications` | 確定した変化のデスクトップ通知 |
 | `unlimitedStorage` | 利用者の履歴をブラウザの容量回収から保護 |
 | `declarativeNetRequestWithHostAccess` | VRChat指定形式のUser-Agentを、対象APIのGET通信だけへ付与 |
-| `https://api.vrchat.cloud/*` | VRChat APIから利用者自身のお気に入りを読み取る |
+| `cookies` | 固定名 `auth` と任意の `twoFactorAuth` を同期中だけAPI用ドメインへ一時複製し、終了時と復旧時に削除 |
+| `https://vrchat.com/*` | 公式Webログインの固定Cookie名2つを読み取るために使用 |
+| `https://vrchat.cloud/*` | APIへ届き得る親domainの同名Cookieを競合として検出するためだけに使用。通信先にはしない |
+| `https://api.vrchat.cloud/*` | 一時Cookieの設定・削除と、固定 `/api/1/` への読み取り専用GETに使用 |
 
-`cookies`、`tabs`、`webRequest`、`<all_urls>` は要求しません。
+`tabs`、`webRequest`、`<all_urls>` は要求しません。`cookies` 権限を、上記の2つの名前・3つのVRChat host以外の用途には使用しません。
 
 ## 変更と問い合わせ
 
