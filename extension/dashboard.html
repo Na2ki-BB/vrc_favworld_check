@@ -24,6 +24,17 @@
       </header>
 
       <main>
+        <section id="primary-focus" class="primary-focus" aria-live="polite">
+          <div>
+            <p class="section-label">MOST IMPORTANT</p>
+            <h2 id="primary-focus-title">現在アクセスできないワールドを確認しています</h2>
+            <p id="primary-focus-detail">保存済みの名前と画像を読み込んでいます。</p>
+          </div>
+          <button id="primary-focus-button" class="button button-primary" type="button" hidden>
+            保存済みの名前と画像を見る
+          </button>
+        </section>
+
         <section id="notice-panel" class="notice-panel" aria-live="polite" hidden>
           <div>
             <strong id="notice-title"></strong>
@@ -46,30 +57,30 @@
         </section>
 
         <section class="summary-grid" aria-label="記録の概要">
-          <article class="summary-card accent-teal">
+          <button class="summary-card accent-coral" type="button" data-world-filter="unavailable">
+            <span>現在アクセス不可</span>
+            <strong id="summary-unavailable">—</strong>
+            <small>削除・非公開などの可能性</small>
+          </button>
+          <button class="summary-card accent-gold" type="button" data-world-filter="missing">
+            <span>お気に入り一覧から外れた</span>
+            <strong id="summary-missing">—</strong>
+            <small>手動解除の可能性もあります</small>
+          </button>
+          <button class="summary-card accent-violet" type="button" data-world-filter="attention">
+            <span>すべての要確認</span>
+            <strong id="summary-attention">—</strong>
+            <small>上の2状態を重複なしで集計</small>
+          </button>
+          <button class="summary-card accent-teal" type="button" data-world-filter="all">
             <span>記録中</span>
             <strong id="summary-total">—</strong>
             <small>ワールド</small>
-          </article>
-          <article class="summary-card accent-coral">
-            <span>現在アクセス不可</span>
-            <strong id="summary-unavailable">—</strong>
-            <small>削除・非公開の区別はしません</small>
-          </article>
-          <article class="summary-card accent-gold">
-            <span>お気に入り一覧にない</span>
-            <strong id="summary-missing">—</strong>
-            <small>2回確認済み</small>
-          </article>
-          <article class="summary-card accent-violet">
-            <span>名前変更</span>
-            <strong id="summary-renamed">—</strong>
-            <small>記録した履歴</small>
-          </article>
+          </button>
         </section>
 
         <nav class="tabs" aria-label="表示内容">
-          <button class="tab is-active" type="button" data-tab="worlds">ワールド</button>
+          <button class="tab is-active" type="button" data-tab="worlds">消えたワールドを確認</button>
           <button class="tab" type="button" data-tab="events">
             変更履歴
             <span id="history-unread-badge" class="tab-count" hidden></span>
@@ -78,33 +89,46 @@
         </nav>
 
         <section id="worlds-panel" class="tab-panel">
-          <div class="toolbar">
-            <label class="search-field">
-              <span class="sr-only">ワールドを検索</span>
-              <input id="world-search" type="search" placeholder="名前・作者・リスト名・World IDで検索">
-            </label>
-            <label class="select-field">
-              <span class="sr-only">状態で絞り込み</span>
-              <select id="world-filter">
-                <option value="all">すべての状態</option>
-                <option value="favorite">お気に入り中</option>
-                <option value="missing">お気に入り一覧にない</option>
-                <option value="unavailable">現在アクセス不可</option>
-                <option value="pending">確認中</option>
-              </select>
-            </label>
-            <label class="select-field">
-              <span class="sr-only">お気に入りリストで絞り込み</span>
-              <select id="group-filter">
-                <option value="">すべてのリスト</option>
-              </select>
-            </label>
+          <div class="section-heading">
+            <div>
+              <p class="section-label">CHECK FIRST</p>
+              <h2>保存済みの名前と画像を確認</h2>
+            </div>
+            <p>アクセスできないワールドを先頭に表示します。「削除」か「非公開」かは断定せず、最後に保存できた情報を残します。</p>
           </div>
+          <details id="world-filter-panel" class="filter-panel">
+            <summary>検索・絞り込み</summary>
+            <div class="toolbar">
+              <label class="search-field">
+                <span class="sr-only">ワールドを検索</span>
+                <input id="world-search" type="search" placeholder="名前・作者・リスト名・World IDで検索">
+              </label>
+              <label class="select-field">
+                <span class="sr-only">状態で絞り込み</span>
+                <select id="world-filter">
+                  <option value="attention">すべての要確認</option>
+                  <option value="unavailable">現在アクセス不可</option>
+                  <option value="missing">お気に入り一覧から外れた</option>
+                  <option value="all" selected>すべての記録</option>
+                  <option value="favorite">お気に入り中</option>
+                  <option value="pending">確認中</option>
+                </select>
+              </label>
+              <label class="select-field">
+                <span class="sr-only">お気に入りリストで絞り込み</span>
+                <select id="group-filter">
+                  <option value="">すべてのリスト</option>
+                </select>
+              </label>
+            </div>
+          </details>
+          <p>画像は一度の確認で順番に自動保存します。この画面を閉じても、Chrome起動中は続き、Chromeを閉じた場合は次の起動時に再開します。定期的な自動確認がオフでも、開始済みの画像保存は続きます。</p>
+          <p id="thumbnail-capture-notice" class="result-count" role="status" hidden></p>
           <p id="world-result-count" class="result-count"></p>
           <div id="world-list" class="world-list" aria-live="polite"></div>
           <div id="world-empty" class="empty-state" hidden>
-            <strong>該当するワールドはありません</strong>
-            <p>検索語や状態の絞り込みを変えてください。</p>
+            <strong id="world-empty-title">該当するワールドはありません</strong>
+            <p id="world-empty-detail">検索語や状態の絞り込みを変えてください。</p>
           </div>
         </section>
 
@@ -121,6 +145,7 @@
               <span class="sr-only">変更の種類で絞り込み</span>
               <select id="event-filter">
                 <option value="all">すべての変更</option>
+                <option value="attention">一覧にない・アクセス不可</option>
                 <option value="renamed">名前変更</option>
                 <option value="group">お気に入りリスト変更</option>
                 <option value="missing">お気に入り一覧にない</option>
@@ -162,7 +187,7 @@
             <article class="settings-card">
               <p class="section-label">BACKUP</p>
               <h2>記録をバックアップ</h2>
-              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。</p>
+              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。サムネイル画像は現在のJSONには含まれません。</p>
               <div class="stacked-actions">
                 <button id="export-button" class="button button-secondary" type="button">バックアップを書き出す</button>
                 <label class="button button-ghost file-button">
@@ -181,6 +206,7 @@
                 <div><dt>ワールド</dt><dd id="settings-world-count">0件</dd></div>
                 <div><dt>変更履歴</dt><dd id="settings-event-count">0件</dd></div>
                 <div><dt>お気に入りリスト</dt><dd id="settings-group-count">0件</dd></div>
+                <div><dt>保存済み画像</dt><dd id="settings-thumbnail-count">0件</dd></div>
                 <div><dt>概算使用量</dt><dd id="settings-storage-usage">確認中</dd></div>
                 <div><dt>最終バックアップ</dt><dd id="settings-last-backup">まだありません</dd></div>
               </dl>

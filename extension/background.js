@@ -5,15 +5,19 @@ import { AuthCookieBridge } from "./lib/auth-cookie-bridge.js";
 import { openDatabase } from "./lib/database.js";
 import { installUserAgentRule } from "./lib/dnr.js";
 import {
+  ATTENTION_NOTIFICATION_ID_PREFIX,
   NOTIFICATION_ID_PREFIX,
   SETTINGS_SCHEDULE_WARNING,
   SETTING_KEYS,
   SYNC_ALARM_NAME,
+  THUMBNAIL_ALARM_NAME,
   SyncService
 } from "./lib/sync-service.js";
 
 export const VRCHAT_LOGIN_URL = "https://vrchat.com/home/login";
 export const HISTORY_DASHBOARD_PATH = "dashboard.html#events";
+export const ATTENTION_DASHBOARD_PATH = "dashboard.html#attention";
+export const ALL_WORLDS_DASHBOARD_PATH = "dashboard.html#all";
 
 export const MESSAGE_TYPES = Object.freeze({
   getStatus: "GET_STATUS",
@@ -46,25 +50,71 @@ export function createHistoryDashboardOpener(dependencies) {
 }
 
 /**
+ * Open only the packaged attention dashboard route used by notifications.
+ * No caller-controlled value can influence the URL or hash.
+ *
+ * @param {{
+ *   resolveExtensionUrl: (path: string) => string,
+ *   createTab: (details: {url: string}) => Promise<unknown>
+ * }} dependencies
+ * @returns {() => Promise<void>}
+ */
+export function createAttentionDashboardOpener(dependencies) {
+  return async function openAttentionDashboard() {
+    await dependencies.createTab({
+      url: dependencies.resolveExtensionUrl(ATTENTION_DASHBOARD_PATH)
+    });
+  };
+}
+
+/**
+ * Open the full saved world list from the popup, including current favorites.
+ * @param {{
+ *   resolveExtensionUrl: (path: string) => string,
+ *   createTab: (details: {url: string}) => Promise<unknown>
+ * }} dependencies
+ */
+export function createAllWorldsDashboardOpener(dependencies) {
+  return async function openAllWorldsDashboard() {
+    await dependencies.createTab({
+      url: dependencies.resolveExtensionUrl(ALL_WORLDS_DASHBOARD_PATH)
+    });
+  };
+}
+
+/**
  * Keep notification navigation testable and limited to notifications created
  * by this extension. Chrome ignores the returned promises; the registration
  * boundary consumes failures so they do not become unhandled rejections.
  *
- * @param {{openHistoryDashboard: () => Promise<void>}} dependencies
+ * @param {{
+ *   openHistoryDashboard: () => Promise<void>,
+ *   openAttentionDashboard: () => Promise<void>
+ * }} dependencies
  */
 export function createHistoryNotificationHandlers(dependencies) {
+  /** @param {string} notificationId */
+  async function openKnownNotificationDestination(notificationId) {
+    if (notificationId.startsWith(ATTENTION_NOTIFICATION_ID_PREFIX)) {
+      await dependencies.openAttentionDashboard();
+      return;
+    }
+    if (notificationId.startsWith(NOTIFICATION_ID_PREFIX)) {
+      await dependencies.openHistoryDashboard();
+    }
+  }
+
   return {
     /** @param {string} notificationId */
     async onClicked(notificationId) {
-      if (notificationId.startsWith(NOTIFICATION_ID_PREFIX)) {
-        await dependencies.openHistoryDashboard();
-      }
+      await openKnownNotificationDestination(notificationId);
     },
     /** @param {string} notificationId @param {number} buttonIndex */
     async onButtonClicked(notificationId, buttonIndex) {
-      if (notificationId.startsWith(NOTIFICATION_ID_PREFIX) && buttonIndex === 0) {
-        await dependencies.openHistoryDashboard();
+      if (buttonIndex !== 0) {
+        return;
       }
+      await openKnownNotificationDestination(notificationId);
     }
   };
 }
@@ -103,7 +153,7 @@ export async function keepServiceWorkerAlive(operation, dependencies = {}) {
  *
  * @param {{
  *   ensureUserAgentRule: () => Promise<void>,
- *   startSync: (trigger: "manual" | "alarm" | "resume") => Promise<Awaited<ReturnType<SyncService["start"]>>>,
+ *   startSync: (trigger: "manual" | "alarm" | "resume" | "thumbnail") => Promise<Awaited<ReturnType<SyncService["start"]>>>,
  *   keepAlive: <T>(operation: Promise<T>) => Promise<T>,
  *   canStart?: () => boolean | Promise<boolean>,
  *   afterSync?: () => unknown
@@ -112,10 +162,18 @@ export async function keepServiceWorkerAlive(operation, dependencies = {}) {
 export function createGatedSyncRunner(dependencies) {
   /** @type {Promise<Awaited<ReturnType<SyncService["start"]>> | {ok: false, error: "SECURITY_RULE_UNAVAILABLE" | "MAINTENANCE_IN_PROGRESS"}> | null} */
   let active = null;
+  /** @type {"manual" | "alarm" | "resume" | "thumbnail" | null} */
+  let activeTrigger = null;
 
-  /** @param {"manual" | "alarm" | "resume"} trigger */
+  /**
+   * @param {"manual" | "alarm" | "resume" | "thumbnail"} trigger
+   * @returns {Promise<Awaited<ReturnType<SyncService["start"]>> | {ok: false, error: "SECURITY_RULE_UNAVAILABLE" | "MAINTENANCE_IN_PROGRESS"}>}
+   */
   return function runSync(trigger) {
     if (active !== null) {
+      if (activeTrigger === "thumbnail" && trigger !== "thumbnail") {
+        return active.then(() => runSync(trigger));
+      }
       return active;
     }
     const operation = (async () => {
@@ -141,9 +199,11 @@ export function createGatedSyncRunner(dependencies) {
     const tracked = operation.finally(() => {
       if (active === tracked) {
         active = null;
+        activeTrigger = null;
       }
     });
     active = tracked;
+    activeTrigger = trigger;
     return tracked;
   };
 }
@@ -179,7 +239,8 @@ export function createBadgeUpdater(dependencies) {
  * Every worker/browser interruption boundary therefore remains fail-closed.
  *
  * @param {{
- *   service: Pick<SyncService, "syncing" | "repairScheduleBestEffort">,
+ *   service: Pick<SyncService, "syncing" | "repairScheduleBestEffort"> &
+ *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort">>,
  *   repository: Pick<import("./lib/database.js").DatabaseRepository, "beginPurge" | "recoverFromFailedPurge" | "purgeAllData">,
  *   clearAlarm: () => Promise<boolean>,
  *   cleanupAuthCookies: () => Promise<void>,
@@ -222,6 +283,7 @@ export function createPurgeController(dependencies) {
         purging = false;
         try {
           await dependencies.service.repairScheduleBestEffort();
+          await dependencies.service.repairThumbnailScheduleBestEffort?.();
         } catch {
           // The failed purge remains recoverable at browser startup.
         }
@@ -263,14 +325,15 @@ export function createPurgeController(dependencies) {
  * @param {{
  *   getService: () => Promise<Pick<SyncService,
  *     "prepareAutomaticSync" | "resolveAlarmTrigger" |
- *     "rearmWatchdogForActiveSync" | "repairScheduleBestEffort">>,
+ *     "rearmWatchdogForActiveSync" | "repairScheduleBestEffort"> &
+ *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort">>>,
  *   getRunner: () => Promise<ReturnType<typeof createGatedSyncRunner>>
  * }} dependencies
  */
 export function createAlarmEventHandler(dependencies) {
   /** @param {{name: string, scheduledTime?: number}} alarm */
   return async function handleAlarm(alarm) {
-    if (alarm.name !== SYNC_ALARM_NAME) {
+    if (alarm.name !== SYNC_ALARM_NAME && alarm.name !== THUMBNAIL_ALARM_NAME) {
       return;
     }
 
@@ -283,6 +346,11 @@ export function createAlarmEventHandler(dependencies) {
       ]);
       service = resolved[0];
       const runSync = resolved[1];
+      if (alarm.name === THUMBNAIL_ALARM_NAME) {
+        await runSync("thumbnail");
+        await service.repairThumbnailScheduleBestEffort?.();
+        return;
+      }
       if (!await service.prepareAutomaticSync()) {
         return;
       }
@@ -304,7 +372,11 @@ export function createAlarmEventHandler(dependencies) {
         }
       }
       try {
-        await service.repairScheduleBestEffort();
+        if (alarm.name === THUMBNAIL_ALARM_NAME) {
+          await service.repairThumbnailScheduleBestEffort?.();
+        } else {
+          await service.repairScheduleBestEffort();
+        }
       } catch {
         return;
       }
@@ -317,7 +389,8 @@ export function createAlarmEventHandler(dependencies) {
  * accepts a URL, API path, request headers, credentials, or arbitrary DB key.
  *
  * @param {{
- *   service: Pick<SyncService, "getStatus" | "updateSettings" | "repairSchedule" | "markHistoryRead">,
+ *   service: Pick<SyncService, "getStatus" | "updateSettings" | "repairSchedule" | "markHistoryRead"> &
+ *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort">>,
  *   startSync: ReturnType<typeof createGatedSyncRunner>,
  *   openVrchat: () => Promise<void>,
  *   openDashboard: () => Promise<void>,
@@ -376,6 +449,7 @@ export function createMessageHandler(dependencies) {
       }
       if (message.type === MESSAGE_TYPES.settingsChanged) {
         await dependencies.service.repairSchedule();
+        await dependencies.service.repairThumbnailScheduleBestEffort?.();
         try {
           await dependencies.refreshBadge();
         } catch {
@@ -453,6 +527,7 @@ function registerChromeBackground() {
     try {
       const service = await servicePromise;
       await service.repairScheduleBestEffort();
+      await service.repairThumbnailScheduleBestEffort();
     } catch {
       // A later lifecycle event or user action retries initialization.
     }
@@ -468,21 +543,32 @@ function registerChromeBackground() {
   const openVrchat = async () => {
     await chrome.tabs.create({ url: VRCHAT_LOGIN_URL });
   };
-  const openDashboard = createHistoryDashboardOpener({
+  /** @type {{
+   *   resolveExtensionUrl: (path: string) => string,
+   *   createTab: (details: {url: string}) => Promise<unknown>
+   * }} */
+  const openerDependencies = {
     resolveExtensionUrl: (path) => chrome.runtime.getURL(path),
     createTab: async (details) => {
       await chrome.tabs.create(details);
     }
-  });
+  };
+  const openDashboard = createAllWorldsDashboardOpener(openerDependencies);
+  const openHistoryDashboard = createHistoryDashboardOpener(openerDependencies);
   const notificationHandlers = createHistoryNotificationHandlers({
-    openHistoryDashboard: openDashboard
+    openHistoryDashboard,
+    openAttentionDashboard: createAttentionDashboardOpener(openerDependencies)
   });
 
   const purgeControllerPromise = Promise.all([servicePromise, repositoryPromise])
     .then(([service, repository]) => createPurgeController({
       service,
       repository,
-      clearAlarm: () => chrome.alarms.clear(SYNC_ALARM_NAME),
+      clearAlarm: async () => {
+        const cleared = await chrome.alarms.clear(SYNC_ALARM_NAME);
+        await chrome.alarms.clear(THUMBNAIL_ALARM_NAME);
+        return cleared;
+      },
       cleanupAuthCookies: () => authCookieBridge.cleanupStaleCookies(),
       clearBadge: () => chrome.action.setBadgeText({ text: "" }),
       uninstallSelf: () => chrome.management.uninstallSelf({ showConfirmDialog: true })

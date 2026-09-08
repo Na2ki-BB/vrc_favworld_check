@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "VRC Favorite World History",
   "short_name": "VRC World History",
-  "version": "0.1.7",
+  "version": "0.1.10",
   "description": "VRChatのお気に入りワールド名と変化を、このブラウザ内だけに記録します。",
   "homepage_url": "https://github.com/Na2ki-BB/vrc_favworld_check",
   "minimum_chrome_version": "120",
@@ -16,7 +16,8 @@
   "host_permissions": [
     "https://vrchat.com/*",
     "https://vrchat.cloud/*",
-    "https://api.vrchat.cloud/*"
+    "https://api.vrchat.cloud/*",
+    "https://files.vrchat.cloud/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -40,6 +41,6 @@
   },
   "options_page": "dashboard.html",
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' https://api.vrchat.cloud https://files.vrchat.cloud; img-src 'self' blob:"
   }
 }

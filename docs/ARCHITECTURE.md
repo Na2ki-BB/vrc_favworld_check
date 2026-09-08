@@ -1,5 +1,7 @@
 # vrc_favworld_check 基本・詳細設計
 
+> この文書は開発者向けです。利用方法と画面の見方は[README](../README.md)を参照してください。
+
 ## 1. 設計方針
 
 `vrc_favworld_check` は Windows 版 Google Chrome の Manifest V3 拡張として動作し、VRChat API との通信、差分検知、履歴保存、表示、通知を利用者のブラウザ内だけで完結させる。
@@ -31,11 +33,11 @@
                          ├─ Alarm Scheduler
                          └─ IndexedDB
                               ├─ profiles / worlds / favoriteGroups
-                              ├─ events / syncRuns
+                              ├─ thumbnails / events / syncRuns
                               └─ settings / meta
 ```
 
-拡張機能から開発者または第三者のサーバーへ向かう経路は存在しない。ワールド画像も API 呼び出し数と外部読込みを増やすため、MVP の必須表示には含めない。
+拡張機能から開発者または第三者のサーバーへ向かう経路は存在しない。ワールド画像はVRChat APIの許可済み画像pathから同期時だけ取得し、縮小WebPをIndexedDBへ保存する。UIは外部画像URLを直接読み込まない。
 
 ## 3. 実行コンテキストと責務
 
@@ -68,6 +70,7 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 - ページング、2 秒の要求間隔、タイムアウト、5xx / network error の短い再試行を実装する。429 は再試行せず同期全体を停止する。
 - 現行 `CurrentUser` schemaには任意の `authToken` と必須の `usesGeneratedPassword` がある。`/auth/user` はbounded JSONとしてparseした後、未知fieldを列挙・再帰走査せず、新しいobjectへ `id` と `displayName` だけをコピーしてraw応答を破棄する。
 - `/worlds/favorites` だけは、他の必須fieldが正常でもIDがcanonical World IDでない行について、そのIDを追加解釈・コピーせず、明示的にopt-inしたページング投影の `{ identity: null, metadata: null }` として扱う。raw行はoffsetと総数上限へ含めるが、null identityはglobal重複検査から除外し、adapter外へ出さない。他endpointはnullable identityを許可しない。
+- favorite worldの任意`thumbnailImageUrl`は、`https://api.vrchat.cloud`の固定file/image pathに一致する場合だけ画像候補として投影し、不正値は主要world metadataを止めず無視する。画像取得だけはCookie・Refererなしでredirectを追従する。画像APIが302で転送する`files.vrchat.cloud`をhost permissionへ追加し、拡張ページとService WorkerのCSP `connect-src`で通信先をself・HTTPSのAPI・files originに限定する。転送先でもCSPを適用し、最終URLの形式を検査してから元画像のbyte数・MIMEとPNG・JPEG・WebP headerの寸法・画素数をdecode前後で検査し、最大辺320px・最大48KiBのWebPへ変換する。署名付き転送先URLは保存せず、保存版の識別には元API URLを使う。JSON APIはredirectを拒否する。
 - HTTP の詳細を `AuthenticatedUser`、`FavoriteGroupMetadata`、`FavoriteRelation`、`WorldMetadata`、`WorldProbe`、`ApiFailure` に変換する。
 
 ### 3.4 Auth Cookie Bridge
@@ -92,6 +95,7 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 
 - IndexedDB の schema migration、照会、単一 read-write transaction を隠蔽する。
 - ワールド・お気に入りリスト更新、イベント追加、未読件数、通知 outbox、同期結果を同じ transaction で確定する。
+- サムネイルを`[userId, worldId]`で分離保存し、profile世代とpurge gateを同じtransactionで検査した後だけ完全な新画像へ置換する。画像取得失敗やmetadata-only復元では既存画像を消さない。
 - 検索用に正規化名と複合 index を管理する。
 - 1 profile 単位のバックアップ読出しと、検証済み復元データによる対象 user の record だけの置換を担当する。他 profile を保持し、安全な global preferences だけを merge する。
 
@@ -99,7 +103,7 @@ UI は同期、外部ページを開く操作、通常設定を Service Worker �
 
 - 定期同期には繰り返し alarm ではなく、固定名 `sync-next` の 1 回限り alarm を使う。自動同期が有効なら同期の全終了経路の `finally` で既存 alarm を次の 1 件へ置換し、無効なら解除する。
 - 次回時刻は、成功なら現在から 12 時間 + 0〜60 分 jitter、429 なら `backoffUntil`、offline または 5xx の最大再試行後なら 30〜60 分後、401・schema 不正・その他の失敗なら現在から 12 時間 + 0〜60 分 jitter とする。
-- デスクトップ通知は transaction で生成された未 claim event のうち、名称変更、確定したお気に入り消失・復帰、アクセス不可・復帰だけを同期単位で集約する。`favorite_group_changed`は履歴と未読件数には含めるが、OS通知outboxへ入れない。
+- デスクトップ通知は transaction で生成された未 claim event のうち、名称変更、確定したお気に入り消失・復帰、アクセス不可・復帰だけを同期単位で集約する。`favorite_group_changed`は履歴と未読件数には含めるが、OS通知outboxへ入れない。一覧欠落またはアクセス不可を含む集約では、world IDで重複を除いた要確認件数と状態別件数を通知の主題にし、名称変更などその他の件数は補助情報にする。
 - OS 通知は exactly-once にできないため、通知 API の attempt を最大 1 回にする厳密な at-most-once とする。API 呼出し前の transaction で `notificationClaimedAt` を確定し、以後は成功、明示的失敗、crash のいずれでも claim を解除しない。成功時は `notifiedAt`、明示的失敗時は固定コード `notificationError` を記録し、結果不明時は claim だけを残す。通知の成否にかかわらず履歴 event を正本とする。
 
 ### 3.8 Windows Installer
@@ -113,7 +117,7 @@ Inno Setup 6 は実行時コンポーネントではなく、検証済みの `di
 - 更新前に Chrome の全ウィンドウを閉じるよう表示するが、プロセス検出や強制終了はしない。semantic version の downgrade は拒否し、同版再インストールは許可する。
 - 更新後にも `chrome://extensions/` を開き、必須 host permission の変更に伴う再有効化・権限承認、表示 version、必要時だけの 1 回の再読み込みを利用者が確認できるようにする。インストーラーは権限を自動承認せず、拡張の削除や別 path からの再読込みも行わない。
 - 新版は app root 内の `extension.new` へ展開・検証してから、現行 `extension` を `extension.old` へ移し、新版を固定 path へ切り替える。成功後は `extension.old` を削除し、失敗時だけ元へ戻す。退避は 1 世代に限定する。
-- Windows アンインストール前に、必要なら JSON をバックアップし、拡張 UI の「記録をすべて削除してアンインストール」を先に実行するよう案内する。Chrome 側の完了をプロフィールから自動判定しない。
+- Windows アンインストール前に、必要なら JSON をバックアップし、拡張 UI の「記録をすべて削除して拡張を削除」を先に実行するよう案内する。Chrome 側の完了をプロフィールから自動判定しない。
 - Windows アンインストーラーの削除範囲は固定 app root 内に限定する。Chrome のプロフィール、Cookie、IndexedDB、書き出した JSON backup は探索も削除もしない。
 - service、scheduled task、startup、telemetry、自動更新、実行時ダウンロード、コード署名は持たない。
 
@@ -179,7 +183,8 @@ JavaScript の `fetch` から `User-Agent` を直接設定することはでき�
 12. Domain Reconciler を実行する。IndexedDB の 1 transaction で世代番号と world revision を再検査し、ワールド、お気に入りリスト、イベント、未読件数、同期結果、成功時の必須 settings を反映して世代番号を増やす。
 13. 通知対象kindの未 claim イベントだけをkind indexから取得し、transaction で永久 claim してから集約通知を 1 回だけ attempt する。今回の event に加え、前回 commit 後に通知処理へ進めなかった対象 event もここで回収する。成功した event に `notifiedAt`、明示的に失敗した event に固定 `notificationError` を設定する。いずれの結果でも claim は解除しない。リスト移動など非通知kindはこの走査にもclaimにも含めない。
 14. 成否や例外にかかわらずAuth Cookie Bridgeの `finally` で、今回設定した値・属性と一致する一時認証Cookieと所有マーカーを削除する。値・属性が変化した場合や削除を確認できない場合は削除を広げず、Chromeを終了して設定時点の最長15分を待つよう案内する。同期結果が既にcommit済みなら最終成功時刻を正本として保持する。
-15. `finally` でlockを解放し、自動同期が有効なら終了結果に対応する次回の名前付きone-shot alarmへ置換する。無効なら既存alarmを解除する。
+15. Cookie Bridgeの正常なcleanup後、今回のfavorite metadataに許可済み画像URLがあり、同じURLの保存画像がないワールドだけをCookieなし・250ms間隔で取得・縮小・保存する。1回最大100件・30秒の共通deadlineで区切り、fetch timeoutを5秒と残り時間の短い方にする。deadlineはmetadata読出し、間隔待ち、fetch/decode/WebP変換、DB保存待ちを覆い、期限時は画像pipelineへAbortSignalを通知して残りを永続ジョブに保持して画像専用アラームへ引き継ぐ。通信断、不正な転送、401/403/408、429、5xx、世代競合またはpurge開始時は残りを中止する。429では検証済み`Retry-After`または30分の既定値を`thumbnailBackoffUntil`と全VRChat通信用`backoffUntil`へ保存し、期限前に追加通信しない。画像処理は手順12の主要commit後に行い、失敗を名前・状態・通知へ波及させない。
+16. `finally` でlockを解放し、自動同期が有効なら終了結果に対応する次回の名前付きone-shot alarmへ置換する。無効なら既存alarmを解除する。
 
 ページング結果は手順12のcommit完了までメモリ上にだけ置く。Service Worker 中断時は結果を捨て、確定データは変更しない。同期中だけ25秒間隔の限定 keep-alive を使い、開始時には同じ名前の復旧用 one-shot alarm を先に登録する。正常終了時は通常の次回時刻へ置換し、中断時は復旧 alarm から認証確認を含む完全同期をやり直す。
 
@@ -336,7 +341,7 @@ API adapter の外側で `any` を使用しない。境界入力は `unknown` �
 
 ## 8. IndexedDB データモデル
 
-DB 名は `vrc-favworld-check`、schema version 2 とする。version 1 からは新しいstore・indexと同期記録の保持キーをmigration transaction内で追加し、既存eventには当時存在した全kindが通知対象だったことを表す`notificationEligible: true`だけを同じtransactionで補完する。その他の既存record内容は変更しない。全 user-owned record は VRChat user ID で分離する。
+DB 名は `vrc-favworld-check`、schema version 3 とする。version 1からversion 2では新しいstore・indexと同期記録の保持キーをmigration transaction内で追加し、既存eventには当時存在した全kindが通知対象だったことを表す`notificationEligible: true`だけを同じtransactionで補完する。version 3では既存recordを書き換えず`thumbnails` storeを追加する。全 user-owned record は VRChat user ID で分離する。
 
 ### 8.1 `profiles`
 
@@ -388,7 +393,29 @@ key は `[userId, groupId]`。`[userId, internalName]` は非unique indexとし�
 | `firstSeenAt`, `lastSeenAt`, `updatedAt` | ISO string | 端末での観測時刻 |
 | `displayNameHistory` | `{displayName, observedAt}[]` | 過去名。最大100件 |
 
-### 8.4 `events`
+### 8.4 `thumbnails`
+
+取得候補は現在のお気に入りと個別確認200の画像URLをWorld IDで重複排除する。旧版で画像が未保存の一覧外・アクセス可能ワールドには、主要状態確認の残り枠だけ個別確認を行う（合計最大20件）。画像の保存済みメタデータ読出しに失敗した場合は追加確認を延期し、画像取得段階で失敗を記録して主要な履歴保存を維持する。
+
+画像候補は永続ジョブの試行回数が少ないものを優先し、同じ試行回数内ではWorld ID順に取得する。成功済み画像は除外され、失敗画像の試行回数は進むため、再起動後にも先頭の失敗画像だけで取得上限を使い切らない。旧`thumbnailCaptureCursor`と最新集計は互換用の実行情報でありJSONバックアップへ含めない。
+
+keyは`[userId, worldId]`、`userId` indexを持つ。`blob`はWebPだけ、`byteLength`はBlob実サイズと一致する1〜48KiB、`width`と`height`は1〜320、`capturedAt`はISO日時、`sourceUrl`は許可済みVRChat API画像URLとする。一覧件数の取得ではBlobを返さず、画面表示時は最大55件ずつ必要なカードだけを読む。
+
+### 8.4.1 画像自動取得ジョブ
+
+`settings.thumbnailJob`に形式version=1と対象user、同期commit時のgeneration、取得時刻、画像元API URLとWorld ID、各画像の試行回数、次回予定、ジョブ状態を保存する。署名付き転送先、Cookie、raw応答は含めず、JSONバックアップにも含めない。ジョブの入力件数とURLを検査し、専用repositoryメソッドで現在user・generation・purge guardを同じtransaction内で検査してcheckpointを保存する。
+
+正常同期の画像段階でジョブを作り、初回batchを処理する。残件があれば`thumbnail-next`を通常60秒後に予約する。画像alarmは`start("thumbnail")`を使い、認証や主要APIは呼び直さない。DNRルールとpurge gateは通常と同じ入口で検査する。保存済みの同一URLを通信前に除外し、最少試行回数の画像を優先する。試行前に回数を永続化し、各画像最大3回に達した未保存画像は取得不能とする。次回の完全同期では再試行できる。
+
+batch開始前にも回復用alarmを予約する。Chrome/Service Worker再起動時は残ジョブと待機期限から予定を修復する。429の共通backoffと画像専用backoffを両方尊重する。complete/partial時やジョブが古い世代・別profile・全消去中の場合は画像alarmを解除する。名前・状態の定期確認を停止していても、利用者が開始した画像保存は完遂する。
+
+画像処理と完全同期は同じsingle-flight（同時に1つだけ実行）を使う。画像処理中の完全同期要求は画像batch終了後に実行し、画像結果を完全同期の結果として返さない。完全同期中の画像alarmはその処理を待ち、新ジョブの残りを再予約する。全消去は両alarmを解除し、復元や別userの同期でgeneration/profileが変わった旧ジョブは継続しない。
+
+`GET_STATUS.thumbnailProgress`はtotal=saved+remaining+failedと次回予定・状態を返す。表示対象userと一致する進捗だけを可視中に更新し、保存済み画像は再描画せず新しく取得された画像枠だけを差し替える。検索条件、ページ件数、スクロール位置を維持する。
+
+`GET_STATUS.thumbnailSavedCount`は画像ジョブと独立に保存済み画像の総数を返し、画像メタデータの読取り失敗時はnullを返す。更新直後などジョブがない場合、対象0件の場合、進捗を読めない場合も件数欄は非表示にしない。既知の保存数と進捗未確認の案内を表示し、記録数との差を取得可能な残り件数と推測しない。画像数の取得失敗で名前・履歴の表示を失敗させない。
+
+### 8.5 `events`
 
 | フィールド | 型 | 説明 |
 | --- | --- | --- |
@@ -406,7 +433,7 @@ key は `[userId, groupId]`。`[userId, internalName]` は非unique indexとし�
 
 index は `[userId, observedAt]`、`[userId, kind, observedAt]`、`[userId, worldId, observedAt]`。
 
-### 8.5 `syncRuns`
+### 8.6 `syncRuns`
 
 成功と利用者向け障害診断に必要な最小情報だけを保持する。
 
@@ -423,9 +450,9 @@ index は `[userId, observedAt]`、`[userId, kind, observedAt]`、`[userId, worl
 
 URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。新規記録と同じ transaction で、新しい順にプロフィールごと100件、認証前の `__anonymous__` は20件だけ残す。結果種別にかかわらず古い run を整理するが、`events` と `worlds` は削除しない。
 
-### 8.6 `settings` と `meta`
+### 8.7 `settings` と `meta`
 
-- `settings`: 定期同期、通知、直近手動同期時刻、`nextSyncAt`、`backoffUntil`、飽和カウンター、最後に選択した profile、グループ情報の鮮度、最後のバックアップ日時、全消去中の fail-closed gate。
+- `settings`: 定期同期、通知、直近手動同期時刻、`nextSyncAt`、主要API用`backoffUntil`、画像専用`thumbnailBackoffUntil`、画像取得集計`thumbnailCaptureStatus`、飽和カウンター、最後に選択した profile、グループ情報の鮮度、最後のバックアップ日時、全消去中の fail-closed gate。
 - `meta`: schema version、最終 migration、バックアップ形式 version、profile ごとの単調増加 `dataGeneration` と未読件数。generation と未読件数は端末内の制御用でバックアップへ含めない。
 
 同期 lock は Service Worker の単一 flight promise で管理する。イベントが重なった場合は既存 promise を共有する。Service Worker 終了で lock も消えるため、永続データの commit は短い 1 transaction に限定し、未完了 fetch は状態を変えない。
@@ -459,7 +486,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
   "format": "vrc_favworld_check-backup",
   "version": 2,
   "exportedAt": "2026-08-17T00:00:00.000Z",
-  "appVersion": "1.0.0",
+  "appVersion": "<current-version>",
   "profile": {},
   "worlds": [],
   "favoriteGroups": [],
@@ -470,11 +497,11 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 
 - 1 ファイルは `profile` 1 件と、その `userId` に属する `worlds`、`favoriteGroups`、`events` だけを含む。複数 profile を含めない。
 - version 1 は `favoriteGroups: []` を補完して取り込む。version 2 のグループ ID、内部名の一意性、owner、type、表示名履歴を厳格検証し、未知の将来 version は拒否する。
-- `syncRuns`、lock、backoff、認証応答は含めない。event作成時に固定した`notificationEligible`と、`notificationClaimedAt`、`notifiedAt`、`notificationError`はat-most-once状態を保つためeventとともに含める。通知対象かつ未claimのimport eventだけ、復元時に`notificationClaimedAt = max(restoredAt, observedAt)`とし、時計ずれで日時順序を壊さず、復元を過去通知の起点にしない。通知対象外eventはdelivery stateを持たない。
+- `thumbnails`、`syncRuns`、lock、backoff、認証応答は含めない。画像なしのJSON復元は対象profileにすでにあるthumbnailを保持し、現在アクセスできるワールドの不足画像は後続同期で再取得する。event作成時に固定した`notificationEligible`と、`notificationClaimedAt`、`notifiedAt`、`notificationError`はat-most-once状態を保つためeventとともに含める。通知対象かつ未claimのimport eventだけ、復元時に`notificationClaimedAt = max(restoredAt, observedAt)`とし、時計ずれで日時順序を壊さず、復元を過去通知の起点にしない。通知対象外eventはdelivery stateを持たない。
 - `preferences` は定期同期と通知の有効・無効など明示した安全な利用者設定だけを含め、端末固有時刻、選択 profile、`backoffUntil`、`consecutiveRateLimits` は除外する。
 - エクスポートは profile、worlds、events、安全な preferences を同一 read-only transaction で snapshot として読み、安定した key 順、world ID / event ID 順に並べる。
 - 復元は JSON parse 後に prototype を持たない値へ正規化し、件数、文字列長、ID、日時、enum、参照を検証する。受理したUTC日時は必ず小数秒3桁の`toISOString()`形式へ変換してから、時刻の最大値や前後関係を文字列比較する。
-- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds` key range、`events` key range だけを削除・再作成し、profile 世代番号を増やす。他 user の record を触らず、同じ transaction で allowlist 済み global preferences だけを既存 settings へ merge する。失敗時は全 profile、世代、settings の処理前状態を維持する。
+- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds`、`favoriteGroups`、`events` key rangeだけを削除・再作成し、profile世代番号を増やす。既存`thumbnails`と他userのrecordを触らず、同じtransactionでallowlist済みglobal preferencesだけを既存settingsへmergeする。失敗時は全profile、世代、settingsの処理前状態を維持する。
 
 ## 11. UI 状態設計
 
@@ -492,18 +519,22 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 
 ### 11.2 履歴カード
 
+- 記録画面は「すべての記録」を初期表示する。通常のお気に入りも保存画像とともに確認できる。「要確認」では確定した一覧欠落またはアクセス不可を論理和で抽出する。同じワールドが両状態でもカードと主件数は1件とし、アクセス不可を先頭に、同じ分類では関連する最新確定イベント時刻の降順に並べる。
+- ポップアップ最上段の要確認専用カード、記録画面最上段の要確認枠、件数カードは同じ重複なし要確認件数を表示する。通信エラー・待機状態は要確認表示を置き換えず、その下の運用状態として示す。記録画面の件数buttonは対応する現在状態へ直接移動し、0件時は異常なしと分かる空状態を表示する。ポップアップは全記録を開く。
+- 左側: 保存済み縮小サムネイル。読込み中・未保存・DB読出し失敗・画像表示失敗を区別し、再確認または画像の再読込みを案内する。外部URLを直接読み込まない。読出し完了と画像errorイベントでは描画世代とprofileを再確認し、古い要求を別profileや新しい描画へ反映しない。`thumbnailCaptureStatus`は直近batch診断に残す。利用者向けには`GET_STATUS.thumbnailProgress`の全体進捗を使い、表示対象profileと一致するときだけ可視中に更新する。画像未保存枠は自動取得待ちと案内し、手動同期の反復を求めない。
 - 最上段: 保存済みの最新名称。取得不能でも空にしない。
 - 補助: 過去名、作者、world ID、最終確認時刻。
 - 状態 badge: 「お気に入り」「確認中」「お気に入り一覧にありません」「現在アクセスできません」。色と文言を併用する。
 - 展開部: 時系列 event と「この表示は削除・非公開を区別するものではありません」の注記。
 - API 文字列は `textContent` で表示し、HTML として解釈しない。
 - お気に入りリストは保存済み内部タグを現在または最後に確認した表示名へ変換し、カード、検索、絞り込みで表示する。対応表がない場合だけ安全な内部名を併記する。
+- 通常4枠はAPIの空枠省略にかかわらず表示する。VRC+枠の保存済みrecordまたはタグがあれば合計8枠を番号順で表示し、実recordもタグもない枠は「未使用」と示す。
 
 ### 11.3 保存量・未読・全消去
 
 - 拡張アイコンは未読イベント数を `1`〜`99+` で表示し、履歴画面を開いたときだけ DB の未読件数を0へする。
-- OS通知の本体または「履歴を見る」ボタンは、外部入力を混ぜない固定の`dashboard.html#events`を開く。dashboardはhashをallowlistで解釈し、DB読込み後に履歴タブを選択して既読化する。
-- 最終正常同期から36時間、8,000ワールド、80,000イベント、または概算20MiBを超えた場合だけ行動案内を表示する。通常の800件では利用者へメンテナンスを要求しない。
+- ポップアップは固定の`dashboard.html#all`を開き、全記録の保存済み名称と画像を表示する。一覧欠落・アクセス不可を含む通知は固定の`dashboard.html#attention`、通常の変更通知は固定の`dashboard.html#events`を開く。外部入力をURLへ混ぜず、dashboardはhashをallowlistで解釈し、イベントrouteではDB読込み後に履歴タブを選択して既読化する。
+- 最終正常同期から36時間、8,000ワールド、80,000イベント、または概算250MiBを超えた場合だけ行動案内を表示する。800件×48KiBでも画像は約38MiBのため、通常利用でメンテナンスを要求しない。
 - 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止とAuth Cookie Bridge対象Cookieの不在確認後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、cleanup、clear、`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSON、Downloadsのインストーラー、Windowsの固定配置ファイルは拡張側の削除対象外と明示し、続けてWindows側のアンインストールを案内する。
 
 ## 12. テスト可能性
@@ -533,4 +564,4 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 - 101件目のプロフィールrunと21件目の匿名run追加後に上限だけが残り、履歴は減らない。
 - purge transactionまたはowned Cookie cleanupの注入失敗では自己アンインストールを呼ばず全利用者recordが残る。成功時だけ順序が `gate → alarm停止 → owned Cookie cleanup → 全store原子的clear+gate再作成 → uninstall` となる。
 - installer config の静的テストで、ユーザー単位の固定 path、custom registry 不在、`key` 不在、禁止機能不在、downgrade 拒否、単一世代 rollback、app root 限定削除を確認する。
-- Windows上のInno Setup 6 compileと、対象の実PC / 実Chromeによるfresh install、Downloads削除後の動作、同版再インストール、`0.1.6`から`0.1.7`への上書き更新と103件raw pageを含む完全同期、`cookies`と3つのVRChat host権限、一時Cookie消去、ID・履歴保持、正規順序のアンインストールは手動リリースゲートとする。
+- Windows上のInno Setup 6 compileと、対象の実PC / 実Chromeによるfresh install、Downloads削除後の動作、同版再インストール、直前の配布版から現行版への上書き更新とDB移行、103件raw pageとサムネイル取得を含む完全同期、`cookies`と4つのVRChat host権限、一時Cookie消去、ID・履歴保持、正規順序のアンインストールは手動リリースゲートとする。

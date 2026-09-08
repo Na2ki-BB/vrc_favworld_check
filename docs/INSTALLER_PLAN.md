@@ -1,136 +1,108 @@
-# Windows 簡易インストーラー計画
+# Windows 簡易インストーラー設計
 
-## 目的と対象
+この文書は、Windowsインストーラーが行うことと、導入・更新・削除を安全に確認する基準をまとめた開発者向け資料である。利用者向けの手順は[README](../README.md)を参照する。対象は、Windows版Google Chromeの画面操作で拡張機能を導入する利用者である。
 
-- PC操作に詳しくない1名が実際に使うGoogle Chromeだけを対象にする。
-- 検証済みの `dist/extension` を、Windows ユーザー単位の固定場所
-  `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension` へ配置する。
-- Inno Setup 6 を使い、`PrivilegesRequired=lowest` として管理者権限や UAC を要求しない。
-- インストール先は変更不可とし、Inno Setup 標準の HKCU アンインストール登録だけを使う。
-- コード署名、自動更新、実行時ダウンロードは行わない。
+## 1. インストーラーの役割
 
-## 初回導入
+インストーラーは、検証済みの拡張ファイルをWindowsユーザーごとの固定場所へ配置し、Chromeへ追加する画面を開く。
 
-1. ビルド時に `extension/` を検査して `dist/extension` を作り、両者の内容と
-   `package.json` / manifest のバージョン一致を再確認してからインストーラーへ同梱する。
-2. 固定場所へ拡張ファイルを配置する。
-3. 完了時に Chrome の `chrome://extensions/` と固定 `extension` フォルダーを開く。
-4. 「デベロッパー モード」「パッケージ化されていない拡張機能を読み込む」
-   「開いた `extension` フォルダーを選択」の順で日本語案内する。
-5. Chromeが権限を表示した場合は、Cookie利用の対象が `vrchat.com` / `vrchat.cloud` / `api.vrchat.cloud` だけであることを確認するよう案内する。root `vrchat.cloud` は親domain Cookieの競合検査だけに使う。
-6. Downloads 内のインストーラーは導入後に削除できると案内する。
+- 固定場所: `%LOCALAPPDATA%\Programs\VRCFavoriteWorldHistory\extension`
+- 作成方式: Inno Setup 6
+- 権限: 現在のWindowsユーザーだけで実行し、管理者権限やUACを要求しない
+- 登録: Windows標準の「インストールされているアプリ」から削除できるよう、Inno Setup標準のユーザー単位アンインストール情報を登録する
+- 同梱内容: ビルド時に検証した `dist/extension` 一式
 
-manifest に `key` は追加しない。同じ Windows ユーザー、Chrome プロフィール、固定パスを
-維持することで、上書き更新時に同じ unpacked 拡張として読み込まれる前提とする。
+Chromeの通常の画面からローカル拡張を登録するため、初回だけ利用者が「パッケージ化されていない拡張機能を読み込む」を選ぶ。インストーラーは必要な画面とフォルダーを自動で開き、日本語の手順を表示する。
 
-## 更新
+## 2. 配布物の作成
 
-- 更新開始前に Chrome の全ウィンドウを閉じるよう表示する。プロセス検出や強制終了はしない。
-- インストール済み manifest の `x.y.z` バージョンを比較し、downgrade は拒否し、同版再インストールは許可する。
-- 新版全体を同じ app root の `extension.new` へ先に展開する。
-- 展開成功後だけ、既存 `extension` を `extension.old` へ退避し、`extension.new` を
-  `extension` へ切り替える。
-- 切替または検証に失敗した場合だけ、新版を除去して `extension.old` を元へ戻す。
-- 新版の固定配置を確認後に `extension.old` を削除する。保持する退避は 1 世代だけとする。
-- 前回失敗で `extension` がなく `extension.old` だけが残った場合の単純復元は行うが、
-  電源断を網羅する状態機械、複数世代 rollback、複雑な fault injection は作らない。
+`npm run package` は次の順で配布物を作成する。
 
-## アンインストール
+1. `extension/` を検査して `dist/extension` を作る。
+2. `package.json`、source manifest、built manifestのバージョンが一致することを確認する。
+3. sourceとbuildのファイル一覧および各ファイル内容が一致することを確認する。
+4. 再現可能なChrome用ZIPを `artifacts/vrc_favworld_check-v<version>.zip` として作る。
+5. 検証済みの `dist/extension` をInno Setupへ渡し、`artifacts/vrc_favworld_check-installer-v<version>.exe` を作る。
+6. ZIPとインストーラーのSHA-256を出力する。
 
-- Windows 側の削除前に、拡張の設定画面で必要なら JSON バックアップを保存し、
-  「記録をすべて削除してアンインストール」を先に行うよう日本語で案内する。
-- ブラウザ側の削除完了は Chrome profile から自動判定しない。
-- Windows アンインストーラーが削除するのは、固定 app root 内の `extension`、
-  一時的な `extension.new` / `extension.old`、Inno Setup 自身の固定ファイルだけとする。
-- Chrome の profile、Cookie、IndexedDB と、利用者が書き出した JSON backup は探索も削除もしない。
+manifestへ固定の `key` を埋め込まず、同じWindowsユーザー、同じChromeプロフィール、同じ固定場所を使うことで、更新時も同じローカル拡張として扱われる構成にする。extension IDと履歴が実際に保持されることは、配布前の実機更新試験で確認する。
 
-## 明示的に行わないこと
+## 3. 初回導入
 
-- browser policy、force install、custom `[Registry]`、service、scheduled task、startup、telemetry
-- インストーラーからの Cookie、profile、IndexedDB の探索・変更、および拡張の認証、API、同期、DB、backup 処理の呼出し
-- Windows 10/11 両方、Chrome/Edge 両方、複数 profile、全障害点、ProcMon、複数 AV の網羅
-- push、GitHub Release、外部配布
+1. 利用者がインストーラーを実行する。
+2. インストーラーが拡張ファイルを固定場所へ配置する。
+3. 完了時にChromeの `chrome://extensions/` と、選択する `extension` フォルダーを開く。
+4. 利用者はChromeで「デベロッパー モード」をオンにする。
+5. 「パッケージ化されていない拡張機能を読み込む」を押し、開いている `extension` フォルダーを選ぶ。
+6. Chromeが権限を表示した場合は、Cookie利用と接続先が `vrchat.com`、`vrchat.cloud`、`api.vrchat.cloud`、画像配信先 `files.vrchat.cloud` であることを確認して許可する。
+7. 拡張の案内に従い、VRChat公式サイトでログインしてから「今すぐ確認」を押す。
 
-## 検証
+`vrchat.com` は公式Webログインのセッション確認、`api.vrchat.cloud` はVRChat API通信、`vrchat.cloud` は親domainに同名Cookieがないことを確認するために使う。`files.vrchat.cloud` は画像APIから転送されるサムネイルだけをCookieなしで取得する。権限の理由を初回案内とREADMEから確認できるようにする。
 
-- 自動: installer 設定の静的テスト、manifest の `key` 不在、lint、型検査、全テスト、
-  `npm run verify`、`npm run package`、Inno Setup compile。
-- 対象の実PC / 実Chrome: fresh install、Downloadsのinstaller削除後の動作、同版再インストール、
-  `0.1.6`から`0.1.7`への上書き更新、103件raw pageを含む完全同期、`cookies`と `vrchat.com` / `vrchat.cloud` / `api.vrchat.cloud` 権限、同期後の一時Cookie不在、更新前後のextension IDと履歴保持、
-  正規順序のアンインストール。
-- コード署名をしないため、SmartScreen が未認知の実行ファイルとして警告する残余リスクを受容し、
-  配布時にファイル名と SHA-256 を別経路で確認する。
+## 4. 更新
 
-## 実装状況と残作業（2026-08-24）
+更新時は既存のChrome登録とブラウザ内の履歴を維持するため、次の手順で同じ固定場所だけを切り替える。
 
-`0.1.0`の初回導入と公式サイトへのログインは実PC / 実Chromeで完了したが、拡張要求の
-`https://api.vrchat.cloud/api/1/auth/user` は401 `Missing Credentials`になった。`0.1.1`でAPI baseを
-`https://vrchat.com/api/1`へ変更しても、拡張要求はAPI hostへ307 redirectされ、その先は同じ401になった。
+1. 利用者へChromeの全ウィンドウを閉じるよう表示する。ブラウザの作業を失わせないため、インストーラーからChromeを強制終了しない。
+2. インストール済みmanifestの `x.y.z` バージョンを検査する。新しい版から古い版への置換はDBや設定の互換性を壊す可能性があるため拒否し、同じ版の再インストールは修復用途として許可する。
+3. 新版全体を同じapp rootの `extension.new` へ先に展開する。
+4. manifest、バージョン、主要ファイルを検証できた場合だけ、既存 `extension` を `extension.old` へ移し、`extension.new` を `extension` へ切り替える。
+5. 切替または新版の検証に失敗した場合は `extension.old` を元へ戻す。
+6. 新版の固定配置を確認した後に `extension.old` を削除する。復旧用の退避は1世代に限定する。
+7. 更新完了後にChromeの拡張機能画面を開き、有効状態、表示バージョン、権限を確認する。古い版が表示される場合だけ、同じ拡張の「再読み込み」を1回押す。
 
-`0.1.2`ではAPI baseを `api.vrchat.cloud` に戻し、拡張側の同期中だけ固定名 `auth` と任意の
-`twoFactorAuth` を一時複製する。値はDB・設定・ログ・UI・backupへ渡さず、通常終了時は今回設定した
-値・属性の一致時だけ削除する。途中終了後は同名Cookieを誤削除せず、設定時の期限切れによる不在を確認してから
-次回同期や正規アンインストールへ進む。これはインストーラーがChrome profileやCookieを操作する変更ではなく、
-配置された拡張が利用者承認済みの `cookies` 権限で行う認証境界の変更である。
+前回の中断で `extension` がなく `extension.old` だけが残っている場合は、更新を始める前に旧版を元へ戻す。両方が残っている場合は古い退避を片付けてから新版を配置する。安全な状態を確認できない場合は既存ファイルを上書きせず、Chromeを閉じて再実行するよう案内する。
 
-対象実機で `0.1.2` を確認したところ、権限は正常だったが、VRChatのsource `auth` / `twoFactorAuth` に
-Secure属性が付いていないため過剰な入力検査で同期前に停止した。Cookie値を表示・記録せず属性だけを確認して原因を特定した。
-`0.1.3`ではPromise版Cookie APIの未検出値 `undefined` を仕様どおり扱い、sourceのSecure属性を必須とせず、
-API側の一時CookieだけをSecure・HttpOnly・SameSite=Strictへ固定する。sourceは変更・延命しない。
+## 5. アンインストール
 
-対象実機の `0.1.3` で `/auth/user` は200となり、Cookie BridgeとCORS境界が成立することを確認した。しかし
-正常な `CurrentUser` の必須field `usesGeneratedPassword` をfield名の `password` だけで拒否する再帰検査により、
-後続のお気に入りAPIへ進む前に `API_INCOMPATIBLE` となった。`0.1.4`ではbounded JSONから `id` と
-`displayName` だけを検証・コピーし、`authToken`を含むその他のfieldは名前・値・階層を走査せず破棄する。
+記録を端末から消したい場合は、次の順序を利用者へ案内する。
 
-対象実機の `0.1.4` では `/auth/user`、グループ一覧、お気に入り関係一覧がすべて200となった。しかし
-`/worlds/favorites?n=100&offset=0` が正常なJSON配列を103件返し、実装が要求件数100を応答上限と誤認して
-完全同期を停止した。`0.1.5`ではこのendpointだけ過剰返却を受け入れ、総数10,000件の残枠を投影前に検査し、
-offsetを実取得件数だけ進める。他endpointの100件上限、5 MiB応答上限、要求回数、schema、重複検査は維持する。
-応答値、ID、ワールド名、作者名、Cookieは調査記録へ保存していない。
+1. 必要な履歴があれば、拡張の設定画面からJSONバックアップを保存する。
+2. 拡張の「記録をすべて削除して拡張を削除」を実行する。
+3. 拡張が一時Cookieの不在を確認し、Chrome内の記録と画像を原子的に消去してから自分自身をChromeから削除する。
+4. Windowsの「インストールされているアプリ」から VRC Favorite World History を削除する。
 
-対象実機の `0.1.5` は103件raw pageを受け入れたが、必須5fieldのうちID形式だけ2件がcanonicalな `wrld_` + UUID検査に一致せず完全同期を停止した。名称、作者名、お気に入りグループ、公開状態の不正は0件だった。利用者は該当IDの値を共有しておらず、raw応答やCookieも記録していない。
+Windowsアンインストーラーが削除するのは、固定app root内の `extension`、一時的な `extension.new` と `extension.old`、Inno Setup自身の固定ファイルだけである。Chromeプロフィールを探索すると他の閲覧データを誤って扱う危険があるため、Chrome内の記録消去は拡張自身が担当する。
 
-`0.1.6`は `/worlds/favorites` に限り、他必須fieldが正常で、IDが200コードポイント以下・前後空白なし・制御文字なしの非canonical文字列である行をページング検査にだけ含め、metadata出力前に除外した。しかし対象実機では `/auth/user`、グループ一覧、お気に入り関係一覧、`/worlds/favorites?offset=0` がすべて200だった後、`offset=103` を要求する前に `API_INCOMPATIBLE` となった。追加の値分類は求めず、noncanonical IDを安全な一時文字列として解釈し、重複identityとfingerprintへ残した過剰防御を原因候補とする。実ID、ワールド名、作者名、Cookie、raw応答は記録していない。
+書き出したJSONバックアップは利用者が再利用できる記録なので、Windowsアンインストーラーの削除対象にしない。不要になったバックアップは、内容と保存先を利用者が確認してから通常のファイル操作で削除する。
 
-`0.1.7`ではこのendpointだけがnullable identityを明示的にopt-inする。canonicalでないIDは追加の型・値分類もコピーも行わず `{ identity: null, metadata: null }` とし、raw行数はoffsetと総数10,000件上限へ含める。nullはglobal重複検査から除外する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、全件nullのpageは同数だけで反復と断定せずraw offset、最大100非空要求と空終端確認1要求、総数上限で終了を保証する。非空snapshot全体のcanonical metadataが0件なら `API_INCOMPATIBLE` とする。ID以外の必須field、canonical ID重複、`/favorites`、`GET /worlds/{worldId}`、backupのcanonical検査は厳格なまま維持し、除外IDは保存、UI、ログ、API URL、backupへ渡さない。
+JSONバックアップには名前や変更履歴が入るが、容量の大きいサムネイル画像は入らない。拡張の全消去ではChrome内の保存画像も削除され、アクセスできなくなったワールドの画像は後から再取得できない。この影響を確認画面とREADMEで説明してから削除を実行する。
 
-`0.1.2`、`0.1.3`、`0.1.4`、`0.1.5`、`0.1.6`は上記の実機不適合により完全同期の配布候補から外す。各成果物は後述のビルド履歴としてのみ扱う。
+## 6. Windows側で扱う範囲
 
-- Inno Setup 6.7.3 を Windows ユーザー単位で導入し、`.iss` の実コンパイルに成功した。
-- `0.1.5` の `npm run verify` はlint、型検査、13テストファイル、coverage、buildをすべて成功し、失敗・skipは0件だった。coverageはline 90.34%、branch 79.91%、function 93.92%だった。
-- `0.1.5` でCookie APIの実Chrome準拠、正常な `CurrentUser` の必要2fieldだけを投影する回帰に加え、world metadataの103件ページ、実取得件数によるoffset、投影前の10,000件上限、他endpointの100件上限を自動テストした。
-- `0.1.5` の `npm run package` は検証済み `dist/extension` から次の履歴用成果物を生成した。これらは現行の完全同期候補ではない。
-  - `artifacts/vrc_favworld_check-v0.1.5.zip`（102,487 bytes）
-    SHA-256: `58f7f1fa61866722debc732e4ecbcb468f21c729060b5d8182fc4e241d4aa74c`
-  - `artifacts/vrc_favworld_check-installer-v0.1.5.exe`（2,179,474 bytes）
-    SHA-256: `de8786c68f949b688d4dca90b44a5166197737290589af79815e7e1d630d3fa9`
-- installer config test は固定 path、非昇格、`SetupMutex`、禁止機能不在、manifest `key` 不在、
-  downgrade 拒否、単一世代 rollback、app root 限定削除、初回・更新後の管理画面導線を固定した。
-- 最終レビューで見つかったインストーラー二重起動の競合は、製品固有 `SetupMutex` を追加して解消した。
-- `0.1.6` の `npm run verify` はlint、型検査、13テストファイル、coverage、buildをすべて成功し、失敗・skipは0件だった。coverageはline 90.44%、branch 80.12%、function 93.95%で、`dist/extension` のversionは `0.1.6` となった。
-- `0.1.6` の `npm run package` とInno Setup 6.7.3 compileは成功し、次の履歴用成果物を生成した。これらは現行の完全同期候補ではない。
-  - `artifacts/vrc_favworld_check-v0.1.6.zip`（102,894 bytes）
-    SHA-256: `bcdd3668b9ca0be6c1145230a14bdeb2e914c30203fc5f2c6f17cc303995ec34`
-  - `artifacts/vrc_favworld_check-installer-v0.1.6.exe`（2,179,799 bytes）
-    SHA-256: `435e1c02349b085f39ffc5cd11f4ca7bba17eed64fbbadf62c070b02cfd15ddc`
+インストーラーは拡張ファイルの配置・更新・削除だけを担当し、ChromeとVRChatに関わる処理はインストールされた拡張と公式サイトへ分離する。
 
-- `0.1.7` の `npm run verify` はlint、型検査、13テストファイル、coverage、buildをすべて成功し、失敗・skipは0件だった。coverageはline 90.44%、branch 80.17%、function 93.95%で、`dist/extension` のversionは `0.1.7` となった。
-- `0.1.7` の `npm run package` とInno Setup 6.7.3 compileは成功し、次の現行実機確認用成果物を生成した。
-  - `artifacts/vrc_favworld_check-v0.1.7.zip`（103,095 bytes）
-    SHA-256: `4312d640c4724b18edbb27101971059432a1502e872466fd75d0853dc945c120`
-  - `artifacts/vrc_favworld_check-installer-v0.1.7.exe`（2,179,969 bytes）
-    SHA-256: `be60ce23ba62590d8b34c38ad166cc4940029043807df8a87ec499f45aca1aaa`
+- Chromeプロフィール、Cookie、IndexedDBをインストーラーから探索・変更しない。これは利用者のブラウザデータを固定app rootの外で扱わないためである。
+- 認証、API通信、同期、履歴保存、バックアップは拡張内で行う。インストーラーはVRChatへ通信しない。
+- browser policyやforce installを使わず、利用者がChromeの標準画面で拡張を確認して追加する。
+- service、scheduled task、startupを登録せず、定期確認はChrome拡張のalarmで行う。
+- telemetryや実行時ダウンロードを使わず、配布物に同梱した検証済みファイルだけを配置する。
+- Windows設定の変更は、Inno Setup標準のユーザー単位アンインストール登録に限定する。
 
-2026-08-24の対象実機では、`0.1.7`導入後の「今すぐお気に入りを確認」が成功し、`0.1.6`で `offset=0` の200応答後に発生していた `API_INCOMPATIBLE` は解消した。**推論**: 同期成功までの実装経路から、103件raw pageを処理して `offset=103` 以降へ進む経路も通過したと判断できる。
+現行の配布物にはコード署名がないため、Windows SmartScreenが未認知の実行ファイルとして警告する場合がある。READMEでは、インストーラーを渡した人の確認と警告画面の進み方を案内する。SHA-256は配布ファイルを詳しく確認する利用者向けの任意情報として提供する。警告画面の文言は対象実機で確認し、READMEの手順と一致させる。
 
-`0.1.7`を利用可能と判断する前に、残る次の実機受け入れ試験を行う。
+## 7. 検証基準
 
-1. 同期終了後にAPI hostの一時 `auth` / `twoFactorAuth` と所有markerが残っていないことを確認する。Cookie値は表示・撮影・記録しない。`AUTH_COOKIE_CLEANUP_FAILED` または残存が確認された場合は配布せず、API応答によるCookie更新の有無を再調査する。
-2. 更新前後のextension IDと既存履歴が同一であることを確認する。
-3. Chromeを閉じた状態で `0.1.7` の同版再インストールを1回行い、extension IDと履歴が変わらないことを確認する。
-4. 必要ならJSON backupを保存し、拡張UIの全消去・自己アンインストール、Windows側アンインストールの順で削除する。app root外、Chrome profile / Cookie / IndexedDB、JSON backupがWindows側から削除されないことを確認する。
-5. 正規削除後に検証済みの `0.1.7` installerでfresh installし、3hostの権限を確認してunpacked拡張を固定pathから読み込み、完全同期する。Downloads内の `0.1.7` installerを削除してChromeを再起動した後も同じ固定pathから動作することを確認する。
-6. 実機で表示されたSmartScreen警告を利用者向け案内へ反映し、配布ファイルのSHA-256を別経路で伝える。
+### 7.1 自動検証
 
-push、GitHub Release、外部配布は、それぞれ明示承認を得るまで行わない。
+- `npm run verify`: lint、strict typecheck、全テストとcoverage、拡張ビルドを実行し、失敗とskipが0件であることを確認する。
+- installer設定テスト: Windowsユーザー単位の固定path、非昇格、製品固有 `SetupMutex`、同時実行防止、downgrade拒否、同版再導入、1世代の復旧、app root限定削除を確認する。
+- 安全境界テスト: custom registry、browser policy、force install、service、scheduled task、startup、telemetry、Chromeプロフィール探索を行う設定がないことを確認する。
+- `npm run package`: sourceとbuildの一致を再確認し、再現可能なZIPとInno Setup 6インストーラーを生成する。
+- 成果物監査: packageとmanifestのバージョン、manifest `key` の不在、ファイル名、サイズ、SHA-256、秘密情報とローカル専用ファイルの不在を確認する。
+
+### 7.2 対象実機での受け入れ確認
+
+自動検証に加え、対象のWindows PCとGoogle Chromeで次を確認する。
+
+1. 新規導入で固定場所が作られ、Chromeの管理画面と選択用フォルダーが開き、利用者が拡張を追加できる。
+2. Downloads内のインストーラーを削除してChromeを再起動しても、固定場所から拡張が動作する。
+3. 同版を再インストールしてもextension IDと既存履歴が保持される。
+4. 直前の配布版から現行版へ上書き更新し、extension ID、履歴、DB schema version 3への移行結果が保持される。
+5. 更新後にChromeの表示バージョンと、`cookies`、`vrchat.com`、`vrchat.cloud`、`api.vrchat.cloud`、`files.vrchat.cloud` の権限を確認できる。更新案内の「今すぐ確認」を一度だけ押すと、以前の版で未保存だった画像も専用アラームで自動取得できる。画面に残数が表示され、Chrome再起動後も再開する。
+6. 公式Webログイン後、100件を超えるワールドページとサムネイル取得を含む完全同期が成功し、同期後にAPI用一時Cookieが残らない。
+7. 必要なバックアップを保存し、拡張画面の全消去・自己アンインストール、Windows側アンインストールの順で削除できる。
+8. Windows側の削除後も、app root外のファイル、Chromeプロフィール、利用者が保存したJSONバックアップが変更されない。
+9. 実際のSmartScreen表示とChromeの権限表示が、利用者向け手順の説明と一致する。
+
+実機で確認していない項目は、自動テストや推測で完了扱いにしない。配布、GitHub Release、pushは、上記確認と公開対象監査を終えた後に明示承認を得て実行する。

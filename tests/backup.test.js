@@ -240,7 +240,7 @@ test("backup default app version matches the current bugfix release", async (con
 
   const backup = validateBackup(await createBackup(source, USER_A, { exportedAt: AT_2 }));
 
-  assert.equal(backup.appVersion, "0.1.7");
+  assert.equal(backup.appVersion, "0.1.8");
 });
 
 test("fractional timestamps normalize before restore max and immediate re-export", async (context) => {
@@ -448,12 +448,12 @@ test("createdBySchemaVersion is validated against the source and database versio
   await seed(database, USER_A, WORLD_A, "Alice", "Schema version");
   const valid = JSON.parse(await createBackup(database, USER_A, { exportedAt: AT_2 }));
 
-  for (const schemaVersion of [1, 2]) {
+  for (const schemaVersion of [1, 2, 3]) {
     const candidate = structuredClone(valid);
     candidate.profile.createdBySchemaVersion = schemaVersion;
     assert.equal(validateBackup(JSON.stringify(candidate)).profile.createdBySchemaVersion, schemaVersion);
   }
-  for (const schemaVersion of [0, 3]) {
+  for (const schemaVersion of [0, 4]) {
     const candidate = structuredClone(valid);
     candidate.profile.createdBySchemaVersion = schemaVersion;
     assert.throws(() => validateBackup(JSON.stringify(candidate)), /createdBySchemaVersion/);

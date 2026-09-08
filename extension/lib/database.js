@@ -1,18 +1,24 @@
 // @ts-check
 
+import { isAllowedVrchatImageUrl } from "./api.js";
 import {
   EVENT_KIND_ORDER,
   isSchemaV2NotificationEligibleEventKind
 } from "./domain.js";
 
 export const DATABASE_NAME = "vrc-favworld-check";
-export const DATABASE_VERSION = 2;
+export const DATABASE_VERSION = 3;
 export const SYNC_RUN_RETENTION_PER_PROFILE = 100;
 export const SYNC_RUN_RETENTION_ANONYMOUS = 20;
 export const ANONYMOUS_RETENTION_OWNER = "__anonymous__";
+export const THUMBNAIL_MAX_BYTE_LENGTH = 48 * 1024;
+export const THUMBNAIL_BATCH_LIMIT = 55;
 
 const DATA_GENERATION_PREFIX = "dataGeneration:";
 const UNREAD_COUNT_PREFIX = "unreadCount:";
+const THUMBNAIL_IDENTIFIER_MAX_LENGTH = 256;
+const THUMBNAIL_SOURCE_URL_MAX_LENGTH = 8_192;
+const THUMBNAIL_MAX_DIMENSION = 320;
 const EVENT_KIND_SET = new Set(EVENT_KIND_ORDER);
 const NOTIFICATION_ERROR_SET = /** @type {ReadonlySet<unknown>} */ (new Set([
   "api_rejected",
@@ -36,7 +42,11 @@ const ALLOWED_SETTING_KEYS = new Set([
   "watchdogUntil",
   "lastBackupAt",
   "purgePending",
-  "favoriteGroupStatus"
+  "favoriteGroupStatus",
+  "thumbnailBackoffUntil",
+  "thumbnailCaptureStatus",
+  "thumbnailCaptureCursor",
+  "thumbnailJob"
 ]);
 
 export class GenerationConflictError extends Error {
@@ -74,6 +84,7 @@ export class PurgePendingError extends Error {
 export const STORES = Object.freeze({
   profiles: "profiles",
   worlds: "worlds",
+  thumbnails: "thumbnails",
   favoriteGroups: "favoriteGroups",
   events: "events",
   syncRuns: "syncRuns",
@@ -87,6 +98,7 @@ const INDEXES = Object.freeze({
   worldsByMembership: "by-user-membership",
   worldsByAvailability: "by-user-availability",
   worldsByProbe: "by-user-probe",
+  thumbnailsByUser: "by-user",
   favoriteGroupsByUser: "by-user",
   favoriteGroupsByInternalName: "by-user-internal-name",
   eventsByUser: "by-user",
@@ -128,6 +140,35 @@ const INDEXES = Object.freeze({
  * @property {200 | 404 | null} lastEvidenceStatus
  * @property {number} revision
  * @property {string} updatedAt
+ */
+
+/**
+ * Locally retained WebP preview. Keeping this record separate from WorldRecord
+ * lets metadata-only backup restores preserve the last successfully captured
+ * image without embedding binary data in JSON.
+ *
+ * @typedef {object} ThumbnailRecord
+ * @property {string} userId
+ * @property {string} worldId
+ * @property {Blob} blob
+ * @property {number} width
+ * @property {number} height
+ * @property {number} byteLength
+ * @property {string} capturedAt
+ * @property {string} sourceUrl
+ */
+
+/**
+ * Thumbnail list projection that intentionally omits the Blob body.
+ *
+ * @typedef {object} ThumbnailMetadata
+ * @property {string} userId
+ * @property {string} worldId
+ * @property {number} width
+ * @property {number} height
+ * @property {number} byteLength
+ * @property {string} capturedAt
+ * @property {string} sourceUrl
  */
 
 /**
@@ -439,6 +480,129 @@ function incrementGeneration(current, userId) {
 }
 
 /**
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {asserts value is string}
+ */
+function requireThumbnailIdentifier(value, label) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > THUMBNAIL_IDENTIFIER_MAX_LENGTH ||
+    value.trim() !== value
+  ) {
+    throw new TypeError(`${label} must be a non-empty bounded string`);
+  }
+}
+
+/**
+ * Repeat the network layer's exact VRChat image allowlist at the durable
+ * boundary so unsafe or credential-bearing URLs cannot become long-lived
+ * local data even if another caller is added later.
+ *
+ * @param {unknown} value
+ * @returns {asserts value is string}
+ */
+function requireThumbnailSourceUrl(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > THUMBNAIL_SOURCE_URL_MAX_LENGTH
+  ) {
+    throw new TypeError("Thumbnail sourceUrl must be a non-empty bounded string");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError("Thumbnail sourceUrl must be an absolute HTTPS URL");
+  }
+  if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") {
+    throw new TypeError("Thumbnail sourceUrl must be an absolute HTTPS URL without credentials");
+  }
+  if (!isAllowedVrchatImageUrl(value)) {
+    throw new TypeError("Thumbnail sourceUrl must use an allowed VRChat API image route");
+  }
+}
+
+/**
+ * @param {ThumbnailRecord} record
+ */
+function validateThumbnailRecord(record) {
+  if (record === null || typeof record !== "object") {
+    throw new TypeError("Thumbnail record must be an object");
+  }
+  requireThumbnailIdentifier(record.userId, "Thumbnail userId");
+  requireThumbnailIdentifier(record.worldId, "Thumbnail worldId");
+  if (!(record.blob instanceof Blob) || record.blob.type !== "image/webp") {
+    throw new TypeError("Thumbnail blob must be a WebP Blob");
+  }
+  if (
+    !Number.isSafeInteger(record.width) ||
+    record.width <= 0 ||
+    record.width > THUMBNAIL_MAX_DIMENSION ||
+    !Number.isSafeInteger(record.height) ||
+    record.height <= 0 ||
+    record.height > THUMBNAIL_MAX_DIMENSION
+  ) {
+    throw new RangeError("Thumbnail dimensions are invalid");
+  }
+  if (
+    !Number.isSafeInteger(record.byteLength) ||
+    record.byteLength <= 0 ||
+    record.byteLength > THUMBNAIL_MAX_BYTE_LENGTH ||
+    record.byteLength !== record.blob.size
+  ) {
+    throw new RangeError("Thumbnail byteLength must match a non-empty Blob of at most 48 KiB");
+  }
+  if (!isCanonicalUtcTimestamp(record.capturedAt)) {
+    throw new TypeError("Thumbnail capturedAt must be a canonical UTC timestamp");
+  }
+  requireThumbnailSourceUrl(record.sourceUrl);
+}
+
+/**
+ * @param {ThumbnailRecord} record
+ * @returns {ThumbnailMetadata}
+ */
+function thumbnailMetadata(record) {
+  return {
+    userId: record.userId,
+    worldId: record.worldId,
+    width: record.width,
+    height: record.height,
+    byteLength: record.byteLength,
+    capturedAt: record.capturedAt,
+    sourceUrl: record.sourceUrl
+  };
+}
+
+/**
+ * Copy only the schema fields before the first asynchronous boundary. Callers
+ * may mutate their input object after putThumbnail() returns its promise; this
+ * snapshot keeps validation, ownership checks, and the eventual put aligned.
+ * Unknown fields are intentionally not persisted.
+ *
+ * @param {ThumbnailRecord} record
+ * @returns {ThumbnailRecord}
+ */
+function thumbnailRecordSnapshot(record) {
+  if (record === null || typeof record !== "object") {
+    throw new TypeError("Thumbnail record must be an object");
+  }
+  return {
+    userId: record.userId,
+    worldId: record.worldId,
+    blob: record.blob,
+    width: record.width,
+    height: record.height,
+    byteLength: record.byteLength,
+    capturedAt: record.capturedAt,
+    sourceUrl: record.sourceUrl
+  };
+}
+
+/**
  * @param {IDBObjectStore} store
  * @param {Readonly<Record<string, unknown>>} updates
  */
@@ -447,7 +611,33 @@ function putSettings(store, updates) {
     if (!ALLOWED_SETTING_KEYS.has(key)) {
       throw new Error(`Unknown setting key: ${key}`);
     }
+    if (key === "thumbnailJob" && updates[key] !== null) validateThumbnailJob(updates[key]);
     store.put({ key, value: updates[key] });
+  }
+}
+
+/** @param {unknown} value */
+function validateThumbnailJob(value) {
+  if (typeof value !== "object" || value === null) throw new Error("Invalid thumbnail job");
+  const job = /** @type {Record<string, unknown>} */ (value);
+  const keys = ["version", "userId", "generation", "capturedAt", "items", "nextAttemptAt", "state"];
+  if (Object.keys(job).length !== keys.length || Object.keys(job).some((key) => !keys.includes(key))
+    || job.version !== 1 || typeof job.userId !== "string" || !/^usr_[a-f0-9-]{36}$/.test(job.userId)
+    || !Number.isSafeInteger(job.generation) || Number(job.generation) < 0
+    || typeof job.capturedAt !== "string" || !Number.isFinite(Date.parse(job.capturedAt))
+    || (job.nextAttemptAt !== null && (typeof job.nextAttemptAt !== "number" || !Number.isFinite(job.nextAttemptAt) || job.nextAttemptAt < 0))
+    || !["running", "waiting", "complete", "partial", "paused"].includes(String(job.state))
+    || !Array.isArray(job.items) || job.items.length > 10_000) throw new Error("Invalid thumbnail job");
+  const ids = new Set();
+  for (const entry of job.items) {
+    if (typeof entry !== "object" || entry === null) throw new Error("Invalid thumbnail job item");
+    const item = /** @type {Record<string, unknown>} */ (entry);
+    if (Object.keys(item).length !== 3 || Object.keys(item).some((key) => !["id", "thumbnailImageUrl", "attempts"].includes(key))
+      || typeof item.id !== "string" || !/^wrld_[a-f0-9-]{36}$/.test(item.id) || ids.has(item.id)
+      || typeof item.thumbnailImageUrl !== "string" || item.thumbnailImageUrl.length > THUMBNAIL_SOURCE_URL_MAX_LENGTH
+      || !isAllowedVrchatImageUrl(item.thumbnailImageUrl)
+      || !Number.isSafeInteger(item.attempts) || Number(item.attempts) < 0 || Number(item.attempts) > 3) throw new Error("Invalid thumbnail job item");
+    ids.add(item.id);
   }
 }
 
@@ -687,6 +877,16 @@ function putSyncRunAndPrune(store, syncRun) {
 /**
  * @param {IDBDatabase} database
  */
+function installThumbnailStore(database) {
+  const thumbnails = database.createObjectStore(STORES.thumbnails, {
+    keyPath: ["userId", "worldId"]
+  });
+  thumbnails.createIndex(INDEXES.thumbnailsByUser, "userId", { unique: false });
+}
+
+/**
+ * @param {IDBDatabase} database
+ */
 function installSchema(database) {
   const profiles = database.createObjectStore(STORES.profiles, { keyPath: "userId" });
   void profiles;
@@ -705,6 +905,8 @@ function installSchema(database) {
   worlds.createIndex(INDEXES.worldsByProbe, ["userId", "probeState", "lastProbeAt"], {
     unique: false
   });
+
+  installThumbnailStore(database);
 
   const favoriteGroups = database.createObjectStore(STORES.favoriteGroups, {
     keyPath: ["userId", "groupId"]
@@ -793,6 +995,17 @@ function migrateV1ToV2(database, transaction) {
 }
 
 /**
+ * Add the binary thumbnail cache without rewriting any v2 record. Creating the
+ * store in the versionchange transaction makes both v1 -> v3 and v2 -> v3
+ * upgrades all-or-nothing with the existing data.
+ *
+ * @param {IDBDatabase} database
+ */
+function migrateV2ToV3(database) {
+  installThumbnailStore(database);
+}
+
+/**
  * IndexedDB repository used by the extension service worker and UI.
  */
 export class DatabaseRepository {
@@ -833,8 +1046,13 @@ export class DatabaseRepository {
       }
       if (oldVersion === 0) {
         installSchema(request.result);
-      } else if (oldVersion === 1) {
-        migrateV1ToV2(request.result, transaction);
+      } else {
+        if (oldVersion < 2) {
+          migrateV1ToV2(request.result, transaction);
+        }
+        if (oldVersion < 3) {
+          migrateV2ToV3(request.result);
+        }
       }
       transaction.objectStore(STORES.meta).put({
         key: "schemaVersion",
@@ -1087,6 +1305,160 @@ export class DatabaseRepository {
 
   /**
    * @param {string} userId
+   * @param {string} worldId
+   * @returns {Promise<ThumbnailRecord | null>}
+   */
+  async getThumbnail(userId, worldId) {
+    requireThumbnailIdentifier(userId, "Thumbnail userId");
+    requireThumbnailIdentifier(worldId, "Thumbnail worldId");
+    const transaction = this.#requireDatabase().transaction(STORES.thumbnails, "readonly");
+    const value = await completeRead(
+      transaction,
+      getValue(transaction.objectStore(STORES.thumbnails), [userId, worldId])
+    );
+    return value === undefined ? null : /** @type {ThumbnailRecord} */ (value);
+  }
+
+  /**
+   * Fetch the visible cards in one readonly transaction. IDs are de-duplicated
+   * while preserving caller order, and missing thumbnails are omitted.
+   *
+   * @param {string} userId
+   * @param {readonly string[]} worldIds
+   * @returns {Promise<ThumbnailRecord[]>}
+   */
+  async getThumbnails(userId, worldIds) {
+    requireThumbnailIdentifier(userId, "Thumbnail userId");
+    if (!Array.isArray(worldIds)) {
+      throw new TypeError("Thumbnail worldIds must be an array");
+    }
+    if (worldIds.length > THUMBNAIL_BATCH_LIMIT) {
+      throw new RangeError(`Thumbnail batch is limited to ${THUMBNAIL_BATCH_LIMIT} world IDs`);
+    }
+    /** @type {string[]} */
+    const uniqueWorldIds = [];
+    /** @type {Set<string>} */
+    const seen = new Set();
+    for (const worldId of worldIds) {
+      requireThumbnailIdentifier(worldId, "Thumbnail worldId");
+      if (!seen.has(worldId)) {
+        seen.add(worldId);
+        uniqueWorldIds.push(worldId);
+      }
+    }
+    if (uniqueWorldIds.length === 0) {
+      return [];
+    }
+
+    const transaction = this.#requireDatabase().transaction(STORES.thumbnails, "readonly");
+    const values = await completeRead(
+      transaction,
+      Promise.all(
+        uniqueWorldIds.map((worldId) =>
+          getValue(transaction.objectStore(STORES.thumbnails), [userId, worldId])
+        )
+      )
+    );
+    /** @type {ThumbnailRecord[]} */
+    const thumbnails = [];
+    for (const value of values) {
+      if (value !== undefined) {
+        thumbnails.push(/** @type {ThumbnailRecord} */ (value));
+      }
+    }
+    return thumbnails;
+  }
+
+  /**
+   * List lightweight fields only. The Blob body is deliberately excluded from
+   * the returned objects so list views cannot accidentally retain every image.
+   *
+   * @param {string} userId
+   * @returns {Promise<ThumbnailMetadata[]>}
+   */
+  async listThumbnailMetadata(userId) {
+    requireThumbnailIdentifier(userId, "Thumbnail userId");
+    const transaction = this.#requireDatabase().transaction(STORES.thumbnails, "readonly");
+    const index = transaction.objectStore(STORES.thumbnails).index(INDEXES.thumbnailsByUser);
+    /** @type {Promise<ThumbnailMetadata[]>} */
+    const metadata = new Promise((resolve, reject) => {
+      /** @type {ThumbnailMetadata[]} */
+      const records = [];
+      const request = index.openCursor(userId);
+      request.addEventListener("error", () => {
+        reject(request.error ?? new Error("IndexedDB thumbnail cursor failed"));
+      }, { once: true });
+      request.addEventListener("success", () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve(records);
+          return;
+        }
+        records.push(thumbnailMetadata(/** @type {ThumbnailRecord} */ (cursor.value)));
+        cursor.continue();
+      });
+    });
+    const records = await completeRead(transaction, metadata);
+    return records.sort((left, right) => left.worldId.localeCompare(right.worldId));
+  }
+
+  /**
+   * Replace one thumbnail atomically after all image processing has succeeded.
+   * The old record remains intact if validation, generation checking, cloning,
+   * or commit fails. The optional generation protects low-priority captures
+   * planned from an older sync snapshot; the durable purge guard is mandatory
+   * even when no generation is supplied.
+   *
+   * @param {ThumbnailRecord} record
+   * @param {number} [expectedGeneration]
+   * @param {string} [expectedActiveProfileId]
+   * @returns {Promise<void>}
+   */
+  async putThumbnail(record, expectedGeneration, expectedActiveProfileId) {
+    const storedRecord = thumbnailRecordSnapshot(record);
+    validateThumbnailRecord(storedRecord);
+    if (expectedGeneration !== undefined) {
+      requireGeneration(expectedGeneration, "expectedGeneration");
+    }
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.thumbnails, STORES.worlds, STORES.settings, STORES.meta],
+      "readwrite"
+    );
+    const finished = transactionFinished(transaction);
+    try {
+      const [storedPurgePending, storedGeneration, storedWorld, activeProfile] = await Promise.all([
+        getValue(transaction.objectStore(STORES.settings), "purgePending"),
+        getValue(transaction.objectStore(STORES.meta), generationKey(storedRecord.userId)),
+        getValue(
+          transaction.objectStore(STORES.worlds),
+          [storedRecord.userId, storedRecord.worldId]
+        ),
+        getValue(transaction.objectStore(STORES.settings), "activeProfileId")
+      ]);
+      requireWritesAllowed(storedPurgePending);
+      const actualGeneration = generationValue(storedGeneration, storedRecord.userId);
+      if (expectedGeneration !== undefined && actualGeneration !== expectedGeneration) {
+        throw new GenerationConflictError(
+          storedRecord.userId,
+          expectedGeneration,
+          actualGeneration
+        );
+      }
+      if (expectedActiveProfileId !== undefined && (activeProfile === undefined || /** @type {StoredValue} */ (activeProfile).value !== expectedActiveProfileId)) {
+        throw new GenerationConflictError(storedRecord.userId, expectedGeneration ?? actualGeneration, actualGeneration);
+      }
+      if (storedWorld === undefined) {
+        throw new Error(`Thumbnail target world is not stored: ${storedRecord.worldId}`);
+      }
+      transaction.objectStore(STORES.thumbnails).put(storedRecord);
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
+  }
+
+  /**
+   * @param {string} userId
    * @returns {Promise<FavoriteGroupRecord[]>}
    */
   async listFavoriteGroups(userId) {
@@ -1123,11 +1495,19 @@ export class DatabaseRepository {
   }
 
   /**
-   * Count profile data without materializing all records. Pending probes are
-   * counted once per world from the same readonly snapshot as both totals.
+   * Count profile data without materializing all records. Pending and confirmed
+   * attention states are counted once per world from the same readonly snapshot
+   * as both totals.
    *
    * @param {string} userId
-   * @returns {Promise<{ worldCount: number, eventCount: number, pendingProbeCount: number }>}
+   * @returns {Promise<{
+   *   worldCount: number,
+   *   eventCount: number,
+   *   pendingProbeCount: number,
+   *   attentionWorldCount: number,
+   *   missingCount: number,
+   *   unavailableCount: number
+   * }>}
    */
   async getProfileStats(userId) {
     const transaction = this.#requireDatabase().transaction(
@@ -1136,9 +1516,17 @@ export class DatabaseRepository {
     );
     const worldIndex = transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser);
     const eventIndex = transaction.objectStore(STORES.events).index(INDEXES.eventsByUser);
-    /** @type {Promise<number>} */
-    const pendingProbeCount = new Promise((resolve, reject) => {
-      let count = 0;
+    /** @type {Promise<{
+     *   pendingProbeCount: number,
+     *   attentionWorldCount: number,
+     *   missingCount: number,
+     *   unavailableCount: number
+     * }>} */
+    const worldStateCounts = new Promise((resolve, reject) => {
+      let pendingProbeCount = 0;
+      let attentionWorldCount = 0;
+      let missingCount = 0;
+      let unavailableCount = 0;
       const request = worldIndex.openCursor(userId);
       request.addEventListener("error", () => {
         reject(request.error ?? new Error("IndexedDB profile stats cursor failed"));
@@ -1146,25 +1534,41 @@ export class DatabaseRepository {
       request.addEventListener("success", () => {
         const cursor = request.result;
         if (cursor === null) {
-          resolve(count);
+          resolve({
+            pendingProbeCount,
+            attentionWorldCount,
+            missingCount,
+            unavailableCount
+          });
           return;
         }
         const world = /** @type {WorldRecord} */ (cursor.value);
         if (world.probeState === "pending" || world.availabilityState === "unavailable_once") {
-          count += 1;
+          pendingProbeCount += 1;
+        }
+        const missing = world.membershipState === "not_in_favorites";
+        const unavailable = world.availabilityState === "unavailable";
+        if (missing) {
+          missingCount += 1;
+        }
+        if (unavailable) {
+          unavailableCount += 1;
+        }
+        if (missing || unavailable) {
+          attentionWorldCount += 1;
         }
         cursor.continue();
       });
     });
-    const [worldCount, eventCount, pendingCount] = await completeRead(
+    const [worldCount, eventCount, stateCounts] = await completeRead(
       transaction,
       Promise.all([
         requestResult(worldIndex.count(userId)),
         requestResult(eventIndex.count(userId)),
-        pendingProbeCount
+        worldStateCounts
       ])
     );
-    return { worldCount, eventCount, pendingProbeCount: pendingCount };
+    return { worldCount, eventCount, ...stateCounts };
   }
 
   /**
@@ -1241,6 +1645,35 @@ export class DatabaseRepository {
       const storedPurgePending = await getValue(settingsStore, "purgePending");
       requireWritesAllowed(storedPurgePending);
       putSettings(settingsStore, updates);
+    } catch (error) {
+      return abortAndThrow(transaction, error, finished);
+    }
+    await finished;
+  }
+
+  /**
+   * Persist a thumbnail checkpoint only for the still-active snapshot.
+   * @param {string} userId
+   * @param {number} expectedGeneration
+   * @param {Readonly<Record<string, unknown>>} updates
+   */
+  async setThumbnailSettings(userId, expectedGeneration, updates) {
+    requireGeneration(expectedGeneration, "expectedGeneration");
+    const transaction = this.#requireDatabase().transaction([STORES.settings, STORES.meta], "readwrite");
+    const finished = transactionFinished(transaction);
+    try {
+      const settings = transaction.objectStore(STORES.settings);
+      const [purge, generation, active] = await Promise.all([
+        getValue(settings, "purgePending"),
+        getValue(transaction.objectStore(STORES.meta), generationKey(userId)),
+        getValue(settings, "activeProfileId")
+      ]);
+      requireWritesAllowed(purge);
+      const actual = generationValue(generation, userId);
+      if (actual !== expectedGeneration || active === undefined || /** @type {StoredValue} */ (active).value !== userId) {
+        throw new GenerationConflictError(userId, expectedGeneration, actual);
+      }
+      putSettings(settings, updates);
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -1700,6 +2133,8 @@ export class DatabaseRepository {
   /**
    * Atomically replace profile/world/event data for exactly one user and merge
    * explicitly supplied boolean preferences. Other users are untouched.
+   * Metadata-only backups do not contain image Blobs, so thumbnails are
+   * intentionally outside this replacement transaction and remain unchanged.
    *
    * @param {ProfileReplacement} replacement
    * @returns {Promise<number>} the replacement data generation
@@ -1812,6 +2247,7 @@ export class DatabaseRepository {
       [
         STORES.profiles,
         STORES.worlds,
+        STORES.thumbnails,
         STORES.favoriteGroups,
         STORES.events,
         STORES.syncRuns,
@@ -1835,6 +2271,10 @@ export class DatabaseRepository {
       await Promise.all([
         deleteByIndex(
           transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
+          userId
+        ),
+        deleteByIndex(
+          transaction.objectStore(STORES.thumbnails).index(INDEXES.thumbnailsByUser),
           userId
         ),
         deleteByIndex(

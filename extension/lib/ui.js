@@ -12,7 +12,74 @@ import {
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
 
 /**
+ * Image metadata failure must not prevent loading the separate world history.
+ * @param {Pick<DatabaseRepository, "listThumbnailMetadata">} repository
+ * @param {string} userId
+ * @returns {Promise<number | null>}
+ */
+export async function readThumbnailCount(repository, userId) {
+  try {
+    return (await repository.listThumbnailMetadata(userId)).length;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @typedef {object} ThumbnailProgress
+ * @property {number} total
+ * @property {number} saved
+ * @property {number} remaining
+ * @property {number} failed
+ * @property {string | null} nextAttemptAt
+ * @property {"running" | "waiting" | "complete" | "partial" | "paused"} state
+ */
+
+/** @param {unknown} value @returns {ThumbnailProgress | null} */
+export function normalizeThumbnailProgress(value) {
+  if (!isRecord(value)) return null;
+  for (const key of ["total", "saved", "remaining", "failed"]) {
+    const count = value[key];
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) return null;
+  }
+  if (!["running", "waiting", "complete", "partial", "paused"].includes(String(value.state))) return null;
+  if (value.nextAttemptAt !== null && (typeof value.nextAttemptAt !== "string" || !Number.isFinite(Date.parse(value.nextAttemptAt)))) return null;
+  const progress = /** @type {ThumbnailProgress} */ (/** @type {unknown} */ (value));
+  if (progress.saved + progress.remaining + progress.failed !== progress.total) return null;
+  if (progress.state === "complete" && (progress.remaining !== 0 || progress.failed !== 0)) return null;
+  return { total: progress.total, saved: progress.saved, remaining: progress.remaining, failed: progress.failed, nextAttemptAt: progress.nextAttemptAt, state: progress.state };
+}
+
+/**
+ * @param {ThumbnailProgress | null} progress
+ * @param {{savedCount?: number | null, hasProfile?: boolean}} [fallback]
+ * @returns {string}
+ */
+export function presentThumbnailProgress(progress, fallback = {}) {
+  if (progress === null || progress.total === 0) {
+    if (fallback.hasProfile === false) return "画像はまだ保存されていません。最初の確認後に保存状況を表示します。";
+    const saved = fallback.savedCount;
+    const count = typeof saved === "number" && Number.isSafeInteger(saved) && saved >= 0
+      ? `保存済み画像${saved.toLocaleString("ja-JP")}件。`
+      : "保存済み画像の件数を現在確認できません。";
+    return count + (progress === null
+      ? "自動保存の残り件数は現在確認できません。"
+      : "今回の確認で画像の取得対象は0件でした。");
+  }
+  const count = `保存済み${progress.saved.toLocaleString("ja-JP")}/${progress.total.toLocaleString("ja-JP")}件（残り${progress.remaining.toLocaleString("ja-JP")}件）`;
+  if (progress.state === "complete") return `画像の保存が完了しました。${count}`;
+  if (progress.state === "partial") return `一部の画像を取得できませんでした。${count}。取得できなかった画像は${progress.failed.toLocaleString("ja-JP")}件です。保存済みの画像と履歴は保持しています。`;
+  if (progress.state === "paused") return `画像の保存を一時停止しています。${count}。Chromeを開き直しても再開しない場合は「今すぐ確認」を押してください。`;
+  const waiting = progress.state === "waiting"
+    ? `待機中です。${progress.nextAttemptAt === null ? "準備ができ次第" : `${formatDateTime(progress.nextAttemptAt)}以降に`}自動再開します。`
+    : "画像を自動で保存しています。";
+  return `${waiting}${count}。この画面を閉じても、Chrome起動中は続きます。「今すぐ確認」を繰り返す必要はありません。`;
+}
+
+/**
  * @typedef {object} UiStatus
+ * @property {ThumbnailProgress | null} thumbnailProgress
+ * @property {number | null} thumbnailSavedCount
  * @property {boolean} syncing
  * @property {boolean} authRequired
  * @property {string | null} lastSuccessfulSyncAt
@@ -22,13 +89,16 @@ import {
  * @property {number} eventCount
  * @property {number} pendingProbeCount
  * @property {number} unreadCount
+ * @property {number} attentionWorldCount
+ * @property {number} missingCount
+ * @property {number} unavailableCount
  * @property {"success" | "stale" | null} favoriteGroupStatus
  * @property {string | null} lastResult
  */
 
 /**
  * @typedef {object} StatusPresentation
- * @property {"idle" | "ready" | "working" | "error"} tone
+ * @property {"idle" | "ready" | "working" | "attention" | "error"} tone
  * @property {string} title
  * @property {string} detail
  */
@@ -91,6 +161,8 @@ export function normalizeStatusResponse(response) {
   const candidate = isRecord(envelope.status) ? envelope.status : envelope;
   const lastResult = typeof candidate.lastResult === "string" ? candidate.lastResult : null;
   return {
+    thumbnailProgress: normalizeThumbnailProgress(candidate.thumbnailProgress),
+    thumbnailSavedCount: typeof candidate.thumbnailSavedCount === "number" && Number.isSafeInteger(candidate.thumbnailSavedCount) && candidate.thumbnailSavedCount >= 0 ? candidate.thumbnailSavedCount : null,
     syncing: candidate.syncing === true,
     authRequired: candidate.authRequired === true || lastResult === RESULT_CODES.authRequired,
     lastSuccessfulSyncAt:
@@ -104,6 +176,9 @@ export function normalizeStatusResponse(response) {
     eventCount: safeCount(candidate.eventCount),
     pendingProbeCount: safeCount(candidate.pendingProbeCount),
     unreadCount: safeCount(candidate.unreadCount),
+    attentionWorldCount: safeCount(candidate.attentionWorldCount),
+    missingCount: safeCount(candidate.missingCount),
+    unavailableCount: safeCount(candidate.unavailableCount),
     favoriteGroupStatus:
       candidate.favoriteGroupStatus === "success" || candidate.favoriteGroupStatus === "stale"
         ? candidate.favoriteGroupStatus
@@ -147,8 +222,8 @@ export function presentStatus(status, now = Date.now()) {
   if (status.syncing) {
     return {
       tone: "working",
-      title: "お気に入りを確認しています",
-      detail: "完了するまでこのままお待ちください。"
+      title: status.thumbnailProgress?.state === "running" ? "画像を保存しています" : "お気に入りを確認しています",
+      detail: "この画面を閉じても、Chrome起動中は続きます。"
     };
   }
   if (status.authRequired) {
@@ -204,6 +279,20 @@ export function presentStatus(status, now = Date.now()) {
       tone: "error",
       title: "36時間以上確認できていません",
       detail: "ブラウザを起動した状態で「今すぐ確認」を押してください。保存済みの記録はそのままです。"
+    };
+  }
+  if (status.unavailableCount > 0) {
+    return {
+      tone: "attention",
+      title: `現在アクセスできないワールドが${status.unavailableCount.toLocaleString("ja-JP")}件あります`,
+      detail: `削除・非公開などの可能性があります。保存済みの名前と画像を最優先で確認してください。お気に入り一覧から外れたワールドは${status.missingCount.toLocaleString("ja-JP")}件です。`
+    };
+  }
+  if (status.missingCount > 0) {
+    return {
+      tone: "attention",
+      title: `お気に入り一覧から外れたワールドが${status.missingCount.toLocaleString("ja-JP")}件あります`,
+      detail: "手動でお気に入り解除した場合も含まれます。現在アクセスできないワールドは確認されていません。"
     };
   }
   const pendingDetail = status.pendingProbeCount === 0
@@ -329,11 +418,16 @@ export function purgeErrorMessage(code, dataDeleted) {
 
 /**
  * @param {WorldRecord} world
- * @param {"all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
  * @returns {boolean}
  */
 export function worldMatchesFilter(world, filter) {
   switch (filter) {
+    case "attention":
+      return (
+        world.membershipState === "not_in_favorites" ||
+        world.availabilityState === "unavailable"
+      );
     case "favorite":
       return world.membershipState === "favorited";
     case "missing":
@@ -360,7 +454,7 @@ export function worldMatchesFilter(world, filter) {
  * @param {readonly WorldRecord[]} worlds
  * @param {readonly HistoryEvent[]} events
  * @param {string} query
- * @param {"all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
  * @param {string | null} [groupTag]
  * @param {readonly FavoriteGroupRecord[]} [favoriteGroups]
  * @returns {WorldRecord[]}
@@ -392,7 +486,7 @@ export function filterWorlds(
     }
   }
 
-  return worlds
+  const matching = worlds
     .filter((world) => worldMatchesFilter(world, filter))
     .filter((world) => groupTag === null || groupTag.length === 0 || world.favoriteTags.includes(groupTag))
     .filter((world) => {
@@ -413,19 +507,82 @@ export function filterWorlds(
         ...favoriteGroupSearchValues([...recordedGroupTags], favoriteGroups)
       ];
       return searchable.some((value) => normalizeSearchText(value).includes(normalizedQuery));
-    })
-    .sort(compareWorlds);
+    });
+
+  if (filter !== "attention" && filter !== "missing" && filter !== "unavailable") {
+    return matching.sort(compareWorlds);
+  }
+
+  const matchingById = new Map(matching.map((world) => [world.worldId, world]));
+  /** @type {Map<string, string>} */
+  const latestConfirmedAt = new Map();
+  for (const event of events) {
+    const world = matchingById.get(event.worldId);
+    if (world === undefined || !isRelatedConfirmedEvent(event, world, filter)) {
+      continue;
+    }
+    const previous = latestConfirmedAt.get(event.worldId);
+    if (previous === undefined || event.observedAt.localeCompare(previous) > 0) {
+      latestConfirmedAt.set(event.worldId, event.observedAt);
+    }
+  }
+  return matching.sort((left, right) => {
+    if (filter === "attention") {
+      const availabilityPriority = Number(right.availabilityState === "unavailable")
+        - Number(left.availabilityState === "unavailable");
+      if (availabilityPriority !== 0) {
+        return availabilityPriority;
+      }
+    }
+    const byConfirmedTime = (latestConfirmedAt.get(right.worldId) ?? "")
+      .localeCompare(latestConfirmedAt.get(left.worldId) ?? "");
+    return byConfirmedTime === 0 ? compareWorlds(left, right) : byConfirmedTime;
+  });
+}
+
+/**
+ * Ignore old confirmation events for a state that has since recovered. This
+ * keeps attention lists ordered by the confirmation relevant to the world's
+ * current state.
+ *
+ * @param {HistoryEvent} event
+ * @param {WorldRecord} world
+ * @param {"attention" | "missing" | "unavailable"} filter
+ * @returns {boolean}
+ */
+function isRelatedConfirmedEvent(event, world, filter) {
+  if (filter === "missing") {
+    return event.kind === "favorite_missing_confirmed";
+  }
+  if (filter === "unavailable") {
+    return event.kind === "access_unavailable_confirmed";
+  }
+  return (
+    (
+      world.membershipState === "not_in_favorites" &&
+      event.kind === "favorite_missing_confirmed"
+    ) ||
+    (
+      world.availabilityState === "unavailable" &&
+      event.kind === "access_unavailable_confirmed"
+    )
+  );
 }
 
 /**
  * @param {readonly HistoryEvent[]} events
- * @param {"all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} filter
+ * @param {"attention" | "all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} filter
  * @returns {HistoryEvent[]}
  */
 export function filterEvents(events, filter) {
   return events
     .filter((event) => {
       switch (filter) {
+        case "attention":
+          return (
+            event.kind === "favorite_missing_confirmed" ||
+            event.kind === "access_unavailable_confirmed"
+          );
         case "renamed":
           return event.kind === "name_changed";
         case "group":
@@ -630,10 +787,14 @@ export function takeVisibleItems(items, visibleCount) {
 /**
  * @param {readonly WorldRecord[]} worlds
  * @param {readonly HistoryEvent[]} events
- * @returns {{ total: number, unavailable: number, missing: number, renamed: number }}
+ * @returns {{ attention: number, total: number, unavailable: number, missing: number, renamed: number }}
  */
 export function summarizeHistory(worlds, events) {
   return {
+    attention: worlds.filter((world) => (
+      world.membershipState === "not_in_favorites" ||
+      world.availabilityState === "unavailable"
+    )).length,
     total: worlds.length,
     unavailable: worlds.filter((world) => world.availabilityState === "unavailable").length,
     missing: worlds.filter((world) => world.membershipState === "not_in_favorites").length,

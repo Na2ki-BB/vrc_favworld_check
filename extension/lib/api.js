@@ -12,6 +12,17 @@ export const API_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 export const API_MAX_TEXT_CODE_POINTS = 4_096;
 export const API_MAX_TAGS = 100;
 
+const VRCHAT_IMAGE_HOST = "api.vrchat.cloud";
+const VRCHAT_FILE_ID_SOURCE = "file_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const VRCHAT_FILE_PATH_PATTERN = new RegExp(
+  `^/api/1/file/${VRCHAT_FILE_ID_SOURCE}/[1-9][0-9]*/file$`,
+  "iu"
+);
+const VRCHAT_IMAGE_PATH_PATTERN = new RegExp(
+  `^/api/1/image/${VRCHAT_FILE_ID_SOURCE}/[1-9][0-9]*/(?:64|128|256|512|1024|2048)$`,
+  "iu"
+);
+
 export const API_ERROR_CODES = /** @type {const} */ ({
   AUTH_REQUIRED: "AUTH_REQUIRED",
   FORBIDDEN: "FORBIDDEN",
@@ -48,7 +59,8 @@ const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
  *   name: string,
  *   authorName: string,
  *   favoriteGroup: string,
- *   releaseStatus: "public" | "private" | "hidden"
+ *   releaseStatus: "public" | "private" | "hidden",
+ *   thumbnailImageUrl?: string
  * }} FavoriteWorldMetadata
  * @typedef {{
  *   identity: string | null,
@@ -72,8 +84,10 @@ const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
  *   id: string,
  *   name: string,
  *   authorName: string,
- *   releaseStatus: "public" | "private" | "hidden"
+ *   releaseStatus: "public" | "private" | "hidden",
+ *   thumbnailImageUrl?: string
  * }} WorldMetadata
+ * @typedef {{thumbnailImageUrl?: string}} OptionalWorldMetadata
  * @typedef {{status: 200, world: WorldMetadata} | {status: 404, world: null}} WorldProbe
  * @typedef {{status: 200, body: unknown} | {status: 404, body: null}} ApiResponse
  */
@@ -632,9 +646,18 @@ function projectFavoriteWorldPageItem(value) {
     return { identity: null, metadata: null };
   }
 
+  const optionalMetadata = projectOptionalWorldMetadata(value);
+
   return {
     identity: id,
-    metadata: { id, name, authorName, favoriteGroup, releaseStatus }
+    metadata: {
+      id,
+      name,
+      authorName,
+      favoriteGroup,
+      releaseStatus,
+      ...optionalMetadata
+    }
   };
 }
 
@@ -693,7 +716,110 @@ function projectWorld(value) {
     throw new ApiSchemaError();
   }
 
-  return { id, name, authorName, releaseStatus };
+  return {
+    id,
+    name,
+    authorName,
+    releaseStatus,
+    ...projectOptionalWorldMetadata(value)
+  };
+}
+
+/**
+ * Project optional display metadata without making older API responses fail.
+ * Null is treated like an omitted optional field. Unknown fields, including
+ * description, remain outside the product data model and are ignored.
+ *
+ * @param {Record<string, unknown>} value
+ * @returns {OptionalWorldMetadata}
+ */
+function projectOptionalWorldMetadata(value) {
+  /** @type {OptionalWorldMetadata} */
+  const metadata = {};
+  const thumbnailImageUrl = value.thumbnailImageUrl;
+  if (isAllowedVrchatImageUrl(thumbnailImageUrl)) {
+    metadata.thumbnailImageUrl = thumbnailImageUrl;
+  }
+
+  return metadata;
+}
+
+/**
+ * Accept only the two VRChat API image routes currently emitted for world
+ * artwork. The exact origin and route grammar prevent a stored API value from
+ * becoming an arbitrary network request later.
+ *
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+export function isAllowedVrchatImageUrl(value) {
+  if (typeof value !== "string" || !isBoundedText(value)) {
+    return false;
+  }
+
+  /** @type {URL} */
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+
+  return url.protocol === "https:"
+    && url.hostname === VRCHAT_IMAGE_HOST
+    && url.port === ""
+    && url.username === ""
+    && url.password === ""
+    && url.search === ""
+    && url.hash === ""
+    && (
+      VRCHAT_FILE_PATH_PATTERN.test(url.pathname)
+      || VRCHAT_IMAGE_PATH_PATTERN.test(url.pathname)
+    );
+}
+
+/**
+ * Match the final public image to its requested file and version. Signed CDN
+ * query parameters are used only by fetch and must never become stored data.
+ * The extension CSP restricts every redirect hop before a request is sent.
+ *
+ * @param {string} sourceUrl
+ * @param {string} finalUrl
+ * @returns {boolean}
+ */
+export function isAllowedVrchatImageResponseUrl(sourceUrl, finalUrl) {
+  if (!isAllowedVrchatImageUrl(sourceUrl)) {
+    return false;
+  }
+  if (sourceUrl === finalUrl) {
+    return true;
+  }
+  if (!finalUrl.startsWith("https://files.vrchat.cloud/") || finalUrl.includes("#")) {
+    return false;
+  }
+  let target;
+  try {
+    target = new URL(finalUrl);
+  } catch {
+    return false;
+  }
+  if (target.protocol !== "https:" || target.hostname !== "files.vrchat.cloud"
+    || target.port !== "" || target.username !== "" || target.password !== ""
+    || target.hash !== "") {
+    return false;
+  }
+  const sourceParts = new URL(sourceUrl).pathname.split("/");
+  const kind = sourceParts[3];
+  const fileId = sourceParts[4];
+  const version = sourceParts[5];
+  const size = sourceParts[6];
+  const path = target.pathname;
+  if (kind === "image") {
+    const match = /^\/thumbnails\/(file_[a-f0-9-]+)\.([a-f0-9]{64})\.(\d+)\.thumbnail-(\d+)\.(?:png|jpe?g|webp)$/u.exec(path);
+    return match !== null && match[1] === fileId && match[3] === version && match[4] === size;
+  }
+  const match = /^\/[^/]+\.(file_[a-f0-9-]+)\.(\d+)\.(?:png|jpe?g|webp)$/u.exec(path);
+  return match !== null && match[1] === fileId && match[2] === version;
 }
 
 /**
@@ -713,7 +839,17 @@ function isRecord(value) {
  * @returns {value is string}
  */
 function isNonEmptyString(value) {
-  if (typeof value !== "string" || value.trim() === "") {
+  return typeof value === "string"
+    && value.trim() !== ""
+    && isBoundedText(value);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+function isBoundedText(value) {
+  if (typeof value !== "string") {
     return false;
   }
   let codePointCount = 0;

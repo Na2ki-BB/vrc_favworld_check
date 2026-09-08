@@ -31,14 +31,23 @@ import {
 } from "../extension/lib/auth-cookie-bridge.js";
 import { DatabaseRepository } from "../extension/lib/database.js";
 import {
+  ATTENTION_NOTIFICATION_ID_PREFIX,
   MANUAL_SYNC_COOLDOWN_MS,
   NOTIFICATION_EVENT_KINDS,
   SETTINGS_SCHEDULE_WARNING,
   SETTING_KEYS,
   SYNC_ALARM_NAME,
   SYNC_WATCHDOG_DELAY_MS,
+  THUMBNAIL_CAPTURE_INTERVAL_MS,
+  THUMBNAIL_RATE_LIMIT_FALLBACK_MS,
+  captureAvailableWorldThumbnails,
   SyncService
 } from "../extension/lib/sync-service.js";
+import {
+  THUMBNAIL_ERROR_CODES,
+  ThumbnailError,
+  ThumbnailFetchError
+} from "../extension/lib/thumbnail.js";
 import {
   RECOVERY_MIN_DELAY_MS,
   REGULAR_INTERVAL_MS,
@@ -60,6 +69,416 @@ test("VRChat login and API use the two reviewed fixed origins", () => {
   assert.notEqual(new URL(VRCHAT_LOGIN_URL).origin, new URL(VRCHAT_API_BASE_URL).origin);
 });
 
+test("thumbnail capture skips matching versions and stores only bounded encoded output", async () => {
+  const secondWorldId = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const existingUrl = "https://api.vrchat.cloud/api/1/file/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/file";
+  const newUrl = "https://api.vrchat.cloud/api/1/file/file_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/1/file";
+  /** @type {Array<{record: Parameters<DatabaseRepository["putThumbnail"]>[0], generation: number | undefined}>} */
+  const stored = [];
+  /** @type {number[]} */
+  const waits = [];
+  /** @type {string[]} */
+  const encodedUrls = [];
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata: [
+      {
+        id: WORLD_ID,
+        name: "保存済み",
+        authorName: "作者",
+        favoriteGroup: "worlds1",
+        releaseStatus: "public",
+        thumbnailImageUrl: existingUrl
+      },
+      {
+        id: secondWorldId,
+        name: "新規",
+        authorName: "作者",
+        favoriteGroup: "worlds2",
+        releaseStatus: "public",
+        thumbnailImageUrl: newUrl
+      }
+    ],
+    generation: 4,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [{
+        userId: USER_ID,
+        worldId: WORLD_ID,
+        width: 320,
+        height: 180,
+        byteLength: 3,
+        capturedAt: "2026-08-23T00:00:00.000Z",
+        sourceUrl: existingUrl
+      }],
+      putThumbnail: async (record, generation) => {
+        stored.push({ record, generation });
+      }
+    },
+    encode: async (url) => {
+      encodedUrls.push(url);
+      return {
+        bytes: new Uint8Array([1, 2, 3]),
+        contentType: "image/webp",
+        width: 320,
+        height: 180,
+        sourceUrl: url
+      };
+    },
+    wait: async (delayMs) => {
+      waits.push(delayMs);
+    }
+  });
+
+  assert.deepEqual(result, {
+    saved: 1,
+    skipped: 1,
+    failed: 0,
+    deferred: 0,
+    retryAt: null
+  });
+  assert.deepEqual(encodedUrls, [newUrl]);
+  assert.deepEqual(waits, []);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.generation, 4);
+  assert.equal(stored[0]?.record.worldId, secondWorldId);
+  assert.equal(stored[0]?.record.blob.type, "image/webp");
+  assert.equal(stored[0]?.record.blob.size, 3);
+});
+
+test("thumbnail image failures are counted, paced, and do not block later worlds", async () => {
+  const secondWorldId = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const firstUrl = "https://api.vrchat.cloud/api/1/file/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/file";
+  const secondUrl = "https://api.vrchat.cloud/api/1/file/file_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/1/file";
+  /** @type {string[]} */
+  const storedWorldIds = [];
+  /** @type {number[]} */
+  const waits = [];
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata: [
+      { id: WORLD_ID, name: "A", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public", thumbnailImageUrl: firstUrl },
+      { id: secondWorldId, name: "B", authorName: "作者", favoriteGroup: "worlds2", releaseStatus: "public", thumbnailImageUrl: secondUrl }
+    ],
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async (record) => {
+        storedWorldIds.push(record.worldId);
+      }
+    },
+    encode: async (url) => {
+      if (url === firstUrl) {
+        throw new ThumbnailError(THUMBNAIL_ERROR_CODES.INVALID_MEDIA_TYPE);
+      }
+      return {
+        bytes: new Uint8Array([4, 5]),
+        contentType: "image/webp",
+        width: 240,
+        height: 135,
+        sourceUrl: url
+      };
+    },
+    wait: async (delayMs) => {
+      waits.push(delayMs);
+    }
+  });
+
+  assert.deepEqual(result, {
+    saved: 1,
+    skipped: 0,
+    failed: 1,
+    deferred: 0,
+    retryAt: null
+  });
+  assert.deepEqual(storedWorldIds, [secondWorldId]);
+  assert.deepEqual(waits, [THUMBNAIL_CAPTURE_INTERVAL_MS]);
+});
+
+test("thumbnail capture stops the batch after a systemic network failure", async () => {
+  const metadata = Array.from({ length: 3 }, (_, index) => ({
+    id: `wrld_00000000-0000-4000-8000-00000000000${index}`,
+    name: `World ${index}`,
+    authorName: "作者",
+    favoriteGroup: "worlds1",
+    releaseStatus: /** @type {const} */ ("public"),
+    thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_00000000-0000-4000-8000-00000000000${index}/1/256`
+  }));
+  /** @type {string[]} */
+  const encodedUrls = [];
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata,
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => undefined
+    },
+    encode: async (url) => {
+      encodedUrls.push(url);
+      throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.FETCH_FAILED);
+    },
+    wait: async () => undefined
+  });
+
+  assert.deepEqual(result, {
+    saved: 0,
+    skipped: 0,
+    failed: 1,
+    deferred: 2,
+    retryAt: null
+  });
+  assert.deepEqual(encodedUrls, [metadata[0]?.thumbnailImageUrl]);
+});
+
+test("thumbnail capture stops on 429 and returns the validated retry deadline", async () => {
+  const retryAt = NOW + 120_000;
+  const metadata = Array.from({ length: 2 }, (_, index) => ({
+    id: `wrld_10000000-0000-4000-8000-00000000000${index}`,
+    name: `World ${index}`,
+    authorName: "作者",
+    favoriteGroup: "worlds1",
+    releaseStatus: /** @type {const} */ ("public"),
+    thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_10000000-0000-4000-8000-00000000000${index}/1/256`
+  }));
+  let encodeCount = 0;
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata,
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => undefined
+    },
+    encode: async () => {
+      encodeCount += 1;
+      throw new ThumbnailFetchError(
+        THUMBNAIL_ERROR_CODES.HTTP_STATUS,
+        429,
+        retryAt
+      );
+    },
+    clock: () => NOW,
+    wait: async () => undefined
+  });
+
+  assert.deepEqual(result, {
+    saved: 0,
+    skipped: 0,
+    failed: 1,
+    deferred: 1,
+    retryAt
+  });
+  assert.equal(encodeCount, 1);
+
+  const fallback = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata: metadata.slice(0, 1),
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => undefined
+    },
+    encode: async () => {
+      throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.HTTP_STATUS, 429);
+    },
+    clock: () => NOW
+  });
+  assert.equal(fallback.retryAt, NOW + THUMBNAIL_RATE_LIMIT_FALLBACK_MS);
+});
+
+test("thumbnail capture defers remaining work at its time and attempt limits", async () => {
+  const metadata = Array.from({ length: 5 }, (_, index) => ({
+    id: `wrld_20000000-0000-4000-8000-00000000000${index}`,
+    name: `World ${index}`,
+    authorName: "作者",
+    favoriteGroup: "worlds1",
+    releaseStatus: /** @type {const} */ ("public"),
+    thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_20000000-0000-4000-8000-00000000000${index}/1/256`
+  }));
+  let now = 0;
+  let saved = 0;
+  /** @type {number[]} */
+  const encoderTimeouts = [];
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata,
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => {
+        saved += 1;
+      }
+    },
+    encode: async (sourceUrl, options) => {
+      encoderTimeouts.push(options.timeoutMs);
+      assert.equal(options.signal.aborted, false);
+      now += 11;
+      return {
+        bytes: new Uint8Array([1]),
+        contentType: "image/webp",
+        width: 1,
+        height: 1,
+        sourceUrl
+      };
+    },
+    wait: async (delayMs) => {
+      now += delayMs;
+    },
+    intervalMs: 10,
+    timeBudgetMs: 25,
+    maxAttempts: 4,
+    clock: () => now
+  });
+
+  assert.deepEqual(result, {
+    saved: 1,
+    skipped: 0,
+    failed: 0,
+    deferred: 4,
+    retryAt: null
+  });
+  assert.equal(saved, 1);
+  assert.deepEqual(encoderTimeouts, [25, 4]);
+
+  now = 0;
+  saved = 0;
+  const attemptLimited = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata,
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => {
+        saved += 1;
+      }
+    },
+    encode: async (sourceUrl) => ({
+      bytes: new Uint8Array([1]),
+      contentType: "image/webp",
+      width: 1,
+      height: 1,
+      sourceUrl
+    }),
+    intervalMs: 0,
+    maxAttempts: 2,
+    clock: () => now
+  });
+  assert.equal(attemptLimited.saved, 2);
+  assert.equal(attemptLimited.deferred, 3);
+  assert.equal(saved, 2);
+});
+
+test("thumbnail capture aborts a stalled encoder at the overall deadline", async () => {
+  /** @type {AbortSignal | null} */
+  let encoderSignal = null;
+  /** @type {number | null} */
+  let encoderTimeout = null;
+  const result = await captureAvailableWorldThumbnails({
+    userId: USER_ID,
+    metadata: [{
+      id: WORLD_ID,
+      name: "停止する画像",
+      authorName: "作者",
+      favoriteGroup: "worlds1",
+      releaseStatus: "public",
+      thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"
+    }],
+    generation: 1,
+    capturedAt: "2026-08-24T00:00:00.000Z",
+    repository: {
+      listThumbnailMetadata: async () => [],
+      putThumbnail: async () => undefined
+    },
+    encode: async (_sourceUrl, options) => {
+      encoderSignal = options.signal;
+      encoderTimeout = options.timeoutMs;
+      return new Promise(() => {});
+    },
+    timeBudgetMs: 20
+  });
+
+  assert.deepEqual(result, {
+    saved: 0,
+    skipped: 0,
+    failed: 0,
+    deferred: 1,
+    retryAt: null
+  });
+  assert.equal(encoderTimeout, 20);
+  const capturedSignal = /** @type {AbortSignal | null} */ (
+    /** @type {unknown} */ (encoderSignal)
+  );
+  assert.equal(capturedSignal?.aborted, true);
+});
+
+test("303 and 800 thumbnails complete across bounded capture batches", async (context) => {
+  for (const worldCount of [303, 800]) {
+    await context.test(`${worldCount} worlds`, async () => {
+      const metadata = Array.from({ length: worldCount }, (_, index) => {
+        const suffix = index.toString(16).padStart(12, "0");
+        return {
+          id: `wrld_30000000-0000-4000-8000-${suffix}`,
+          name: `World ${index}`,
+          authorName: "作者",
+          favoriteGroup: "worlds1",
+          releaseStatus: /** @type {const} */ ("public"),
+          thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_30000000-0000-4000-8000-${suffix}/1/256`
+        };
+      });
+      /** @type {Map<string, Awaited<ReturnType<DatabaseRepository["listThumbnailMetadata"]>>[number]>} */
+      const stored = new Map();
+      let captureCount = 0;
+
+      while (stored.size < worldCount) {
+        captureCount += 1;
+        const result = await captureAvailableWorldThumbnails({
+          userId: USER_ID,
+          metadata,
+          generation: 1,
+          capturedAt: "2026-08-24T00:00:00.000Z",
+          repository: {
+            listThumbnailMetadata: async () => [...stored.values()],
+            putThumbnail: async (record) => {
+              stored.set(record.worldId, {
+                userId: record.userId,
+                worldId: record.worldId,
+                width: record.width,
+                height: record.height,
+                byteLength: record.byteLength,
+                capturedAt: record.capturedAt,
+                sourceUrl: record.sourceUrl
+              });
+            }
+          },
+          encode: async (sourceUrl) => ({
+            bytes: new Uint8Array([1]),
+            contentType: "image/webp",
+            width: 1,
+            height: 1,
+            sourceUrl
+          }),
+          intervalMs: 0,
+          clock: () => NOW
+        });
+        assert.ok(result.saved <= 100);
+        assert.equal(result.failed, 0);
+        assert.equal(result.retryAt, null);
+        assert.ok(captureCount <= Math.ceil(worldCount / 100));
+      }
+
+      assert.equal(stored.size, worldCount);
+      assert.equal(captureCount, Math.ceil(worldCount / 100));
+    });
+  }
+});
+
 /** @typedef {import("../extension/lib/api.js").VrchatApi} VrchatApi */
 /** @typedef {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} ApiPort */
 
@@ -79,6 +498,14 @@ class FakeApi {
   currentUserExtra = {};
   /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteGroups"]>> | null} */
   favoriteGroupsOverride = null;
+  /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteRelations"]>> | null} */
+  favoriteRelationsOverride = null;
+  /** @type {Awaited<ReturnType<VrchatApi["listAllFavoriteWorlds"]>> | null} */
+  favoriteWorldsOverride = null;
+  /** @type {200 | 404} */
+  probeStatus = 200;
+  /** @type {string | undefined} */
+  probeThumbnailImageUrl;
   /** @type {(() => Promise<void>) | null} */
   beforeUser = null;
 
@@ -116,6 +543,12 @@ class FakeApi {
   async listAllFavoriteRelations() {
     this.calls.push("relations");
     this.#throwAt("relations");
+    if (this.favoriteRelationsOverride !== null) {
+      return this.favoriteRelationsOverride.map((relation) => ({
+        ...relation,
+        tags: [...relation.tags]
+      }));
+    }
     return [{ favoriteId: WORLD_ID, tags: [...this.relationTags], type: "world" }];
   }
 
@@ -123,6 +556,9 @@ class FakeApi {
   async listAllFavoriteWorlds() {
     this.calls.push("metadata");
     this.#throwAt("metadata");
+    if (this.favoriteWorldsOverride !== null) {
+      return this.favoriteWorldsOverride.map((world) => ({ ...world }));
+    }
     return [{
       id: WORLD_ID,
       name: this.worldName,
@@ -136,13 +572,19 @@ class FakeApi {
   async getWorld(worldId) {
     this.calls.push(`probe:${worldId}`);
     this.#throwAt("probe");
+    if (this.probeStatus === 404) {
+      return { status: 404, world: null };
+    }
     return {
       status: 200,
       world: {
         id: worldId,
         name: this.worldName,
         authorName: "作者",
-        releaseStatus: "public"
+        releaseStatus: "public",
+        ...(this.probeThumbnailImageUrl === undefined ? {} : {
+          thumbnailImageUrl: this.probeThumbnailImageUrl
+        })
       }
     };
   }
@@ -157,6 +599,9 @@ class FakeApi {
 
 class FakeAlarms {
   /** @type {number | null} */
+  thumbnailAt = null;
+  failThumbnailCreate = false;
+  /** @type {number | null} */
   scheduledAt = null;
   /** @type {{name: string, when: number}[]} */
   creates = [];
@@ -168,12 +613,17 @@ class FakeAlarms {
 
   /** @param {string} name */
   async get(name) {
+    if (name === "thumbnail-next") return this.thumbnailAt === null ? undefined : {scheduledTime: this.thumbnailAt};
     assert.equal(name, SYNC_ALARM_NAME);
     return this.scheduledAt === null ? undefined : { scheduledTime: this.scheduledAt };
   }
 
   /** @param {string} name @param {number} when */
   async create(name, when) {
+    if (name === "thumbnail-next") {
+      if (this.failThumbnailCreate) throw new Error("synthetic image alarm failure");
+      this.thumbnailAt = when; return;
+    }
     this.createAttempts += 1;
     if (this.createAttempts === this.failCreateAttempt) {
       throw new Error("simulated alarm create failure");
@@ -184,6 +634,7 @@ class FakeAlarms {
 
   /** @param {string} name */
   async clear(name) {
+    if (name === "thumbnail-next") { this.thumbnailAt = null; return true; }
     assert.equal(name, SYNC_ALARM_NAME);
     if (this.failClear) {
       throw new Error("simulated alarm clear failure");
@@ -234,7 +685,15 @@ async function createRepository() {
  *   alarms?: FakeAlarms,
  *   notifications?: FakeNotifications,
  *   now?: {value: number},
- *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>
+ *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>,
+ *   encodeThumbnail?: (sourceUrl: string) => Promise<{
+ *     bytes: Uint8Array,
+ *     contentType: "image/webp",
+ *     width: number,
+ *     height: number,
+ *     sourceUrl: string
+ *   }>,
+ *   thumbnailWait?: (delayMs: number) => Promise<void>
  * }} input
  */
 function createService(input) {
@@ -251,10 +710,241 @@ function createService(input) {
     idGenerator: () => `test-${++syncSequence}`,
     ...(input.withApiSession === undefined
       ? {}
-      : { withApiSession: input.withApiSession })
+      : { withApiSession: input.withApiSession }),
+    ...(input.encodeThumbnail === undefined
+      ? {}
+      : { encodeThumbnail: input.encodeThumbnail }),
+    ...(input.thumbnailWait === undefined
+      ? {}
+      : { thumbnailWait: input.thumbnailWait })
   });
   return { service, alarms, notifications, time };
 }
+
+test("successful sync stores local thumbnails and later image failures retain them", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const firstUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  const changedUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/2/256";
+  api.favoriteWorldsOverride = [{
+    id: WORLD_ID,
+    name: "画像を残すワールド",
+    authorName: "作者",
+    favoriteGroup: "worlds1",
+    releaseStatus: "public",
+    thumbnailImageUrl: firstUrl
+  }];
+  /** @type {string[]} */
+  const encodedUrls = [];
+  /** @type {string[]} */
+  const phases = [];
+  let failEncoding = false;
+  const { service } = createService({
+    repository,
+    api,
+    withApiSession: async (operation) => {
+      phases.push("session-start");
+      const result = await operation();
+      phases.push("session-cleaned");
+      return result;
+    },
+    encodeThumbnail: async (sourceUrl) => {
+      assert.equal(phases.at(-1), "session-cleaned");
+      encodedUrls.push(sourceUrl);
+      if (failEncoding) {
+        throw new ThumbnailError("FETCH_FAILED");
+      }
+      return {
+        bytes: new Uint8Array([1, 2, 3]),
+        contentType: "image/webp",
+        width: 320,
+        height: 180,
+        sourceUrl
+      };
+    },
+    thumbnailWait: async () => undefined
+  });
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  const stored = await repository.getThumbnail(USER_ID, WORLD_ID);
+  assert.equal(stored?.sourceUrl, firstUrl);
+  assert.equal(stored?.blob.type, "image/webp");
+  assert.deepEqual(encodedUrls, [firstUrl]);
+  assert.deepEqual(phases, ["session-start", "session-cleaned"]);
+  assert.deepEqual(await repository.getSetting(SETTING_KEYS.thumbnailCaptureStatus), {
+    userId: USER_ID,
+    capturedAt: new Date(NOW).toISOString(),
+    saved: 1,
+    skipped: 0,
+    failed: 0,
+    deferred: 0,
+    retryAt: null
+  });
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.deepEqual(encodedUrls, [firstUrl]);
+
+  const currentMetadata = api.favoriteWorldsOverride[0];
+  assert.ok(currentMetadata !== undefined);
+  api.favoriteWorldsOverride[0] = {
+    ...currentMetadata,
+    thumbnailImageUrl: changedUrl
+  };
+  failEncoding = true;
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.deepEqual(encodedUrls, [firstUrl, changedUrl]);
+  assert.equal((await repository.getThumbnail(USER_ID, WORLD_ID))?.sourceUrl, firstUrl);
+  assert.deepEqual(await repository.getSetting(SETTING_KEYS.thumbnailCaptureStatus), {
+    userId: USER_ID,
+    capturedAt: new Date(NOW).toISOString(),
+    saved: 0,
+    skipped: 0,
+    failed: 1,
+    deferred: 0,
+    retryAt: null
+  });
+});
+
+test("old accessible worlds outside favorites acquire images through spare probes", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await service.start("alarm");
+  api.favoriteRelationsOverride = [];
+  api.favoriteWorldsOverride = [];
+  await service.start("alarm");
+  await service.start("alarm");
+  assert.equal((await repository.listWorlds(USER_ID))[0]?.membershipState, "not_in_favorites");
+  api.probeThumbnailImageUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  const imageService = createService({
+    repository,
+    api,
+    encodeThumbnail: async (sourceUrl) => ({
+      bytes: new Uint8Array([1, 2, 3]), contentType: "image/webp",
+      width: 1, height: 1, sourceUrl
+    })
+  }).service;
+  assert.deepEqual(await imageService.start("alarm"), { ok: true, changes: 0 });
+  assert.equal((await repository.getThumbnail(USER_ID, WORLD_ID))?.sourceUrl, api.probeThumbnailImageUrl);
+  const probeCount = api.calls.filter((call) => call.startsWith("probe:")).length;
+  await imageService.start("alarm");
+  assert.equal(api.calls.filter((call) => call.startsWith("probe:")).length, probeCount);
+});
+
+test("thumbnail progress resumes past permanent failures across service restarts", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  api.favoriteWorldsOverride = Array.from({ length: 101 }, (_, index) => ({
+    id: `wrld_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+    name: "画像取得の継続テスト", authorName: "作者", favoriteGroup: "worlds1",
+    releaseStatus: /** @type {const} */ ("public"),
+    thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}/1/256`
+  }));
+  api.favoriteRelationsOverride = api.favoriteWorldsOverride.map((world) => ({
+    favoriteId: world.id, tags: ["worlds1"], type: "world"
+  }));
+  const lastWorld = api.favoriteWorldsOverride.at(-1);
+  assert.ok(lastWorld !== undefined);
+  /** @type {string[]} */
+  const attempts = [];
+  /** @param {string} sourceUrl */
+  const encodeThumbnail = async (sourceUrl) => {
+    attempts.push(sourceUrl);
+    if (sourceUrl !== lastWorld.thumbnailImageUrl) {
+      throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.HTTP_STATUS, 404);
+    }
+    return {
+      bytes: new Uint8Array([1, 2, 3]), contentType: /** @type {const} */ ("image/webp"),
+      width: 1, height: 1, sourceUrl
+    };
+  };
+  const dependencies = { repository, api, encodeThumbnail, thumbnailWait: async () => undefined };
+  assert.deepEqual(await createService(dependencies).service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal(attempts.length, 100);
+  assert.equal(await repository.getThumbnail(USER_ID, lastWorld.id), null);
+  assert.deepEqual(await createService(dependencies).service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal(attempts[100], lastWorld.thumbnailImageUrl);
+  assert.equal((await repository.getThumbnail(USER_ID, lastWorld.id))?.sourceUrl, lastWorld.thumbnailImageUrl);
+});
+
+test("thumbnail store errors are reported without rolling back world history", async () => {
+  const repository = await createRepository();
+  const { service } = createService({ repository, api: new FakeApi() });
+  repository.listThumbnailMetadata = async () => { throw new Error("synthetic image store error"); };
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal((await repository.listWorlds(USER_ID)).length, 1);
+  const status = await repository.getSetting(SETTING_KEYS.thumbnailCaptureStatus);
+  assert.ok(typeof status === "object" && status !== null && "failed" in status);
+  assert.equal(status.failed, 1);
+});
+
+test("thumbnail 429 persists Retry-After and prevents more VRChat requests until it expires", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const sourceUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  api.favoriteWorldsOverride = [{
+    id: WORLD_ID,
+    name: "画像待機中でも同期するワールド",
+    authorName: "作者",
+    favoriteGroup: "worlds1",
+    releaseStatus: "public",
+    thumbnailImageUrl: sourceUrl
+  }];
+  const now = { value: NOW };
+  const retryAt = NOW + 120_000;
+  let encodeCount = 0;
+  let rateLimited = true;
+  const { service } = createService({
+    repository,
+    api,
+    now,
+    encodeThumbnail: async (url) => {
+      encodeCount += 1;
+      if (rateLimited) {
+        throw new ThumbnailFetchError(
+          THUMBNAIL_ERROR_CODES.HTTP_STATUS,
+          429,
+          retryAt
+        );
+      }
+      return {
+        bytes: new Uint8Array([1, 2, 3]),
+        contentType: "image/webp",
+        width: 320,
+        height: 180,
+        sourceUrl: url
+      };
+    },
+    thumbnailWait: async () => undefined
+  });
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal(encodeCount, 1);
+  assert.equal(
+    await repository.getSetting(SETTING_KEYS.thumbnailBackoffUntil),
+    retryAt
+  );
+  assert.equal(await repository.getSetting(SETTING_KEYS.backoffUntil), retryAt);
+
+  const apiCallCount = api.calls.length;
+  assert.deepEqual(await service.start("alarm"), {
+    ok: false,
+    error: "RATE_LIMITED",
+    retryAt: new Date(retryAt).toISOString()
+  });
+  assert.equal(encodeCount, 1);
+  assert.equal(api.calls.length, apiCallCount);
+
+  rateLimited = false;
+  now.value = retryAt + 1;
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal(encodeCount, 2);
+  assert.equal(
+    await repository.getSetting(SETTING_KEYS.thumbnailBackoffUntil),
+    null
+  );
+  assert.equal((await repository.getThumbnail(USER_ID, WORLD_ID))?.sourceUrl, sourceUrl);
+});
 
 test("successful snapshots commit with revisions and claim before one notification attempt", async () => {
   const repository = await createRepository();
@@ -293,6 +983,37 @@ test("successful snapshots commit with revisions and claim before one notificati
   assert.equal(await repository.getSetting(SETTING_KEYS.favoriteGroupStatus), "success");
   assert.equal((await repository.listFavoriteGroups(USER_ID))[0]?.displayName, "いつもの場所");
   assert.equal(await repository.getUnreadCount(USER_ID), 1);
+});
+
+test("confirmed disappearance is the notification headline and counts one world once", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const notifications = new FakeNotifications();
+  const { service } = createService({ repository, api, notifications });
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  api.favoriteRelationsOverride = [];
+  api.favoriteWorldsOverride = [];
+  api.probeStatus = 404;
+
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 0 });
+  assert.equal(notifications.created.length, 0);
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 2 });
+
+  assert.equal(notifications.created.length, 1);
+  const notification = notifications.created[0];
+  assert.ok(notification?.id.startsWith(ATTENTION_NOTIFICATION_ID_PREFIX));
+  assert.equal(notification?.options.title, "現在アクセスできないワールドがあります");
+  assert.equal(
+    notification?.options.message,
+    "要確認: 1件（現在アクセス不可1件・お気に入り一覧にない1件）。"
+  );
+  assert.equal(notification?.options.buttons?.[0]?.title, "保存済みの情報を見る");
+
+  const status = await service.getStatus();
+  assert.equal(status.attentionWorldCount, 1);
+  assert.equal(status.missingCount, 1);
+  assert.equal(status.unavailableCount, 1);
 });
 
 test("sync never persists extra CurrentUser fields", async () => {
@@ -511,6 +1232,9 @@ test("status exposes pending probes and durable unread history, then marks it re
   const status = await service.getStatus();
   assert.equal(status.unreadCount, 1);
   assert.equal(status.pendingProbeCount, 0);
+  assert.equal(status.attentionWorldCount, 0);
+  assert.equal(status.missingCount, 0);
+  assert.equal(status.unavailableCount, 0);
   assert.equal(status.favoriteGroupStatus, "success");
   assert.equal(await service.markHistoryRead(), true);
   assert.equal((await service.getStatus()).unreadCount, 0);
@@ -1508,6 +2232,8 @@ test("durable settings and read markers stay successful when badge refresh rejec
   const handler = createMessageHandler({
     service: {
       getStatus: async () => ({
+        thumbnailProgress: null,
+        thumbnailSavedCount: 0,
         syncing: false,
         authRequired: false,
         lastSuccessfulSyncAt: null,
@@ -1516,6 +2242,9 @@ test("durable settings and read markers stay successful when badge refresh rejec
         worldCount: 0,
         eventCount: 0,
         pendingProbeCount: 0,
+        attentionWorldCount: 0,
+        missingCount: 0,
+        unavailableCount: 0,
         unreadCount: 0,
         favoriteGroupStatus: null,
         lastResult: null
@@ -1587,3 +2316,308 @@ function bindRepositoryWithOverrides(repository, overrides) {
     }
   });
 }
+
+test("one manual sync automatically completes 303 and 800 images across restarted workers without metadata refetch", async (context) => {
+  for (const count of [303, 800]) {
+    await context.test(`${count} images`, async () => {
+      const repository = await createRepository();
+      const api = new FakeApi();
+      const now = {value: NOW};
+      const alarms = new FakeAlarms();
+      api.favoriteWorldsOverride = Array.from({length: count}, (_, index) => ({
+        id: `wrld_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+        name: "画像", authorName: "作者", favoriteGroup: "worlds1",
+        releaseStatus: /** @type {const} */ ("public"),
+        thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}/1/256`
+      }));
+      api.favoriteRelationsOverride = api.favoriteWorldsOverride.map((world) => ({favoriteId: world.id, tags: ["worlds1"], type: "world"}));
+      const attempts = new Set();
+      const deps = {repository, api, now, alarms, thumbnailWait: async () => undefined,
+        /** @param {string} sourceUrl */
+        encodeThumbnail: async (sourceUrl) => {
+          assert.equal(attempts.has(sourceUrl), false, "saved source is never fetched twice");
+          attempts.add(sourceUrl);
+          return {bytes: new Uint8Array([1]), contentType: /** @type {const} */ ("image/webp"), width: 1, height: 1, sourceUrl};
+        }};
+      await repository.setSetting(SETTING_KEYS.autoSyncEnabled, false);
+      let service = createService(deps).service;
+      assert.equal((await service.start("manual")).ok, true);
+      assert.equal(attempts.size, 100);
+      const calls = api.calls.length;
+      for (let batch = 0; batch < 9 && alarms.thumbnailAt !== null; batch += 1) {
+        service = createService(deps).service;
+        await service.repairThumbnailSchedule();
+        assert.ok(alarms.thumbnailAt !== null);
+        now.value = alarms.thumbnailAt;
+        assert.deepEqual(await service.start("thumbnail"), {ok: true});
+        assert.equal(api.calls.length, calls);
+      }
+      assert.equal(attempts.size, count);
+      assert.equal(alarms.thumbnailAt, null);
+      assert.deepEqual((await service.getStatus()).thumbnailProgress, {
+        total: count, saved: count, remaining: 0, failed: 0, nextAttemptAt: null, state: "complete"
+      });
+    });
+  }
+});
+
+test("thumbnail continuation honors Retry-After and terminates permanent failures after three attempts", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  let attempts = 0;
+  const {service} = createService({repository, api, now, alarms, encodeThumbnail: async () => {
+    attempts += 1;
+    throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.HTTP_STATUS, attempts === 1 ? 429 : 404, attempts === 1 ? NOW + 120_000 : null);
+  }});
+  await service.start("manual");
+  assert.equal(attempts, 1);
+  const metadataCalls = api.calls.length;
+  now.value += 60_000;
+  await service.start("thumbnail");
+  assert.equal(attempts, 1);
+  now.value += 60_000;
+  await service.start("thumbnail");
+  assert.equal(attempts, 2);
+  now.value += 60_000;
+  await service.start("thumbnail");
+  assert.equal(attempts, 3);
+  assert.equal(alarms.thumbnailAt, null);
+  await service.start("thumbnail");
+  assert.equal(attempts, 3);
+  assert.equal(api.calls.length, metadataCalls);
+  assert.deepEqual((await service.getStatus()).thumbnailProgress, {
+    total: 1, saved: 0, remaining: 0, failed: 1, nextAttemptAt: null, state: "partial"
+  });
+});
+
+test("thumbnail alarms bypass periodic-sync preference and repair after gated failure", async () => {
+  let repaired = 0;
+  let gateChecks = 0;
+  const service = {
+    prepareAutomaticSync: async () => {gateChecks += 1; return false;},
+    resolveAlarmTrigger: async () => /** @type {const} */ ("alarm"),
+    rearmWatchdogForActiveSync: async () => false,
+    repairScheduleBestEffort: async () => {},
+    repairThumbnailScheduleBestEffort: async () => {repaired += 1;}
+  };
+  /** @type {string[]} */
+  const triggers = [];
+  const handler = createAlarmEventHandler({getService: async () => service,
+    getRunner: async () => async (trigger) => {triggers.push(trigger); return {ok: false, error: "SECURITY_RULE_UNAVAILABLE"};}});
+  await handler({name: "thumbnail-next", scheduledTime: NOW});
+  assert.deepEqual(triggers, ["thumbnail"]);
+  assert.equal(gateChecks, 0);
+  assert.equal(repaired, 1);
+});
+
+test("manual request during an active image batch runs a full sync afterward", async () => {
+  /** @type {(() => void) | undefined} */
+  let finish;
+  const pending = new Promise((resolve) => {finish = () => resolve(undefined);});
+  /** @type {string[]} */
+  const triggers = [];
+  const runner = createGatedSyncRunner({ensureUserAgentRule: async () => {},
+    startSync: async (trigger) => {triggers.push(trigger); if (trigger === "thumbnail") await pending; return {ok: true};},
+    keepAlive: async (operation) => operation});
+  const imageRun = runner("thumbnail");
+  const manualRun = runner("manual");
+  finish?.();
+  await Promise.all([imageRun, manualRun]);
+  assert.deepEqual(triggers, ["thumbnail", "manual"]);
+});
+
+test("failed image alarm reservation is visible and startup repair resumes without another sync", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  alarms.failThumbnailCreate = true;
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  let attempts = 0;
+  const {service} = createService({repository, api, now, alarms, encodeThumbnail: async (sourceUrl) => {
+    attempts += 1;
+    return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+  }});
+  assert.equal((await service.start("manual")).ok, true);
+  assert.equal(attempts, 0);
+  assert.equal((await service.getStatus()).thumbnailProgress?.state, "paused");
+  const calls = api.calls.length;
+  alarms.failThumbnailCreate = false;
+  await service.repairThumbnailScheduleBestEffort();
+  assert.ok(alarms.thumbnailAt !== null);
+  now.value = alarms.thumbnailAt;
+  await service.start("thumbnail");
+  assert.equal(attempts, 1);
+  assert.equal(api.calls.length, calls);
+  assert.equal((await service.getStatus()).thumbnailProgress?.state, "complete");
+});
+
+test("restored generations, switched profiles, and purge suppress persisted image jobs", async (context) => {
+  for (const mode of ["restore", "profile", "purge"]) {
+    await context.test(mode, async () => {
+      const repository = await createRepository();
+      const api = new FakeApi();
+      const now = {value: NOW};
+      const alarms = new FakeAlarms();
+      api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+        thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+      let attempts = 0;
+      const {service} = createService({repository, api, now, alarms, encodeThumbnail: async () => {
+        attempts += 1;
+        throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.HTTP_STATUS, 404);
+      }});
+      await service.start("manual");
+      assert.equal(attempts, 1);
+      if (mode === "purge") await repository.beginPurge();
+      if (mode === "profile") await repository.setSetting(SETTING_KEYS.activeProfileId, "usr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+      if (mode === "restore") {
+        const profile = await repository.getProfile(USER_ID);
+        assert.ok(profile !== null);
+        await repository.replaceProfileData({profile, worlds: await repository.listWorlds(USER_ID), favoriteGroups: [], events: []});
+      }
+      now.value += 60_000;
+      await service.start("thumbnail");
+      assert.equal(attempts, 1);
+      assert.equal(alarms.thumbnailAt, null);
+      assert.equal((await service.getStatus()).thumbnailProgress, null);
+    });
+  }
+});
+
+test("thumbnail checkpoint deadline prevents network requests after slow or stalled checkpoints", async (context) => {
+  for (const mode of ["slow", "stalled"]) {
+    await context.test(mode, async () => {
+      let now = NOW;
+      let encodes = 0;
+      const result = await captureAvailableWorldThumbnails({userId: USER_ID, generation: 1,
+        capturedAt: new Date(NOW).toISOString(), timeBudgetMs: 20, clock: () => now,
+        metadata: [{id: WORLD_ID, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}],
+        repository: {listThumbnailMetadata: async () => [], putThumbnail: async () => {}},
+        onAttempt: async () => {
+          if (mode === "slow") {now += 21; return;}
+          await new Promise(() => {});
+        },
+        encode: async (sourceUrl) => {
+          encodes += 1;
+          return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+        }
+      });
+      assert.equal(encodes, 0);
+      assert.equal(result.deferred, 1);
+      assert.equal(result.saved, 0);
+    });
+  }
+});
+
+test("image metadata read failure does not hide successful world sync status", async () => {
+  const repository = await createRepository();
+  const {service} = createService({repository, api: new FakeApi()});
+  await service.start("manual");
+  repository.listThumbnailMetadata = async () => {throw new Error("synthetic image-only failure");};
+  const status = await service.getStatus();
+  assert.equal(status.worldCount, 1);
+  assert.equal(status.lastSuccessfulSyncAt, new Date(NOW).toISOString());
+  assert.equal(status.thumbnailProgress, null);
+  assert.equal(status.thumbnailSavedCount, null);
+});
+
+test("saved image count remains available without an image job after upgrade", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  const {service} = createService({repository, api, thumbnailWait: async () => undefined,
+    encodeThumbnail: async (sourceUrl) => ({bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl})});
+  assert.equal((await service.start("manual")).ok, true);
+  assert.equal((await service.getStatus()).thumbnailSavedCount, 1);
+  await repository.setSetting(SETTING_KEYS.thumbnailJob, null);
+  const status = await service.getStatus();
+  assert.equal(status.thumbnailProgress, null);
+  assert.equal(status.thumbnailSavedCount, 1);
+  assert.equal(status.worldCount, 1);
+});
+
+test("a transient initial image job write failure is retried before image network access", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  const original = repository.setThumbnailSettings.bind(repository);
+  let writes = 0;
+  repository.setThumbnailSettings = async (...args) => {
+    writes += 1;
+    if (writes === 1) throw new Error("synthetic one-time checkpoint failure");
+    return original(...args);
+  };
+  let encodes = 0;
+  const {service} = createService({repository, api, encodeThumbnail: async (sourceUrl) => {
+    assert.ok(writes >= 2);
+    assert.ok(await repository.getSetting(SETTING_KEYS.thumbnailJob));
+    encodes += 1;
+    return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+  }});
+  assert.equal((await service.start("manual")).ok, true);
+  assert.equal(encodes, 1);
+  assert.equal((await service.getStatus()).thumbnailProgress?.state, "complete");
+});
+
+test("image schedule repair and batches cannot overwrite each other's durable attempts", async (context) => {
+  for (const failRepair of [false, true]) {
+    await context.test(failRepair ? "failed repair recovery" : "successful repair", async () => {
+      const repository = await createRepository();
+      const api = new FakeApi();
+      const now = {value: NOW};
+      const alarms = new FakeAlarms();
+      api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+        thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+      let attempts = 0;
+      const {service} = createService({repository, api, now, alarms, encodeThumbnail: async () => {
+        attempts += 1;
+        throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.HTTP_STATUS, 404);
+      }});
+      await service.start("manual");
+      assert.equal(attempts, 1);
+      now.value += 60_000;
+      /** @type {(() => void) | undefined} */
+      let release;
+      /** @type {(() => void) | undefined} */
+      let entered;
+      const blocked = new Promise((resolve) => {release = () => resolve(undefined);});
+      const created = new Promise((resolve) => {entered = () => resolve(undefined);});
+      const originalCreate = alarms.create.bind(alarms);
+      let pauseNext = true;
+      alarms.create = async (name, when) => {
+        if (name === "thumbnail-next" && pauseNext) {
+          pauseNext = false;
+          entered?.();
+          await blocked;
+          if (failRepair) throw new Error("synthetic delayed repair failure");
+        }
+        return originalCreate(name, when);
+      };
+      const repair = service.repairThumbnailScheduleBestEffort();
+      await created;
+      const batch = service.start("thumbnail");
+      assert.equal(attempts, 1, "batch waits for repair checkpoint including its failure handler");
+      now.value += 60_000;
+      release?.();
+      await Promise.all([repair, batch]);
+      assert.equal(attempts, 2);
+      const job = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting(SETTING_KEYS.thumbnailJob));
+      assert.equal(job.items[0]?.attempts, 2);
+      assert.equal(job.state, "waiting");
+      assert.equal(job.nextAttemptAt, alarms.thumbnailAt);
+      now.value += 60_000;
+      await service.start("thumbnail");
+      assert.equal(attempts, 3);
+      await service.repairThumbnailScheduleBestEffort();
+      assert.equal((await service.getStatus()).thumbnailProgress?.state, "partial");
+      assert.equal(alarms.thumbnailAt, null);
+    });
+  }
+});

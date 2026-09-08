@@ -7,6 +7,7 @@ import {
   FavoriteGroupValidationError,
   MAX_FAVORITE_GROUP_NAME_HISTORY,
   createFavoriteGroupLabelMap,
+  createFavoriteGroupOptions,
   getFavoriteGroupLabel,
   reconcileFavoriteGroups,
 } from "../extension/lib/favorite-groups.js";
@@ -230,6 +231,132 @@ test("label helpers prefer active names and provide deterministic fallbacks", ()
     getFavoriteGroupLabel("custom-list", labels),
     "お気に入りリスト（custom-list）",
   );
+});
+
+test("favorite-group options fill four standard slots without VRC+ evidence", () => {
+  const inactiveHistoric = makeRecord(9, {
+    internalName: "archived-worlds",
+    displayName: "以前のリスト",
+    normalizedDisplayName: "以前のリスト",
+    active: false,
+    missingCount: 2,
+  });
+  const named = makeRecord(2, {
+    displayName: "また行きたい",
+    normalizedDisplayName: "また行きたい",
+  });
+  const options = createFavoriteGroupOptions(
+    [inactiveHistoric, named],
+    ["worlds4", "custom-tag"],
+  );
+
+  assert.deepEqual(options.map((option) => option.internalName), [
+    "worlds1",
+    "worlds2",
+    "worlds3",
+    "worlds4",
+    "archived-worlds",
+    "custom-tag",
+  ]);
+  assert.deepEqual(options.slice(0, 4).map((option) => option.listNumber), [1, 2, 3, 4]);
+  assert.deepEqual(options[0], {
+    internalName: "worlds1",
+    displayName: null,
+    active: null,
+    listNumber: 1,
+    source: "unused-slot",
+  });
+  assert.deepEqual(options[1], {
+    internalName: "worlds2",
+    displayName: "また行きたい",
+    active: true,
+    listNumber: 2,
+    source: "record",
+  });
+  assert.equal(options[3]?.source, "recorded-tag");
+  assert.deepEqual(options[4], {
+    internalName: "archived-worlds",
+    displayName: "以前のリスト",
+    active: false,
+    listNumber: null,
+    source: "record",
+  });
+  assert.equal(options[5]?.source, "recorded-tag");
+});
+
+test("a known VRC+ record fills all eight numbered slots in fixed order", () => {
+  const plusRecord = makeRecord(7, {
+    internalName: "vrcPlusWorlds3",
+    displayName: "VRC+ の思い出",
+    normalizedDisplayName: "vrc+ の思い出",
+    active: false,
+    missingCount: 2,
+  });
+  const options = createFavoriteGroupOptions([plusRecord], []);
+
+  assert.deepEqual(options.map((option) => option.internalName), [
+    "worlds1",
+    "worlds2",
+    "worlds3",
+    "worlds4",
+    "vrcPlusWorlds1",
+    "vrcPlusWorlds2",
+    "vrcPlusWorlds3",
+    "vrcPlusWorlds4",
+  ]);
+  assert.deepEqual(options.map((option) => option.listNumber), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(options[6]?.displayName, "VRC+ の思い出");
+  assert.equal(options[6]?.active, false);
+  assert.equal(options[6]?.source, "record");
+});
+
+test("a recorded VRC+ tag is sufficient evidence but unknown plus names are not", () => {
+  const confirmed = createFavoriteGroupOptions([], ["vrcPlusWorlds1"]);
+  assert.equal(confirmed.length, 8);
+  assert.equal(confirmed[4]?.source, "recorded-tag");
+
+  const unconfirmed = createFavoriteGroupOptions([
+    makeRecord(9, {
+      internalName: "vrcPlusWorlds5",
+      type: "vrcPlusWorld",
+    }),
+  ], []);
+  assert.equal(unconfirmed.length, 5);
+  assert.deepEqual(unconfirmed.slice(0, 4).map((option) => option.internalName), [
+    "worlds1",
+    "worlds2",
+    "worlds3",
+    "worlds4",
+  ]);
+  assert.equal(unconfirmed[4]?.internalName, "vrcPlusWorlds5");
+});
+
+test("records take priority over tags and duplicate display names remain separate", () => {
+  const first = makeRecord(1, {
+    displayName: "同じ名前",
+    normalizedDisplayName: "同じ名前",
+    active: false,
+    missingCount: 2,
+  });
+  const second = makeRecord(2, {
+    displayName: "同じ名前",
+    normalizedDisplayName: "同じ名前",
+  });
+  const options = createFavoriteGroupOptions(
+    [first, second],
+    ["worlds1", "worlds2", "unknown-tag"],
+  );
+
+  assert.equal(options[0]?.source, "record");
+  assert.equal(options[0]?.active, false);
+  assert.equal(options[1]?.source, "record");
+  assert.equal(options[1]?.active, true);
+  assert.deepEqual(
+    options.filter((option) => option.displayName === "同じ名前")
+      .map((option) => option.internalName),
+    ["worlds1", "worlds2"],
+  );
+  assert.equal(options.at(-1)?.internalName, "unknown-tag");
 });
 
 test("reconciliation rejects cross-user, malformed, and duplicate snapshots", () => {

@@ -16,6 +16,19 @@ const FAVORITE_GROUP_ID_PATTERN = /^fvgrp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 const USER_ID_PATTERN = /^usr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const WORLD_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
 const MAX_TEXT_CODE_POINTS = 4_096;
+const STANDARD_WORLD_GROUP_NAMES = Object.freeze([
+  "worlds1",
+  "worlds2",
+  "worlds3",
+  "worlds4",
+]);
+const VRC_PLUS_WORLD_GROUP_NAMES = Object.freeze([
+  "vrcPlusWorlds1",
+  "vrcPlusWorlds2",
+  "vrcPlusWorlds3",
+  "vrcPlusWorlds4",
+]);
+const VRC_PLUS_WORLD_GROUP_NAME_SET = new Set(VRC_PLUS_WORLD_GROUP_NAMES);
 
 /** @typedef {'world' | 'vrcPlusWorld'} FavoriteGroupType */
 
@@ -48,6 +61,15 @@ const MAX_TEXT_CODE_POINTS = 4_096;
  * @property {string} lastSeenAt
  * @property {FavoriteGroupNameHistoryEntry[]} displayNameHistory
  * @property {string} updatedAt
+ */
+
+/**
+ * @typedef {object} FavoriteGroupOption
+ * @property {string} internalName
+ * @property {string | null} displayName
+ * @property {boolean | null} active
+ * @property {number | null} listNumber
+ * @property {"record" | "recorded-tag" | "unused-slot"} source
  */
 
 /**
@@ -234,6 +256,102 @@ export function getFavoriteGroupLabel(internalName, labels) {
   return numberedPlusWorldGroup === null
     ? `お気に入りリスト（${normalizedInternalName}）`
     : `リスト${Number(numberedPlusWorldGroup[1]) + 4}（${normalizedInternalName}）`;
+}
+
+/**
+ * Build the favorite-list choices independently of whether VRChat returns its
+ * empty, unused group slots. Standard accounts always receive the four known
+ * world slots. The four VRC+ slots are added only when a saved group record or
+ * a recorded world tag proves that the profile has used one of them.
+ *
+ * A saved record takes precedence over a recorded tag so its display name and
+ * active state remain available. Unknown and historic internal names follow
+ * the numbered slots in deterministic internal-name order.
+ *
+ * @param {readonly FavoriteGroupRecord[]} groups
+ * @param {readonly string[]} recordedTags
+ * @returns {FavoriteGroupOption[]}
+ */
+export function createFavoriteGroupOptions(groups, recordedTags) {
+  /** @type {Map<string, FavoriteGroupRecord>} */
+  const preferredRecordByInternalName = new Map();
+  for (const group of groups) {
+    const current = preferredRecordByInternalName.get(group.internalName);
+    if (current === undefined || compareLabelCandidates(group, current) < 0) {
+      preferredRecordByInternalName.set(group.internalName, group);
+    }
+  }
+
+  const tagNames = new Set(recordedTags.map((tag) => assertText(tag, "recorded tag")));
+  const hasVrcPlusGroups = [...preferredRecordByInternalName.keys()].some(
+    (internalName) => VRC_PLUS_WORLD_GROUP_NAME_SET.has(internalName),
+  ) || [...tagNames].some(
+    (internalName) => VRC_PLUS_WORLD_GROUP_NAME_SET.has(internalName),
+  );
+  const numberedInternalNames = hasVrcPlusGroups
+    ? [...STANDARD_WORLD_GROUP_NAMES, ...VRC_PLUS_WORLD_GROUP_NAMES]
+    : [...STANDARD_WORLD_GROUP_NAMES];
+  const numberedInternalNameSet = new Set(numberedInternalNames);
+
+  /** @type {FavoriteGroupOption[]} */
+  const options = numberedInternalNames.map((internalName, index) => createGroupOption(
+    internalName,
+    index + 1,
+    preferredRecordByInternalName.get(internalName),
+    tagNames.has(internalName),
+  ));
+
+  const extraInternalNames = new Set([
+    ...preferredRecordByInternalName.keys(),
+    ...tagNames,
+  ]);
+  for (const internalName of numberedInternalNameSet) {
+    extraInternalNames.delete(internalName);
+  }
+  for (const internalName of [...extraInternalNames].sort(compareText)) {
+    options.push(createGroupOption(
+      internalName,
+      null,
+      preferredRecordByInternalName.get(internalName),
+      tagNames.has(internalName),
+    ));
+  }
+  return options;
+}
+
+/**
+ * @param {string} internalName
+ * @param {number | null} listNumber
+ * @param {FavoriteGroupRecord | undefined} record
+ * @param {boolean} hasRecordedTag
+ * @returns {FavoriteGroupOption}
+ */
+function createGroupOption(internalName, listNumber, record, hasRecordedTag) {
+  if (record !== undefined) {
+    return {
+      internalName,
+      displayName: record.displayName,
+      active: record.active,
+      listNumber,
+      source: "record",
+    };
+  }
+  if (hasRecordedTag) {
+    return {
+      internalName,
+      displayName: null,
+      active: null,
+      listNumber,
+      source: "recorded-tag",
+    };
+  }
+  return {
+    internalName,
+    displayName: null,
+    active: null,
+    listNumber,
+    source: "unused-slot",
+  };
 }
 
 /**

@@ -2,6 +2,7 @@
 
 import {
   ApiSchemaError,
+  isAllowedVrchatImageUrl,
   AuthRequiredError,
   ForbiddenError,
   NetworkError,
@@ -25,6 +26,11 @@ import {
   RevisionConflictError
 } from "./database.js";
 import {
+  ThumbnailError,
+  ThumbnailFetchError,
+  fetchAndEncodeThumbnail
+} from "./thumbnail.js";
+import {
   MAX_PROBE_CANDIDATES,
   SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS,
   reconcileWorlds,
@@ -40,12 +46,20 @@ import {
   repairStartupSchedule
 } from "./schedule.js";
 
+export const THUMBNAIL_ALARM_NAME = "thumbnail-next";
+export const THUMBNAIL_BATCH_DELAY_MS = 60_000;
 export const SYNC_ALARM_NAME = "sync-next";
 export const MANUAL_SYNC_COOLDOWN_MS = 5 * 60 * 1_000;
 export const SYNC_WATCHDOG_DELAY_MS = 10 * 60 * 1_000;
 export const NOTIFICATION_ID_PREFIX = "vrc-favworld-check-change-";
+export const ATTENTION_NOTIFICATION_ID_PREFIX = "vrc-favworld-check-attention-";
 export const SETTINGS_SCHEDULE_WARNING = "SCHEDULE_REPAIR_FAILED";
 export const NOTIFICATION_EVENT_KINDS = SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS;
+export const THUMBNAIL_CAPTURE_INTERVAL_MS = 250;
+export const THUMBNAIL_CAPTURE_TIME_BUDGET_MS = 30_000;
+export const THUMBNAIL_CAPTURE_MAX_ATTEMPTS = 100;
+export const THUMBNAIL_FETCH_TIMEOUT_MS = 5_000;
+export const THUMBNAIL_RATE_LIMIT_FALLBACK_MS = 30 * 60 * 1_000;
 
 export const SETTING_KEYS = Object.freeze({
   autoSyncEnabled: "autoSyncEnabled",
@@ -59,10 +73,14 @@ export const SETTING_KEYS = Object.freeze({
   favoriteGroupStatus: "favoriteGroupStatus",
   lastAlarmError: "lastAlarmError",
   watchdogUntil: "watchdogUntil",
-  purgePending: "purgePending"
+  purgePending: "purgePending",
+  thumbnailBackoffUntil: "thumbnailBackoffUntil",
+  thumbnailCaptureStatus: "thumbnailCaptureStatus",
+  thumbnailCaptureCursor: "thumbnailCaptureCursor",
+  thumbnailJob: "thumbnailJob"
 });
 
-/** @typedef {"manual" | "alarm" | "resume"} SyncTrigger */
+/** @typedef {"manual" | "alarm" | "resume" | "thumbnail"} SyncTrigger */
 /** @typedef {"success" | "429" | "offline" | "5xx" | "auth" | "schema" | "conflict" | "other"} ScheduleResult */
 /**
  * @typedef {{
@@ -79,9 +97,28 @@ export const SETTING_KEYS = Object.freeze({
  * @typedef {Pick<import("./database.js").DatabaseRepository,
  *   "getProfile" | "listProfiles" | "getProfileStats" |
  *   "getSyncSnapshot" | "getDataGeneration" | "getSetting" | "setSetting" |
- *   "setSettings" | "commitSync" | "recordSyncRun" | "claimEvents" |
- *   "updateNotificationResult" | "getUnreadCount" | "markEventsRead">} Repository
+ *   "setSettings" | "setThumbnailSettings" | "commitSync" | "recordSyncRun" | "claimEvents" |
+ *   "updateNotificationResult" | "getUnreadCount" | "markEventsRead"> &
+ *   Partial<Pick<import("./database.js").DatabaseRepository,
+ *   "listThumbnailMetadata" | "putThumbnail">>} Repository
  */
+
+/** @typedef {{total:number,saved:number,remaining:number,failed:number,nextAttemptAt:string|null,state:"running"|"waiting"|"complete"|"partial"|"paused"}} ThumbnailProgress */
+/** @typedef {{version:1,userId:string,generation:number,capturedAt:string,items:{id:string,thumbnailImageUrl:string,attempts:number}[],nextAttemptAt:number|null,state:ThumbnailProgress["state"]}} ThumbnailJob */
+/** @param {unknown} value @returns {value is ThumbnailJob} */
+function isThumbnailJob(value) {
+  if (typeof value !== "object" || value === null) return false;
+  const job = /** @type {Record<string, unknown>} */ (value);
+  return job.version === 1 && typeof job.userId === "string" && Number.isSafeInteger(job.generation)
+    && typeof job.capturedAt === "string" && Number.isFinite(Date.parse(job.capturedAt))
+    && (job.nextAttemptAt === null || isFiniteTimestamp(job.nextAttemptAt))
+    && ["running", "waiting", "complete", "partial", "paused"].includes(String(job.state))
+    && Array.isArray(job.items) && job.items.length <= 10_000
+    && job.items.every((item) => typeof item === "object" && item !== null
+      && typeof item.id === "string" && /^wrld_[a-f0-9-]{36}$/.test(item.id)
+      && typeof item.thumbnailImageUrl === "string" && isAllowedVrchatImageUrl(item.thumbnailImageUrl)
+      && Number.isSafeInteger(item.attempts) && item.attempts >= 0 && item.attempts <= 3);
+}
 
 /**
  * @typedef {object} AlarmAdapter
@@ -96,6 +133,326 @@ export const SETTING_KEYS = Object.freeze({
  * @property {(id: string, options: chrome.notifications.NotificationCreateOptions) => Promise<string>} create
  */
 
+/** @typedef {Awaited<ReturnType<Repository["claimEvents"]>>[number]} ClaimedNotificationEvent */
+/** @typedef {Awaited<ReturnType<VrchatApi["listAllFavoriteWorlds"]>>[number]} FavoriteWorldMetadata */
+/** @typedef {Awaited<ReturnType<typeof fetchAndEncodeThumbnail>>} EncodedThumbnail */
+/** @typedef {{timeoutMs: number, clock: () => number, signal: AbortSignal}} ThumbnailEncodeOptions */
+
+/**
+ * @typedef {object} NotificationPresentation
+ * @property {boolean} attention Whether the notification contains at least one confirmed attention event.
+ * @property {string} title Notification title that never contains world metadata.
+ * @property {string} message Notification message that contains counts only.
+ * @property {string} buttonTitle Label for the single fixed-destination notification button.
+ */
+
+/**
+ * Build count-only notification text from the claimed outbox batch. Confirmed
+ * missing and unavailable counts are independently de-duplicated by world ID;
+ * the headline attention count is the union of both sets.
+ *
+ * @param {readonly ClaimedNotificationEvent[]} events Claimed notification-eligible events.
+ * @returns {NotificationPresentation} Immutable-by-convention presentation values.
+ */
+export function createNotificationPresentation(events) {
+  const missingWorldIds = new Set();
+  const unavailableWorldIds = new Set();
+  let otherEventCount = 0;
+
+  for (const event of events) {
+    if (event.kind === "favorite_missing_confirmed") {
+      missingWorldIds.add(event.worldId);
+    } else if (event.kind === "access_unavailable_confirmed") {
+      unavailableWorldIds.add(event.worldId);
+    } else {
+      otherEventCount += 1;
+    }
+  }
+
+  const attentionWorldIds = new Set([...missingWorldIds, ...unavailableWorldIds]);
+  if (attentionWorldIds.size === 0) {
+    return {
+      attention: false,
+      title: "お気に入りワールドに変化があります",
+      message: `${events.length}件の変化を記録しました。履歴を確認してください。`,
+      buttonTitle: "履歴を見る"
+    };
+  }
+
+  const attentionSummary = unavailableWorldIds.size > 0
+    ? `要確認: ${attentionWorldIds.size}件（現在アクセス不可${unavailableWorldIds.size}件・お気に入り一覧にない${missingWorldIds.size}件）。`
+    : `要確認: ${attentionWorldIds.size}件（お気に入り一覧にない${missingWorldIds.size}件）。手動でお気に入り解除した場合も含まれます。`;
+  return {
+    attention: true,
+    title: unavailableWorldIds.size > 0
+      ? "現在アクセスできないワールドがあります"
+      : "お気に入り一覧にないワールドがあります",
+    message: otherEventCount === 0
+      ? attentionSummary
+      : `${attentionSummary}その他の変化: ${otherEventCount}件。`,
+    buttonTitle: "保存済みの情報を見る"
+  };
+}
+
+/**
+ * Save only thumbnails whose source version is not already present. Every
+ * failure is counted and retried on a later successful sync; the authoritative
+ * name/state transaction has already committed before this optional stage.
+ *
+ * @param {{
+ *   userId: string,
+ *   metadata: readonly (FavoriteWorldMetadata | import("./api.js").WorldMetadata | {id: string, thumbnailImageUrl?: string})[],
+ *   generation: number,
+ *   capturedAt: string,
+ *   repository: Pick<import("./database.js").DatabaseRepository, "listThumbnailMetadata" | "putThumbnail">,
+ *   encode?: (sourceUrl: string, options: ThumbnailEncodeOptions) => Promise<EncodedThumbnail>,
+ *   wait?: (delayMs: number) => Promise<void>,
+ *   intervalMs?: number,
+ *   clock?: () => number,
+ *   timeBudgetMs?: number,
+ *   maxAttempts?: number,
+ *   startAfterWorldId?: string,
+ *   onAttempt?: (worldId: string) => void | Promise<void>
+ * }} input
+ * @returns {Promise<{
+ *   saved: number,
+ *   skipped: number,
+ *   failed: number,
+ *   deferred: number,
+ *   retryAt: number | null
+ * }>}
+ */
+export async function captureAvailableWorldThumbnails(input) {
+  const intervalMs = input.intervalMs ?? THUMBNAIL_CAPTURE_INTERVAL_MS;
+  if (!Number.isFinite(intervalMs) || intervalMs < 0) {
+    throw new RangeError("thumbnail intervalMs must be a non-negative finite number");
+  }
+  const timeBudgetMs = input.timeBudgetMs ?? THUMBNAIL_CAPTURE_TIME_BUDGET_MS;
+  if (!Number.isFinite(timeBudgetMs) || timeBudgetMs <= 0) {
+    throw new RangeError("thumbnail timeBudgetMs must be a positive finite number");
+  }
+  const maxAttempts = input.maxAttempts ?? THUMBNAIL_CAPTURE_MAX_ATTEMPTS;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new RangeError("thumbnail maxAttempts must be a positive safe integer");
+  }
+  const encode = input.encode ?? fetchAndEncodeThumbnail;
+  const wait = input.wait ?? waitForThumbnailInterval;
+  const clock = input.clock ?? Date.now;
+  const startedAt = readThumbnailClock(clock);
+  const deadlineAt = startedAt + timeBudgetMs;
+  if (!isFiniteTimestamp(deadlineAt)) {
+    throw new RangeError("thumbnail deadline must be a finite timestamp");
+  }
+  const existing = await runBeforeThumbnailDeadline(
+    () => input.repository.listThumbnailMetadata(input.userId),
+    thumbnailRemainingMs(deadlineAt, clock)
+  );
+  const existingSourceByWorld = new Map(
+    existing.map((record) => [record.worldId, record.sourceUrl])
+  );
+  const orderedCandidates = input.metadata.filter((world) => (
+    typeof world.thumbnailImageUrl === "string"
+    && existingSourceByWorld.get(world.id) !== world.thumbnailImageUrl
+  )).sort((left, right) => left.id.localeCompare(right.id, "en"));
+  const resumeIndex = input.startAfterWorldId === undefined ? 0 : orderedCandidates.findIndex(
+    (world) => world.id > /** @type {string} */ (input.startAfterWorldId)
+  );
+  const startIndex = Math.max(0, resumeIndex);
+  const candidates = [
+    ...orderedCandidates.slice(startIndex),
+    ...orderedCandidates.slice(0, startIndex)
+  ];
+  let saved = 0;
+  let failed = 0;
+  let deferred = 0;
+  /** @type {number | null} */
+  let retryAt = null;
+  for (const [index, world] of candidates.entries()) {
+    if (
+      index >= maxAttempts
+      || thumbnailRemainingMs(deadlineAt, clock) <= 0
+    ) {
+      deferred += candidates.length - index;
+      break;
+    }
+    if (index > 0 && intervalMs > 0) {
+      const waitBudgetMs = thumbnailRemainingMs(deadlineAt, clock);
+      if (waitBudgetMs <= intervalMs) {
+        deferred += candidates.length - index;
+        break;
+      }
+      try {
+        await runBeforeThumbnailDeadline(() => wait(intervalMs), waitBudgetMs);
+      } catch (error) {
+        if (!(error instanceof ThumbnailCaptureDeadlineError)) {
+          throw error;
+        }
+        deferred += candidates.length - index;
+        break;
+      }
+    }
+    const sourceUrl = world.thumbnailImageUrl;
+    if (sourceUrl === undefined) {
+      continue;
+    }
+    try {
+      if (input.onAttempt !== undefined) {
+        await runBeforeThumbnailDeadline(
+          async () => input.onAttempt?.(world.id),
+          thumbnailRemainingMs(deadlineAt, clock)
+        );
+      }
+      const encodeBudgetMs = thumbnailRemainingMs(deadlineAt, clock);
+      if (encodeBudgetMs <= 0) {
+        throw new ThumbnailCaptureDeadlineError();
+      }
+      const encodeController = new AbortController();
+      const encoded = await runBeforeThumbnailDeadline(
+        () => encode(sourceUrl, {
+          timeoutMs: Math.max(
+            1,
+            Math.min(THUMBNAIL_FETCH_TIMEOUT_MS, Math.floor(encodeBudgetMs))
+          ),
+          clock,
+          signal: encodeController.signal
+        }),
+        encodeBudgetMs,
+        () => encodeController.abort()
+      );
+      if (thumbnailRemainingMs(deadlineAt, clock) <= 0) {
+        throw new ThumbnailCaptureDeadlineError();
+      }
+      const buffer = new ArrayBuffer(encoded.bytes.byteLength);
+      new Uint8Array(buffer).set(encoded.bytes);
+      await runBeforeThumbnailDeadline(
+        () => input.repository.putThumbnail({
+          userId: input.userId,
+          worldId: world.id,
+          blob: new Blob([buffer], { type: encoded.contentType }),
+          width: encoded.width,
+          height: encoded.height,
+          byteLength: encoded.bytes.byteLength,
+          capturedAt: input.capturedAt,
+          sourceUrl: encoded.sourceUrl
+        }, input.generation, input.userId),
+        thumbnailRemainingMs(deadlineAt, clock)
+      );
+      saved += 1;
+    } catch (error) {
+      if (error instanceof ThumbnailFetchError && error.status === 429) {
+        failed += 1;
+        deferred += candidates.length - index - 1;
+        retryAt = error.retryAt
+          ?? readThumbnailClock(clock) + THUMBNAIL_RATE_LIMIT_FALLBACK_MS;
+        break;
+      }
+      if (
+        error instanceof ThumbnailCaptureDeadlineError
+        || thumbnailRemainingMs(deadlineAt, clock) <= 0
+      ) {
+        deferred += candidates.length - index;
+        break;
+      }
+      failed += 1;
+      if (error instanceof GenerationConflictError) {
+        deferred += candidates.length - index - 1;
+        break;
+      }
+      if (error instanceof ThumbnailError) {
+        if (shouldStopThumbnailBatch(error)) {
+          deferred += candidates.length - index - 1;
+          break;
+        }
+        continue;
+      }
+      deferred += candidates.length - index - 1;
+      break;
+    }
+  }
+  return {
+    saved,
+    skipped: input.metadata.length - candidates.length,
+    failed,
+    deferred,
+    retryAt
+  };
+}
+
+class ThumbnailCaptureDeadlineError extends Error {
+  constructor() {
+    super("Thumbnail capture deadline exceeded");
+    this.name = "ThumbnailCaptureDeadlineError";
+  }
+}
+
+/**
+ * @template T
+ * @param {() => Promise<T>} operation
+ * @param {number} remainingMs
+ * @param {() => void} [onTimeout]
+ * @returns {Promise<T>}
+ */
+async function runBeforeThumbnailDeadline(operation, remainingMs, onTimeout = () => {}) {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    throw new ThumbnailCaptureDeadlineError();
+  }
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      try {
+        onTimeout();
+      } finally {
+        reject(new ThumbnailCaptureDeadlineError());
+      }
+    }, Math.max(1, Math.ceil(remainingMs)));
+  });
+  try {
+    return /** @type {T} */ (await Promise.race([operation(), timeout]));
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+/** @param {ThumbnailError} error */
+function shouldStopThumbnailBatch(error) {
+  if (error.code === "FETCH_FAILED" || error.code === "UNEXPECTED_REDIRECT") {
+    return true;
+  }
+  if (!(error instanceof ThumbnailFetchError) || error.code !== "HTTP_STATUS") {
+    return false;
+  }
+  return error.status === null
+    || error.status === 401
+    || error.status === 403
+    || error.status === 408
+    || error.status === 429
+    || (error.status !== null && error.status >= 500);
+}
+
+/** @param {() => number} clock */
+function readThumbnailClock(clock) {
+  const value = clock();
+  if (!isFiniteTimestamp(value)) {
+    throw new RangeError("thumbnail clock must return a non-negative finite timestamp");
+  }
+  return value;
+}
+
+/** @param {number} deadlineAt @param {() => number} clock */
+function thumbnailRemainingMs(deadlineAt, clock) {
+  return Math.max(0, deadlineAt - readThumbnailClock(clock));
+}
+
+/** @param {number} delayMs */
+function waitForThumbnailInterval(delayMs) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
 /**
  * Application service that owns the entire sync boundary. It never receives,
  * reads, or persists login material, credential headers, or raw API responses.
@@ -103,6 +460,10 @@ export const SETTING_KEYS = Object.freeze({
 export class SyncService {
   /** @type {Repository} */
   #repository;
+  /** @type {SyncTrigger|null} */
+  #activeTrigger = null;
+  /** @type {Promise<void>} */
+  #thumbnailMutationTail = Promise.resolve();
   /** @type {Pick<VrchatApi, "getCurrentUser" | "listAllFavoriteGroups" | "listAllFavoriteRelations" | "listAllFavoriteWorlds" | "getWorld">} */
   #api;
   /** @type {AlarmAdapter} */
@@ -117,6 +478,10 @@ export class SyncService {
   #idGenerator;
   /** @type {<T>(operation: () => Promise<T>) => Promise<T>} */
   #withApiSession;
+  /** @type {(sourceUrl: string, options: ThumbnailEncodeOptions) => Promise<EncodedThumbnail>} */
+  #encodeThumbnail;
+  /** @type {(delayMs: number) => Promise<void>} */
+  #thumbnailWait;
   /** @type {Promise<PublicSyncResult> | null} */
   #activeSync = null;
 
@@ -129,7 +494,9 @@ export class SyncService {
    *   clock?: () => number,
    *   random?: () => number,
    *   idGenerator?: () => string,
-   *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>
+   *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>,
+   *   encodeThumbnail?: (sourceUrl: string, options: ThumbnailEncodeOptions) => Promise<EncodedThumbnail>,
+   *   thumbnailWait?: (delayMs: number) => Promise<void>
    * }} dependencies
    */
   constructor(dependencies) {
@@ -141,6 +508,8 @@ export class SyncService {
     this.#random = dependencies.random ?? Math.random;
     this.#idGenerator = dependencies.idGenerator ?? (() => crypto.randomUUID());
     this.#withApiSession = dependencies.withApiSession ?? (async (operation) => operation());
+    this.#encodeThumbnail = dependencies.encodeThumbnail ?? fetchAndEncodeThumbnail;
+    this.#thumbnailWait = dependencies.thumbnailWait ?? waitForThumbnailInterval;
   }
 
   get syncing() {
@@ -155,19 +524,25 @@ export class SyncService {
    * @returns {Promise<PublicSyncResult>}
    */
   start(trigger) {
-    if (trigger !== "manual" && trigger !== "alarm" && trigger !== "resume") {
+    if (trigger !== "manual" && trigger !== "alarm" && trigger !== "resume" && trigger !== "thumbnail") {
       return Promise.resolve({ ok: false, error: "SYNC_FAILED" });
     }
     if (this.#activeSync !== null) {
+      if (this.#activeTrigger === "thumbnail" && trigger !== "thumbnail") {
+        return this.#activeSync.then(() => this.start(trigger));
+      }
       return this.#activeSync;
     }
 
-    const started = this.#startNewSync(trigger);
+    this.#activeTrigger = trigger;
+    const started = this.#withThumbnailMutationLock(() => trigger === "thumbnail"
+      ? this.#continueThumbnails() : this.#startNewSync(trigger));
     /** @type {Promise<PublicSyncResult>} */
     let tracked;
     tracked = started.finally(() => {
       if (this.#activeSync === tracked) {
         this.#activeSync = null;
+        this.#activeTrigger = null;
       }
     });
     this.#activeSync = tracked;
@@ -184,9 +559,14 @@ export class SyncService {
    *   worldCount: number,
    *   eventCount: number,
    *   pendingProbeCount: number,
+   *   attentionWorldCount: number,
+   *   missingCount: number,
+   *   unavailableCount: number,
    *   unreadCount: number,
    *   favoriteGroupStatus: "success" | "stale" | null,
-   *   lastResult: string | null
+   *   lastResult: string | null,
+   *   thumbnailProgress: ThumbnailProgress | null,
+   *   thumbnailSavedCount: number | null
    * }>}
    */
   async getStatus() {
@@ -201,13 +581,28 @@ export class SyncService {
       ? null
       : await this.#repository.getProfile(profileId);
     const stats = profileId === null
-      ? { worldCount: 0, eventCount: 0, pendingProbeCount: 0 }
+      ? {
+          worldCount: 0,
+          eventCount: 0,
+          pendingProbeCount: 0,
+          attentionWorldCount: 0,
+          missingCount: 0,
+          unavailableCount: 0
+        }
       : await this.#repository.getProfileStats(profileId);
     const unreadCount = profileId === null
       ? 0
       : await this.#repository.getUnreadCount(profileId);
+    // Saved images survive upgrades independently of the current capture job.
+    // A missing/unreadable job must not erase the independently known count.
+    const thumbnailSavedCount = profileId === null ? 0
+      : this.#repository.listThumbnailMetadata === undefined ? null
+        : await this.#repository.listThumbnailMetadata(profileId)
+          .then((images) => images.length, () => null);
 
     return {
+      thumbnailSavedCount,
+      thumbnailProgress: await this.#thumbnailProgress().catch(() => null),
       syncing: this.syncing,
       authRequired: lastResult === "auth_required",
       lastSuccessfulSyncAt: profile?.lastSuccessfulSyncAt ?? null,
@@ -218,6 +613,9 @@ export class SyncService {
       worldCount: stats.worldCount,
       eventCount: stats.eventCount,
       pendingProbeCount: stats.pendingProbeCount,
+      attentionWorldCount: stats.attentionWorldCount,
+      missingCount: stats.missingCount,
+      unavailableCount: stats.unavailableCount,
       unreadCount,
       favoriteGroupStatus:
         favoriteGroupStatus === "success" || favoriteGroupStatus === "stale"
@@ -458,7 +856,147 @@ export class SyncService {
     }
   }
 
-  /** @param {SyncTrigger} trigger @returns {Promise<PublicSyncResult>} */
+  /** @returns {Promise<ThumbnailJob|null>} */
+  async #currentThumbnailJob() {
+    const job = await this.#repository.getSetting(SETTING_KEYS.thumbnailJob);
+    if (!isThumbnailJob(job) || await this.#repository.getSetting(SETTING_KEYS.purgePending) === true
+      || await this.#repository.getSetting(SETTING_KEYS.activeProfileId) !== job.userId
+      || await this.#repository.getDataGeneration(job.userId) !== job.generation) return null;
+    return job;
+  }
+
+  /** @param {ThumbnailJob} job @param {Record<string, unknown>} [extra] */
+  async #saveThumbnailJob(job, extra = {}) {
+    await this.#repository.setThumbnailSettings(job.userId, job.generation, {
+      ...extra, [SETTING_KEYS.thumbnailJob]: job
+    });
+  }
+
+  /** @returns {Promise<ThumbnailProgress|null>} */
+  async #thumbnailProgress() {
+    const job = await this.#currentThumbnailJob();
+    if (job === null || this.#repository.listThumbnailMetadata === undefined) return null;
+    const stored = new Map((await this.#repository.listThumbnailMetadata(job.userId)).map((item) => [item.worldId, item.sourceUrl]));
+    const missing = job.items.filter((item) => stored.get(item.id) !== item.thumbnailImageUrl);
+    const failed = missing.filter((item) => item.attempts >= 3).length;
+    return { total: job.items.length, saved: job.items.length - missing.length,
+      remaining: missing.length - failed, failed,
+      nextAttemptAt: job.nextAttemptAt === null ? null : new Date(job.nextAttemptAt).toISOString(),
+      state: job.state };
+  }
+
+  /**
+   * Serialize every sync and schedule repair that can replace a thumbnail job.
+   * Reads used for presentation remain independent.
+   * @template T
+   * @param {() => Promise<T>} operation
+   * @returns {Promise<T>}
+   */
+  #withThumbnailMutationLock(operation) {
+    const result = this.#thumbnailMutationTail.then(operation);
+    this.#thumbnailMutationTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async repairThumbnailSchedule() {
+    return this.#withThumbnailMutationLock(() => this.#repairThumbnailSchedule());
+  }
+
+  async #repairThumbnailSchedule() {
+    const job = await this.#currentThumbnailJob();
+    if (job === null || job.state === "complete" || job.state === "partial") {
+      await this.#alarms.clear(THUMBNAIL_ALARM_NAME);
+      return;
+    }
+    const backoff = await this.#repository.getSetting(SETTING_KEYS.backoffUntil);
+    const imageBackoff = await this.#repository.getSetting(SETTING_KEYS.thumbnailBackoffUntil);
+    const when = Math.max(this.#now() + THUMBNAIL_BATCH_DELAY_MS, job.nextAttemptAt ?? 0,
+      isFiniteTimestamp(backoff) ? backoff : 0, isFiniteTimestamp(imageBackoff) ? imageBackoff : 0);
+    await this.#alarms.create(THUMBNAIL_ALARM_NAME, when);
+    job.nextAttemptAt = when;
+    job.state = "waiting";
+    await this.#saveThumbnailJob(job);
+  }
+
+  async repairThumbnailScheduleBestEffort() {
+    return this.#withThumbnailMutationLock(async () => {
+      try { await this.#repairThumbnailSchedule(); }
+      catch {
+        const job = await this.#currentThumbnailJob().catch(() => null);
+        if (job !== null && job.state !== "complete" && job.state !== "partial") {
+          job.state = "paused";
+          await this.#saveThumbnailJob(job).catch(() => undefined);
+        }
+      }
+    });
+  }
+
+  /** @returns {Promise<PublicSyncResult>} */
+  async #continueThumbnails() {
+    let job = null;
+    try {
+      job = await this.#currentThumbnailJob();
+      if (job === null || this.#repository.listThumbnailMetadata === undefined || this.#repository.putThumbnail === undefined) {
+        await this.#alarms.clear(THUMBNAIL_ALARM_NAME);
+        return { ok: true };
+      }
+      if (job.state === "complete" || job.state === "partial") return { ok: true };
+      const now = this.#now();
+      const backoff = await this.#repository.getSetting(SETTING_KEYS.backoffUntil);
+      const imageBackoff = await this.#repository.getSetting(SETTING_KEYS.thumbnailBackoffUntil);
+      const next = Math.max(job.nextAttemptAt ?? 0, isFiniteTimestamp(backoff) ? backoff : 0,
+        isFiniteTimestamp(imageBackoff) ? imageBackoff : 0);
+      if (next > now) {
+        job.nextAttemptAt = next;
+        job.state = "waiting";
+        await this.#saveThumbnailJob(job);
+        await this.#alarms.create(THUMBNAIL_ALARM_NAME, next);
+        return { ok: true };
+      }
+      job.state = "running";
+      job.nextAttemptAt = now + THUMBNAIL_BATCH_DELAY_MS;
+      await this.#saveThumbnailJob(job);
+      await this.#alarms.create(THUMBNAIL_ALARM_NAME, job.nextAttemptAt);
+      const activeJob = job;
+      const stored = new Map((await this.#repository.listThumbnailMetadata(job.userId)).map((item) => [item.worldId, item.sourceUrl]));
+      const pending = job.items.filter((item) => item.attempts < 3 && stored.get(item.id) !== item.thumbnailImageUrl);
+      const minAttempts = Math.min(...pending.map((item) => item.attempts));
+      const result = await captureAvailableWorldThumbnails({
+        userId: job.userId, generation: job.generation, capturedAt: job.capturedAt,
+        metadata: pending.filter((item) => item.attempts === minAttempts),
+        repository: { listThumbnailMetadata: this.#repository.listThumbnailMetadata.bind(this.#repository),
+          putThumbnail: this.#repository.putThumbnail.bind(this.#repository) },
+        encode: this.#encodeThumbnail, wait: this.#thumbnailWait, clock: this.#clock,
+        onAttempt: async (worldId) => {
+          const item = activeJob.items.find((entry) => entry.id === worldId);
+          if (item !== undefined) item.attempts += 1;
+          await this.#saveThumbnailJob(activeJob);
+        }
+      });
+      const progress = await this.#thumbnailProgress();
+      if (progress === null) return { ok: true };
+      job.state = progress.remaining === 0 ? (progress.failed === 0 ? "complete" : "partial") : "waiting";
+      job.nextAttemptAt = progress.remaining === 0 ? null : Math.max(this.#now() + THUMBNAIL_BATCH_DELAY_MS, result.retryAt ?? 0);
+      await this.#saveThumbnailJob(job, {
+        [SETTING_KEYS.thumbnailCaptureStatus]: {userId: job.userId, capturedAt: job.capturedAt, ...result},
+        [SETTING_KEYS.thumbnailBackoffUntil]: result.retryAt,
+        ...(result.retryAt === null ? {} : {[SETTING_KEYS.backoffUntil]: result.retryAt})
+      });
+      if (job.nextAttemptAt === null) await this.#alarms.clear(THUMBNAIL_ALARM_NAME);
+      else await this.#alarms.create(THUMBNAIL_ALARM_NAME, job.nextAttemptAt);
+      return { ok: true };
+    } catch {
+      if (job !== null) {
+        job.state = "paused";
+        try { await this.#saveThumbnailJob(job, {
+          [SETTING_KEYS.thumbnailCaptureStatus]: {userId: job.userId, capturedAt: job.capturedAt, saved: 0, skipped: 0, failed: 1, deferred: job.items.length, retryAt: null}
+        }); } catch { return {ok: false, error: "STORAGE_UNAVAILABLE"}; }
+      }
+      return {ok: false, error: "STORAGE_UNAVAILABLE"};
+    }
+  }
+
+  /** @param {Exclude<SyncTrigger, "thumbnail">} trigger @returns {Promise<PublicSyncResult>} */
   async #startNewSync(trigger) {
     try {
       if (await this.#repository.getSetting(SETTING_KEYS.purgePending) === true) {
@@ -498,7 +1036,7 @@ export class SyncService {
     }
   }
 
-  /** @param {SyncTrigger} trigger @returns {Promise<PublicSyncResult>} */
+  /** @param {Exclude<SyncTrigger, "thumbnail">} trigger @returns {Promise<PublicSyncResult>} */
   async #executeSync(trigger) {
     const startedAtMs = this.#now();
     const startedAt = new Date(startedAtMs).toISOString();
@@ -522,7 +1060,7 @@ export class SyncService {
 
     try {
       await this.#armWatchdog(startedAtMs);
-      await this.#withApiSession(async () => {
+      const thumbnailCapturePlan = await this.#withApiSession(async () => {
       const user = await this.#api.getCurrentUser();
       userId = user.id;
       const initialSnapshot = await this.#repository.getSyncSnapshot(user.id);
@@ -575,14 +1113,40 @@ export class SyncService {
         metadata,
         limit: MAX_PROBE_CANDIDATES
       });
+      // Older releases did not save images. Use spare probe slots for recorded
+      // accessible worlds outside the current favorites, until their image is saved.
+      if (this.#repository.listThumbnailMetadata !== undefined && candidates.length < MAX_PROBE_CANDIDATES) {
+        // A broken optional image store must not prevent committing world history.
+        const storedImages = await this.#repository.listThumbnailMetadata(user.id)
+          .catch(() => null);
+        const imageWorldIds = new Set(storedImages?.map((record) => record.worldId));
+        const knownMetadataIds = new Set(apiMetadata.map((world) => world.id));
+        const selectedIds = new Set(candidates);
+        const imageProbeCandidates = initialSnapshot.worlds.filter((world) => (
+          storedImages !== null && world.availabilityState === "accessible"
+          && !knownMetadataIds.has(world.worldId)
+          && !imageWorldIds.has(world.worldId)
+          && !selectedIds.has(world.worldId)
+        )).sort((left, right) => (
+          (left.lastProbeAt ?? "").localeCompare(right.lastProbeAt ?? "", "en")
+          || left.worldId.localeCompare(right.worldId, "en")
+        ));
+        candidates.push(...imageProbeCandidates
+          .slice(0, MAX_PROBE_CANDIDATES - candidates.length)
+          .map((world) => world.worldId));
+      }
       /** @type {Map<string, import("./domain.js").MappedWorldProbe>} */
       const probes = new Map();
+      const thumbnailMetadata = new Map(
+        apiMetadata.map((world) => [world.id, /** @type {import("./api.js").WorldMetadata} */ (world)])
+      );
       for (const worldId of candidates) {
         const result = await this.#api.getWorld(worldId);
         probeCount += 1;
         if (result.status === 404) {
           probes.set(worldId, { worldId, status: 404 });
         } else {
+          thumbnailMetadata.set(result.world.id, result.world);
           probes.set(worldId, {
             worldId,
             status: 200,
@@ -619,7 +1183,39 @@ export class SyncService {
       scheduleResult = "success";
       publicResult = { ok: true, changes: committedPlan.changeCount };
       await this.#deliverNotifications(user.id, syncId, committedPlan.generation);
+      return {
+        userId: user.id,
+        metadata: [...thumbnailMetadata.values()].map((world) => ({ ...world })),
+        generation: committedPlan.generation,
+        capturedAt: observedAt
+      };
       });
+      if (this.#repository.listThumbnailMetadata !== undefined && this.#repository.putThumbnail !== undefined) {
+        const previous = await this.#repository.getSetting(SETTING_KEYS.thumbnailJob);
+        const attempts = new Map(isThumbnailJob(previous) && previous.userId === thumbnailCapturePlan.userId
+          ? previous.items.map((item) => [`${item.id}:${item.thumbnailImageUrl}`, item.attempts]) : []);
+        /** @type {ThumbnailJob} */
+        const job = {
+          version: 1, userId: thumbnailCapturePlan.userId, generation: thumbnailCapturePlan.generation,
+          capturedAt: thumbnailCapturePlan.capturedAt,
+          items: thumbnailCapturePlan.metadata.filter((world) => typeof world.thumbnailImageUrl === "string"
+            && isAllowedVrchatImageUrl(world.thumbnailImageUrl)).map((world) => ({
+              id: world.id, thumbnailImageUrl: /** @type {string} */ (world.thumbnailImageUrl),
+              attempts: previous !== undefined && isThumbnailJob(previous) && previous.state !== "complete" && previous.state !== "partial"
+                ? attempts.get(`${world.id}:${world.thumbnailImageUrl}`) ?? 0 : 0
+            })),
+          nextAttemptAt: null, state: "waiting"
+        };
+        try {
+          await this.#saveThumbnailJob(job);
+        } catch {
+          // Retry the exact guarded checkpoint once; no image request is allowed
+          // before the initial durable job exists.
+          job.state = "paused";
+          await this.#saveThumbnailJob(job);
+        }
+        await this.#continueThumbnails();
+      }
     } catch (error) {
       if (committed && error instanceof AuthCookieCleanupError) {
         publicResult = { ok: false, error: "AUTH_COOKIE_CLEANUP_FAILED" };
@@ -657,7 +1253,7 @@ export class SyncService {
    *
    * @param {{
    *   user: Awaited<ReturnType<VrchatApi["getCurrentUser"]>>,
-   *   trigger: SyncTrigger,
+   *   trigger: Exclude<SyncTrigger, "thumbnail">,
    *   syncId: string,
    *   startedAt: string,
    *   observedAt: string,
@@ -767,7 +1363,7 @@ export class SyncService {
    *   error: unknown,
    *   syncId: string,
    *   userId: string | null,
-   *   trigger: SyncTrigger,
+   *   trigger: Exclude<SyncTrigger, "thumbnail">,
    *   startedAt: string,
    *   favoriteCount: number,
    *   metadataCount: number,
@@ -882,14 +1478,17 @@ export class SyncService {
 
     let notificationId;
     try {
+      const presentation = createNotificationPresentation(claimed);
       notificationId = await this.#notifications.create(
-        `${NOTIFICATION_ID_PREFIX}${safeNotificationSuffix(syncId)}`,
+        `${presentation.attention
+          ? ATTENTION_NOTIFICATION_ID_PREFIX
+          : NOTIFICATION_ID_PREFIX}${safeNotificationSuffix(syncId)}`,
         {
           type: "basic",
           iconUrl: "icons/icon128.png",
-          title: "お気に入りワールドに変化があります",
-          message: `${claimed.length}件の変化を記録しました。履歴を確認してください。`,
-          buttons: [{ title: "履歴を見る" }]
+          title: presentation.title,
+          message: presentation.message,
+          buttons: [{ title: presentation.buttonTitle }]
         }
       );
     } catch {

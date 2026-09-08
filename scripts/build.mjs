@@ -193,7 +193,7 @@ export async function build() {
   }
   assertExactSet(
     assertStringArray(manifest.host_permissions),
-    ["https://api.vrchat.cloud/*", "https://vrchat.cloud/*", "https://vrchat.com/*"],
+    ["https://api.vrchat.cloud/*", "https://files.vrchat.cloud/*", "https://vrchat.cloud/*", "https://vrchat.com/*"],
     "host_permissions"
   );
 

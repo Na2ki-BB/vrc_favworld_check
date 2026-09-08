@@ -16,6 +16,15 @@
         </div>
       </header>
 
+      <section id="attention-card" class="attention-card" aria-live="polite">
+        <p class="eyebrow">CHECK FIRST</p>
+        <strong id="attention-title">消えたワールドを確認</strong>
+        <p id="attention-detail">保存済みの名前と画像をすぐ確認できます。</p>
+        <button id="dashboard-button" class="button button-attention" type="button">
+          記録とサムネイルを見る
+        </button>
+      </section>
+
       <section class="status-card" aria-live="polite">
         <div class="status-line">
           <span id="status-dot" class="status-dot is-idle" aria-hidden="true"></span>
@@ -25,16 +34,16 @@
         <p id="last-sync" class="muted">最終確認: まだありません</p>
       </section>
 
+      <p id="thumbnail-progress" class="muted" role="status" hidden></p>
+
       <button id="sync-button" class="button button-primary" type="button">
-        今すぐお気に入りを確認
+        今すぐ確認
       </button>
       <button id="login-button" class="button button-secondary" type="button">
         VRChat公式サイトを開く
       </button>
-      <button id="dashboard-button" class="text-button" type="button">
-        記録と設定を詳しく見る
-        <span aria-hidden="true">→</span>
-      </button>
+
+      <p class="muted">開始した画像の保存は、この画面を閉じても、Chrome起動中は続きます。Chromeを閉じた場合は、次の起動時に再開します。</p>
 
       <p id="action-message" class="action-message" role="status"></p>
 

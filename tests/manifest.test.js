@@ -43,7 +43,7 @@ test("manifest grants only the reviewed minimum permissions", async () => {
   );
   assert.deepEqual(
     [...manifest.host_permissions].sort(),
-    ["https://api.vrchat.cloud/*", "https://vrchat.cloud/*", "https://vrchat.com/*"]
+    ["https://api.vrchat.cloud/*", "https://files.vrchat.cloud/*", "https://vrchat.cloud/*", "https://vrchat.com/*"]
   );
   assert.equal(manifest.content_scripts, undefined);
   assert.equal(manifest.externally_connectable, undefined);
@@ -52,7 +52,7 @@ test("manifest grants only the reviewed minimum permissions", async () => {
   assert.equal(manifest.background.type, "module");
   assert.equal(
     manifest.content_security_policy.extension_pages,
-    "script-src 'self'; object-src 'none'; base-uri 'none'"
+    "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' https://api.vrchat.cloud https://files.vrchat.cloud; img-src 'self' blob:"
   );
 });
 
@@ -126,6 +126,10 @@ test("every hard-coded remote URL belongs to the reviewed allowlist", async () =
         || url.startsWith("https://vrchat.com/api/")
         || url.startsWith("https://vrchat.com/home/")
         || url === "https://api.vrchat.cloud/*"
+        || url === "https://api.vrchat.cloud"
+        || url === "https://files.vrchat.cloud"
+        || url === "https://files.vrchat.cloud/"
+        || url === "https://files.vrchat.cloud/*"
         || url === "https://vrchat.cloud/*"
         || url === "https://vrchat.com/*"
         || url === "https://github.com/Na2ki-BB/vrc_favworld_check",

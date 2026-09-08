@@ -473,7 +473,7 @@ begin
       '1. Chromeの拡張機能画面で「デベロッパー モード」をオンにします。' + #13#10 +
       '2. 「パッケージ化されていない拡張機能を読み込む」を押します。' + #13#10 +
       '3. エクスプローラーで開いた extension フォルダーを選択します。' + #13#10 +
-      '4. Chromeが権限を表示した場合は、Cookie利用の対象 vrchat.com / vrchat.cloud / api.vrchat.cloud を確認します。' + #13#10 + #13#10 +
+      '4. Chromeが権限を表示した場合は、vrchat.com / vrchat.cloud / api.vrchat.cloud と、画像配信先 files.vrchat.cloud を確認します。' + #13#10 + #13#10 +
       'インストール完了後、Downloads内のこのインストーラーは削除できます。'
     );
     GuidePage.RichEditViewer.ReadOnly := True;
@@ -486,8 +486,9 @@ begin
       'インストール完了後にChromeの拡張機能画面を開きます',
       '更新後に次の内容を確認してください。',
       '1. VRC Favorite World History が有効で、バージョンが {#AppVersion} であることを確認します。' + #13#10 +
-      '2. ChromeがCookie利用や接続権限を確認した場合は、vrchat.com / vrchat.cloud / api.vrchat.cloud が対象であることを確認して許可します。' + #13#10 +
-      '3. 古いバージョンが表示される場合だけ、拡張の「再読み込み」を1回押します。' + #13#10 + #13#10 +
+      '2. ChromeがCookie利用や接続権限を確認した場合は、vrchat.com / vrchat.cloud / api.vrchat.cloud と、画像配信先 files.vrchat.cloud が対象であることを確認して許可します。' + #13#10 +
+      '3. 古いバージョンが表示される場合だけ、拡張の「再読み込み」を1回押します。' + #13#10 +
+      '4. 拡張を開いて「今すぐ確認」を一度押します。残りの画像はChrome起動中に自動で保存されます。記録画面で進捗を確認でき、何度も押す必要はありません。' + #13#10 + #13#10 +
       '拡張を削除したり、別のフォルダーから読み込み直したりしないでください。'
     );
     GuidePage.RichEditViewer.ReadOnly := True;

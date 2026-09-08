@@ -19,12 +19,17 @@ import {
   ServerError,
   UnexpectedRedirectError,
   VRCHAT_API_BASE_URL,
-  VrchatApi
+  VrchatApi,
+  isAllowedVrchatImageUrl,
+  isAllowedVrchatImageResponseUrl
 } from "../extension/lib/api.js";
 
 const USER_ID = "usr_00000000-0000-0000-0000-000000000001";
 const WORLD_ID = "wrld_00000000-0000-0000-0000-000000000001";
 const NONCANONICAL_WORLD_ID_1 = "noncanonical-world-id-1";
+const FILE_ID = "file_00000000-0000-0000-0000-000000000001";
+const THUMBNAIL_URL = `${VRCHAT_API_BASE_URL}/image/${FILE_ID}/1/256`;
+const FILE_URL = `${VRCHAT_API_BASE_URL}/file/${FILE_ID}/1/file`;
 
 /**
  * @typedef {(input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>} ResponseFactory
@@ -338,6 +343,76 @@ test("favorite world pagination includes releaseStatus=all and validates metadat
     invalidHarness.api.listAllFavoriteWorlds(),
     ApiSchemaError
   );
+});
+
+test("favorite world metadata projects only an optional thumbnail", async () => {
+  const withOptionalMetadata = {
+    ...favoriteWorld(1),
+    thumbnailImageUrl: THUMBNAIL_URL,
+    description: "無関係な説明\n改行もそのまま無視する"
+  };
+  const withoutOptionalMetadata = favoriteWorld(2);
+  const withNullOptionalMetadata = {
+    ...favoriteWorld(3),
+    thumbnailImageUrl: null,
+    description: null
+  };
+  const harness = createHarness([
+    jsonResponse([
+      withOptionalMetadata,
+      withoutOptionalMetadata,
+      withNullOptionalMetadata
+    ]),
+    jsonResponse([])
+  ]);
+
+  assert.deepEqual(await harness.api.listAllFavoriteWorlds(), [
+    {
+      ...favoriteWorld(1),
+      thumbnailImageUrl: THUMBNAIL_URL
+    },
+    withoutOptionalMetadata,
+    favoriteWorld(3)
+  ]);
+});
+
+test("VRChat image URLs are limited to fixed HTTPS image routes", () => {
+  assert.equal(isAllowedVrchatImageUrl(THUMBNAIL_URL), true);
+  assert.equal(isAllowedVrchatImageUrl(FILE_URL), true);
+
+  const rejected = [
+    `http://api.vrchat.cloud/api/1/image/${FILE_ID}/1/256`,
+    `https://example.com/api/1/image/${FILE_ID}/1/256`,
+    `https://api.vrchat.cloud:8443/api/1/image/${FILE_ID}/1/256`,
+    `https://user@api.vrchat.cloud/api/1/image/${FILE_ID}/1/256`,
+    `${THUMBNAIL_URL}#fragment`,
+    `${THUMBNAIL_URL}?download=true`,
+    `${VRCHAT_API_BASE_URL}/image/not-a-file/1/256`,
+    `${VRCHAT_API_BASE_URL}/image/${FILE_ID}/0/256`,
+    `${VRCHAT_API_BASE_URL}/image/${FILE_ID}/1/999`,
+    `${VRCHAT_API_BASE_URL}/file/${FILE_ID}/1/thumbnail`,
+    "not a URL",
+    null
+  ];
+  for (const value of rejected) {
+    assert.equal(isAllowedVrchatImageUrl(value), false, String(value));
+  }
+});
+
+test("malformed optional thumbnail URLs are ignored without blocking world metadata", async () => {
+  const invalidValues = [
+    { thumbnailImageUrl: "https://example.com/image.webp" },
+    { thumbnailImageUrl: 42 },
+    { thumbnailImageUrl: null }
+  ];
+
+  for (const invalid of invalidValues) {
+    const harness = createHarness([
+      jsonResponse([{ ...favoriteWorld(1), ...invalid }]),
+      jsonResponse([])
+    ]);
+    assert.deepEqual(await harness.api.listAllFavoriteWorlds(), [favoriteWorld(1)]);
+  }
 });
 
 test("favorite world pagination accepts an over-returned page and advances by its actual length", async () => {
@@ -660,13 +735,14 @@ test("other paged endpoints retain the requested page-size response limit", asyn
   assert.equal(harness.calls.length, 1);
 });
 
-test("getWorld returns only 200 metadata or a 404 observation", async () => {
+test("getWorld returns projected display metadata or a 404 observation", async () => {
   const world = {
     id: WORLD_ID,
     name: "思い出のワールド",
     authorName: "作者",
     releaseStatus: "hidden",
-    description: "保存しない"
+    thumbnailImageUrl: FILE_URL,
+    description: "保存対象外の説明"
   };
   const foundHarness = createHarness([jsonResponse(world)]);
   assert.deepEqual(await foundHarness.api.getWorld(WORLD_ID), {
@@ -675,7 +751,8 @@ test("getWorld returns only 200 metadata or a 404 observation", async () => {
       id: WORLD_ID,
       name: "思い出のワールド",
       authorName: "作者",
-      releaseStatus: "hidden"
+      releaseStatus: "hidden",
+      thumbnailImageUrl: FILE_URL
     }
   });
 
@@ -811,4 +888,18 @@ test("request timeout is classified as a retried network failure", async () => {
 
   await assert.rejects(harness.api.getCurrentUser(), NetworkError);
   assert.equal(harness.calls.length, 3);
+});
+
+
+test("public image redirect validation binds CDN paths to the requested file", () => {
+  const fileId = "file_00000000-0000-0000-0000-000000000001";
+  const source = `https://api.vrchat.cloud/api/1/file/${fileId}/17/file`;
+  const finalUrl = `https://files.vrchat.cloud/World-Image.${fileId}.17.png?Signature=temporary`;
+  assert.equal(isAllowedVrchatImageResponseUrl(source, finalUrl), true);
+  assert.equal(isAllowedVrchatImageResponseUrl(source, source), true);
+  assert.equal(isAllowedVrchatImageUrl(finalUrl), false, "signed CDN URLs are never valid stored source URLs");
+  assert.equal(isAllowedVrchatImageResponseUrl(source, finalUrl.replace(".17.png", ".18.png")), false);
+  assert.equal(isAllowedVrchatImageResponseUrl(source, finalUrl.replace("/World-Image", "/folder/World-Image")), false);
+  assert.equal(isAllowedVrchatImageResponseUrl(source, finalUrl.replace("files.vrchat.cloud", "files.vrchat.cloud:443")), false);
+  assert.equal(isAllowedVrchatImageResponseUrl("https://example.com/file", finalUrl), false);
 });

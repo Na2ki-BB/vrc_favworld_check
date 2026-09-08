@@ -1,121 +1,126 @@
-# vrc_favworld_check 実装・検証計画
+# vrc_favworld_check 実装・検証基準
 
-## 1. 完了定義
+この文書は、現行実装の構成と、配布前に満たす検証基準をまとめた開発者向け資料である。利用方法は[README](../README.md)を参照する。過去にお気に入りだったワールドが一覧から消えたとき、利用者が保存済みの名前・作者・お気に入りリスト・画像をすぐ確認できることを最優先にする。
 
-本製品は、利用者がVRChat公式サイトでログインした既存セッションを使い、最大8リスト・800ワールドの現在状態を端末内へ記録できることを完了条件とする。名称変更、リスト移動、一覧からの消失、アクセス不可と復帰を誤断定せず履歴化し、開発者サーバー、資格情報入力、利用者によるDB保守を必要としないことを必須とする。
+## 1. 完了条件
 
-公開候補は次のrelease gateをすべて満たす必要がある。
+製品は次の状態を満たしたときに完成と判断する。
 
-- VRChat Creator Guidelinesと現行コミュニティOpenAPIを再確認している。
-- manifestの `cookies` 権限と3つのVRChat host permissionが、固定名Cookie Bridgeと親domain競合検査の用途だけに限定され、閲覧履歴や全URLへアクセスする権限がない。
-- lint、strict typecheck、全テスト、coverage計測、build、公開物の秘密検査が成功し、未実行の主要分岐がないことをレビューする。
-- 800ワールド、8リスト、DB v1移行、backup v1互換、削除失敗の各fixtureが成功する。
-- 配布ZIPが複数タイムゾーンで同一になり、検証済み `dist/extension` から Inno Setup 6 の Windows インストーラーをコンパイルできる。
-- installer configの静的検査と、対象の実PC・実Chromeで限定した導入・更新・同期・一時Cookie削除・正規削除確認が成功する。
-- 実利用者のCookie、バックアップ、ログ、`.env`、ローカル専用文書がGit追跡対象にない。
+- VRChat公式サイトでログイン済みのブラウザセッションを利用し、利用者にパスワードや2FAコードの入力を求めず同期できる。
+- 最大8リスト・800ワールドを扱い、ワールド名、作者名、所属リスト、状態、縮小サムネイルを利用者のChrome内へ保存できる。
+- 一覧からの消失、現在アクセスできない状態、復帰、名称変更、リスト移動を区別して履歴化できる。
+- 一覧からの消失とアクセス不可を画面の最初に表示し、保存済み情報へ直接案内できる。
+- 一覧欠落だけで削除・非公開と断定せず、連続確認と個別取得結果に基づく確度を利用者向け表現へ反映できる。
+- 通信障害、認証切れ、レート制限、API障害では既存の状態と履歴を変更せず、次の操作を日本語で案内できる。
+- 同じ同期結果を再処理しても、履歴と通知を重複させない。
+- JSONバックアップの書き出しと復元、および拡張画面からの全記録削除を完了できる。
+- 利用者データ、サムネイル、認証に必要な一時情報は利用者の端末内とVRChat公式通信の範囲で処理される。
 
-## 2. 採用する構成
+## 2. 現行の構成
 
-| 領域 | 採用 | 理由 |
+| 領域 | 構成 | 目的 |
 | --- | --- | --- |
-| 実行環境 | Windows版Google Chrome Manifest V3拡張 | 公式Webログインをブラウザへ委ね、常駐アプリなしでUI・定期実行・通知を提供できる |
-| 永続DB | 拡張origin内のIndexedDB `vrc-favworld-check` | サーバー費用と利用者によるDB導入が不要。transactionとschema migrationを利用できる |
-| 開発者DB | 使用しない | 利用者データと秘密を開発者が保持しない |
-| 認証 | VRChat公式サイトの既存セッション + 短時間Cookie Bridge | パスワード・2FA入力を受けず、固定名2つだけをAPI用hostへ一時複製し、値を永続化しない |
-| API | 読み取り専用GET | VRChat側の状態を変更しない |
-| 通知 | OS通知 + 永続未読バッジ | OS通知欠落時も履歴を正本として確認できる |
-| 配布 | Chrome用MV3 package + Inno Setup 6 | 検証済み拡張をユーザー単位の固定LocalAppDataへ配置し、Downloadsの展開フォルダー保持を不要にする |
+| 実行環境 | Windows版Google ChromeのManifest V3拡張 | 公式Webログイン、定期実行、画面、通知を同じブラウザ内で扱う |
+| 永続化 | 拡張origin内のIndexedDB `vrc-favworld-check`（schema version 3） | 履歴を原子的に保存し、旧schemaから移行する |
+| 認証 | VRChat公式サイトの既存セッションと短時間のAuth Cookie Bridge | 固定名CookieだけをAPI通信中に橋渡しし、値を永続化しない |
+| API通信 | VRChat APIへのGET | VRChat側の設定やお気に入りを変更せず、現在状態を読み取る |
+| 差分検知 | APIやブラウザ機能から独立した純粋なドメインロジック | 同じ入力に対して同じ履歴を作り、障害時に既存状態を守る |
+| 通知 | OS通知、拡張アイコンの未読バッジ、保存済み履歴 | OS通知が表示されない場合も拡張画面で確認できるようにする |
+| 配布 | Chrome用拡張パッケージとInno Setup 6インストーラー | 検証済みファイルをWindowsユーザー単位の固定場所へ配置する |
 
-## 3. 実装順序と各出口条件
+## 3. 同期処理
 
-### Phase 1: API・純粋ドメイン
+1. 同期を単一実行に制限し、全VRChat通信のレート制限期限と全消去中の停止状態を確認する。
+2. User-Agent用の通信ルールが期待どおり登録されていることを確認する。
+3. 公式Webセッションの固定名 `auth` と、存在する場合だけ `twoFactorAuth` を読み、API用hostへ最長15分の一時Cookieとして設定する。
+4. 現在の利用者、お気に入りリスト、お気に入り関係、ワールド情報を、件数・サイズ・ページ数・schemaの上限を検査しながら取得する。
+5. IndexedDBから同じ利用者の既存記録と世代番号を読み、現在の取得結果との差分を純粋関数で計算する。
+6. 一覧から1回だけ消えたワールドは候補として保持し、連続欠落と個別取得結果を使って状態を分類する。`unavailable_once` の再確認を優先し、アクセス不可と一覧欠落を混同しない。
+7. ワールド、リスト、履歴、未読件数、通知対象、同期結果を1つのread-write transactionで確定する。世代競合があれば古い計画を保存しない。
+8. 確定した消失系を最優先に、1同期につき集約したOS通知を最大1回試行する。通知本文は件数と分類だけとし、名称などの詳細は拡張画面で表示する。
+9. 主要データの保存と認証用一時Cookieのcleanup後、画像元URLとデータ世代を永続ジョブへ保存し、未取得または更新された画像を最大100件・共通30秒の範囲で取得する。残件があれば専用アラームで通常60秒後に画像だけを自動取得する。画像処理の失敗は名前・状態・履歴の保存結果へ影響させない。
+10. 今回設定した一時Cookieの値と属性が一致することを削除直前に確認して片付け、成功・失敗のどちらでも次回の定期実行を設定する。
 
-1. `/favorite/groups`を既存の直列ページング・サイズ制限・redirect拒否へ統合する。
-2. 本人所有、ID、内部名、表示名、type、一意性を境界で検証する。
-3. グループ名履歴とワールド所属変更を純粋関数で計算する。
-4. `unavailable_once`を個別確認の最優先にする。
+401、429、ネットワーク障害、5xx、予期しないredirectでは、差分を確定するtransactionへ進まない。429では検証済みの `Retry-After`、または既定の待機期限を保存し、期限までは画像を含むVRChat通信を控える。
 
-出口条件は、混在するavatar/friendの安全な除外、owner不一致・重複・未知typeのfail closed、800件の先頭・中間・末尾差分、同一入力の冪等性が単体テストで証明されることである。
+## 4. データ保存と復元
 
-### Phase 2: IndexedDB v2・backup v2
+IndexedDBは利用者IDごとに記録を分離し、次の情報を保存する。
 
-1. `favoriteGroups` storeと同期記録保持indexをmigration transactionで追加する。
-2. profile、worlds、groups、events、未読件数、同期結果を成功commitの同一transactionへ入れる。
-3. 同期記録をprofile 100件、匿名20件へ同じtransaction内で整理する。
-4. backup v2へgroupsを追加し、v1をgroupsなしとして正規化して取り込む。
-5. 全storeの利用者記録を1 transactionで消去し、削除中gateとschema情報だけを残す。取消不能な`deleteDatabase` requestは使わない。
+- 利用者プロフィールと最終正常同期時刻
+- ワールドの最後に確認できた名前、作者、所属リスト、現在状態、確認時刻
+- お気に入りリストの内部名、表示名、表示名履歴、取得状態
+- 名称変更、リスト移動、一覧欠落、アクセス不可、復帰の履歴
+- 最大辺320px・1件48KiB以下へ縮小したWebPサムネイル
+- 同期結果、未読件数、通知処理状態、定期同期と待機期限の設定
 
-出口条件は、v1 DBの既存world/eventが移行後も同一であること、復元競合で古い同期を拒否すること、800world + 8groupのround-trip、未知field・秘密field・巨大入力の拒否である。
+主要データは1回の正常同期ごとに同じtransactionで保存する。同期結果の診断記録はプロフィールごと最新100件、認証前は最新20件へ自動整理し、ワールドと変更履歴は消さない。
 
-### Phase 3: 同期・ライフサイクル
+バックアップ形式version 2は、1人分のプロフィール、ワールド、お気に入りリスト、変更履歴、安全な設定だけをJSONへ書き出す。画像はJSONの容量を抑えるためChrome内へ別に保持し、復元時も同じ利用者の既存画像を維持する。現在アクセスできるワールドの不足画像は次回同期で再取得できるが、すでにアクセスできないワールドの画像は再取得できないため、拡張の全消去を行うと保存画像も失われる。version 1のバックアップはお気に入りリスト情報がない形式として正規化して取り込む。復元は全項目を検証してから、対象利用者の記録だけを1つのtransactionで置き換える。
 
-1. 固定名 `auth` と任意の `twoFactorAuth` だけをsourceから読み、targetへ最長15分だけ設定するAuth Cookie Bridgeを同期single-flight内へ置く。
-2. 非秘密markerを使い、通常終了時は今回設定した値・属性が一致するCookieだけを削除する。startup、次回同期、正規削除時は中断残骸を誤削除せず、最長15分の失効後に孤立markerだけを回収する。親domain・別pathを含む既存target競合とCookie APIから返るpartitionedはfail closedにする。
-3. グループAPIの部分障害と同期全体の障害境界を分離する。
-4. commit後に未読バッジをDBから再構築する。
-5. 36時間の同期停滞と個別確認待ち件数をstatusへ公開する。
-6. 全消去では永続gate、alarm停止、Cookie残骸不在の確認、利用者recordの原子的消去、自己アンインストールを順序固定し、全repository書込みが同じtransaction内でgateを検査する。
+## 5. 画面と通知
 
-出口条件は、bridgeの成功・source欠落・親domainを含むtarget競合・Cookie APIから返るpartitioned・setup/cleanup失敗・途中残骸・並行実行をCookie値なしで再現でき、今回設定した値・属性から変化したCookieと再起動後の認証Cookieを削除しないこと、401・429・network・5xx・redirectでDB不変、グループschemaまたはID同一性だけの不調では以前の名称を保持してworld同期成功、DNR不成立時fetch 0、Cookie cleanupまたは削除失敗時uninstall 0、既存の削除guardからの再試行でguardを解除せず自己アンインストールまで再実行できることである。
+- ポップアップと記録画面の最上段に、一覧から外れたワールドと現在アクセスできないワールドの合計を表示する。
+- 通常の初期表示ではすべての記録を示し、保存済みの名称、作者、最後のリスト、画像を同じカードで確認できるようにする。消失系通知では要確認に絞る。未保存・読出し失敗・表示失敗を区別し、画像取得の最新集計と再試行操作を案内する。
+- 検索、状態、リストで絞り込み、必要に応じて全ワールドと全変更履歴へ切り替えられるようにする。
+- VRC+の利用記録がある場合は、API応答に現れない未使用枠を含む最大8枠のリストを選択肢へ表示する。
+- ワールドやAPIから受け取った文字列はテキストとして表示し、HTMLとして解釈しない。
+- キーボード操作、見えるフォーカス、明暗どちらのselect背景でも読める文字色を維持する。
+- エラーにはHTTPステータスやstack traceではなく、利用者が次に押すボタンを表示する。
+- 最終正常同期から36時間、8,000ワールド、80,000履歴、または概算250MiBを超えた場合は、バックアップと整理方法を案内する。
 
-### Phase 4: UI・利用者保護
+## 6. セキュリティとライフサイクル
 
-1. カード、検索、フィルターへ利用者設定のリスト名を表示する。
-2. 800件を200件ずつ段階表示する。
-3. 未読、同期停滞、グループ情報の鮮度、保存件数・概算容量を平易な日本語で示す。
-4. 全消去前に対象件数、最終backup日時、外部JSONが残ることを確認する。
+- Auth Cookie Bridgeは固定名2つと固定3hostだけを扱う。source Cookieは変更・延命せず、API側の一時CookieはSecure、HttpOnly、SameSite=Strict、固定path、最長15分へ制限する。
+- Cookie値、APIの認証応答、バックアップ内容、利用者名、ワールド名をログへ出さない。APIのraw objectは検証済みの必要項目だけへ投影してから後段へ渡す。
+- サムネイルは許可したVRChat APIの画像pathからCookie・Refererなしで取得し、画像専用fetchだけ転送に追従する。APIとfiles origin以外への接続をCSPで遮断し、最終URLの形式、元画像のサイズ、MIME、形式、寸法、画素数を検査する。署名付き転送先を保存せず元API URLで保存版を識別し、UIは保存済みBlobだけを表示する。JSON APIの転送拒否は維持する。
+- 全消去は、定期実行の停止、一時Cookie不在の確認、全利用者記録と画像の原子的消去、Chrome側の自己アンインストールの順に行う。消去transaction前の失敗では利用者記録を処理前の状態に保つ。消去後に自己アンインストールできなかった場合は、記録を消去済みであることを表示し、同期を停止したまま削除を再試行できるようにする。
+- Windows側の削除は拡張内データを安全に消去した後に行い、利用者が保存したJSONバックアップは本人が再利用できるよう残す。
 
-出口条件は、API文字列をHTMLとして解釈する経路がなく、キーボード操作とvisible focusを維持し、固定エラーコードごとに次の操作が表示されることである。
+## 7. 検証基準
 
-### Phase 5: 配布・実環境確認
+### 7.1 自動検証
 
-1. 再現可能なmanifest直下ZIPとSHA-256を作る。
-2. installer config の固定path、非昇格、禁止機能不在、単一世代rollback、app root限定削除を自動検査し、Inno Setup 6 compileを行う。
-3. 対象の実PC・実Chromeでfresh install、Downloadsのinstaller削除後の動作、同版再インストール、`0.1.6`から`0.1.7`への上書き更新、103件raw pageを含む完全同期、`cookies`と3つのVRChat host権限、一時Cookieの同期後不在、extension ID・履歴保持を確認する。
-4. 拡張UIの全消去・自己アンインストール後にWindows側を削除する正規順序を確認する。
+`npm run verify` で次を一括実行し、失敗とskipが0件であることを確認する。
 
-Windows 10/11双方、Chrome/Edge双方、複数profile、全障害点、ProcMon、複数AV、コード署名、自動更新は今回のrelease gateに含めない。実アカウントでのAPI応答確認もローカル実装だけでは完了できないため、コードのrelease gateと分けて扱う。
+- ESLint
+- strict typecheck
+- 全単体・結合テストとcoverage計測
+- 配布対象の拡張ビルド
 
-2026-08-23時点で `0.1.0` のfresh installと公式Webログインまでは対象実機で完了した。`0.1.1`の同一origin案は拡張要求が307でAPI hostへ移り、401 `Missing Credentials`になるため不採用とした。`0.1.2`で限定Cookie Bridgeへ置き換えたが、対象実機のsource CookieがSecure属性なしであることを過剰な入力検査が拒否した。Cookie値を表示しない属性診断で、両固定名、`vrchat.com` host-only、path `/`、HttpOnly、SameSite=Lax、非partitioned、非Secureを確認した。
+テストでは少なくとも次を固定する。
 
-`0.1.3`ではPromise版Cookie APIの未検出値 `undefined` を仕様どおり扱い、sourceのSecure属性を必須にせず、targetだけを必ずSecure・HttpOnlyへ固定した。対象実機で `/auth/user` は200になり、Cookie BridgeとCORS境界は成立した。しかし正常な `CurrentUser` の必須field `usesGeneratedPassword` をfield名の `password` だけで拒否する過剰な再帰検査により、後続のお気に入りAPIへ進む前に `API_INCOMPATIBLE` となった。
+- 8リスト・800ワールドの先頭、中間、末尾での差分と冪等性
+- 最初の同期1回の後、303件および800件の画像を画像専用アラームだけで継続保存し、主要APIの再取得や保存済み画像の重複取得がないこと
+- DB schema version 1・2から3への移行と、backup version 1・2の互換性
+- 認証、ネットワーク、401、429、5xx、redirect時のDB不変性
+- Cookie Bridgeの競合、中断、片付け失敗、並行実行
+- 復元と同期の世代競合、全消去中の全書込み拒否、削除失敗からの再試行
+- 全記録の初期表示と消失系通知の絞り込み、通知集約、未読バッジ、リスト選択、サムネイルの自動取得進捗・失敗時の案内。進捗更新で検索・表示件数・スクロールを変えないこと
+- 更新前データに画像ジョブがない場合、取得対象0件の場合、進捗読取り失敗の場合も、記録画面とポップアップの画像件数欄を表示する。保存済み件数と取得待ち件数を混同せず、残り件数が未確認なら明記する。
+- 画像ジョブの再起動後の再開、最大3回の試行上限、429期限厳守、世代/profile変更と全消去時の中止、画像処理中に要求された完全同期の後続実行
+- 旧版の一覧外・アクセス可能ワールドの画像補完、恒久失敗100件を越える候補の再起動後の継続、画像store障害でも主要履歴を保存すること
+- API文字列の安全な表示と、キーボード操作・フォーカス・配色
 
-`0.1.4`では `CurrentUser` 全体のcredential-like field走査を廃止し、bounded JSONのtop-level objectから `id` と `displayName` だけを厳格検証して新objectへコピーする。仕様上存在する `authToken`、`usesGeneratedPassword`、nestedの未知fieldは名前も値も走査せず、DB、backup、log、UIへ渡さない。必要2fieldと応答境界の不正は従来どおりfail closedにする。
+`npm run package` では、検証済み `dist/extension` から再現可能なZIPとWindowsインストーラーを生成する。package、source manifest、built manifestのバージョン一致、sourceとbuildのファイル一致、manifest `key` の不在、成果物のSHA-256出力を確認する。
 
-対象実機の `0.1.4` では `/auth/user`、グループ一覧、お気に入り関係一覧がすべて200となり、認証とCookie Bridgeは通過した。しかし `/worlds/favorites?n=100` の正常な最初のページが103件を返し、実装が要求件数100を応答上限と誤認して `API_INCOMPATIBLE` で停止した。応答値、ID、ワールド名、作者名、Cookieは調査記録へ保存していない。
+### 7.2 配布前の実機確認
 
-`0.1.5`では過剰返却の受入れを実測したworld metadata endpointだけへ限定し、103件を切り捨てず次を `offset=103` とする。raw pageは投影前に総数10,000件の残枠を検査し、5 MiB応答上限、100非空要求、空終端確認、schema、ID重複、page fingerprintの防御を維持する。他の一覧endpointは1ページ100件上限を変えない。13テストファイルを含む `npm run verify` は失敗・skip 0件で、coverageはline 90.34%、branch 79.91%、function 93.92%、`dist/extension` のversionは `0.1.5` となった。`npm run package` とInno Setup 6.7.3の実コンパイルも完走し、v0.1.5のZIPとEXEを生成した。
+対象のWindows PCとGoogle Chromeで次を確認してから配布可否を判断する。自動テストの成功だけで実機項目を完了扱いにしない。
 
-対象実機の `0.1.5` は103件pageの受入れまで進んだが、必須5fieldのうちID形式だけ2件がcanonicalな `wrld_` + UUID検査に合わず完全同期を停止した。名称、作者名、お気に入りグループ、公開状態の不正は0件だった。利用者は該当IDの値を共有しておらず、raw応答、利用者情報、ワールド名、Cookieは記録していない。このため `0.1.5` は自動検証とパッケージ生成の履歴は有効だが、完全同期の配布候補ではない。
+1. 新規導入後、固定場所から拡張を読み込み、公式Webログイン後に完全同期できる。
+2. 100件を超えるワールドページ、最大8リスト、サムネイル取得を含む実データを処理できる。
+3. 同期後にAPI用の一時Cookieと所有markerが残らない。Cookie値は表示・撮影・記録せず、存在と属性だけを確認する。
+4. 直前の配布版から現行版へ更新しても、extension ID、履歴、DB移行結果が保持される。
+5. 同版再インストール後も同じextension IDと履歴を利用できる。
+6. インストーラーをDownloadsから削除してChromeを再起動しても、固定場所の拡張が動作する。
+7. JSONバックアップ、拡張画面からの全消去と自己アンインストール、Windows側アンインストールの順で削除できる。
+8. Chromeが表示する権限とSmartScreenの警告を、利用者向け案内どおり確認できる。
 
-`0.1.6`は `/worlds/favorites` に限り、他必須fieldが正常で、IDが200コードポイント以下・前後空白なし・制御文字なしの非canonical文字列である行をページング用の一時identityにだけ使い、metadata出力前に除外する。raw 103件なら除外後件数にかかわらず次を `offset=103` とする。除外IDは保存、UI、ログ、個別API URL、backupへ渡さない。`/favorites` 関係IDと `GET /worlds/{worldId}` の入力検査、backupのID検査は緩めず、DBへはcanonicalなadapter出力だけを渡す。ID以外の必須field不正、安全でないID、重複は従来どおり失敗させる。
+## 8. 継続管理
 
-`0.1.6` の `npm run verify` はlint、型検査、13テストファイル、coverage、buildをすべて成功し、失敗・skipは0件だった。coverageはline 90.44%、branch 80.12%、function 93.95%で、`dist/extension` のversionは `0.1.6` となった。`npm run package` とInno Setup 6.7.3の実コンパイルも完走し、v0.1.6のZIPとEXEを生成した。一方、対象実機では `/auth/user`、グループ、お気に入り関係、`/worlds/favorites?offset=0` がすべて200だった後、`offset=103` を要求する前に `API_INCOMPATIBLE` となった。追加の値分類は求めず、非canonical IDを安全な文字列として解釈し、重複identityとfingerprintへ残した過剰防御を原因候補とする。このため `0.1.6` は検証・成果物の履歴として維持するが、完全同期の配布候補から外す。実ID、ワールド名、作者名、Cookie、raw応答は記録していない。
-
-`0.1.7`では `/worlds/favorites` だけがnullable identityを明示的にopt-inする。canonicalでないIDは追加の型・値分類もコピーも行わず `{ identity: null, metadata: null }` とし、raw行数はoffsetと総数10,000件上限へ含める。nullはglobal重複検査から除外する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、全件nullのpageは同数だけで誤って反復判定せず、raw offset、最大100非空要求と空終端確認1要求、総数上限で終了を保証する。非空snapshot全体のcanonical metadataが0件なら `API_INCOMPATIBLE` とする。ID以外の必須fieldとcanonical ID重複は厳格に拒否し、`/favorites`、`GET /worlds/{worldId}`、backupのcanonical検査は維持する。除外IDはstorage、UI、log、API URL、backupへ渡さない。
-
-`0.1.7` の `npm run verify` はlint、型検査、13テストファイル、coverage、buildをすべて成功し、失敗・skipは0件だった。coverageはline 90.44%、branch 80.17%、function 93.95%で、`dist/extension` のversionは `0.1.7` となった。`npm run package` とInno Setup 6.7.3の実コンパイルも完走し、v0.1.7のZIPとEXEを生成した。対象実機では `0.1.7` 導入後の「今すぐお気に入りを確認」が成功し、`0.1.6` の `offset=0` 後に発生していた `API_INCOMPATIBLE` は解消した。**推論**: 同期成功までの実装経路から、103件raw pageを処理して `offset=103` 以降へ進む経路も通過したと判断できる。残る実機作業は、同期後の一時Cookie不在、更新前後のextension ID・既存履歴保持、同版再インストール、正規順序のアンインストール、`0.1.7` のfresh install、Downloads内のinstaller削除後の動作、SmartScreen実表示の確認である。
-
-## 4. リスクの判断
-
-| リスク | 判断 | 実装上の扱い |
-| --- | --- | --- |
-| 800件の一覧比較 | 保有 | bulkページングと全ID比較を維持し、専用回帰テストを追加 |
-| 個別GET最大20件 | 保有・軽減 | API保護のため上限維持。2回目404を優先し待ち件数を表示 |
-| 非公式API変更 | 保有・軽減 | strict schema、部分障害境界、固定エラー、releaseごとの仕様確認 |
-| world metadataの非canonical ID | 保有・軽減 | 実測endpointだけがnullable identityを明示opt-inし、値を投影せず除外。canonicalな関係IDを正本とし、不明IDを保存・表示・probeしない |
-| ブラウザ終了中に同期不可 | 保有 | 次回起動時にalarm修復。OS設定や常駐アプリを追加しない |
-| OS通知欠落 | 軽減 | IndexedDB履歴と未読バッジを正本にする |
-| 履歴の長期増加 | 保有・軽減 | core履歴は消さず、同期記録だけ整理し、容量警告と全消去を提供 |
-| ローカルDBが平文 | 保有 | 認証情報を保存せず、OSアカウント・ディスク保護を前提にする |
-| `cookies`権限と一時転送 | 保有・軽減 | 固定名2つ、固定3host（source、親domain競合検査、API target）、設定時最長15分、Secure/HttpOnly/SameSite=Strict、非秘密marker、値非永続、Cookie APIから返るpartitionedのfail closed、削除直前の値・属性一致確認で範囲を限定 |
-| 手動配布の導入・更新 | 軽減 | Inno Setupで固定pathへ配置し、同版再導入、downgrade拒否、単一世代rollbackを行う。自動更新はしない |
-| アンインストール後の残存 | 軽減 | DB論理削除とChrome側自己削除の後にWindows固定ファイルを削除。外部JSON・物理痕跡は保証外と明示 |
-
-## 5. 変更管理
-
-- schema、backup、message、event kindはversioned contractとしてテストする。
-- API raw objectをrepositoryやloggerへ渡さない。
-- 依存追加、権限追加、通信先追加は個別の脅威レビューなしに行わない。
-- 修正は関連テストから始め、最後に全検証を一度通す。
-- push、GitHub Release、外部配布・外部サービス送信は、ローカル検証と公開対象監査の後に明示承認を得て実行する。
+- DB schema、バックアップ形式、message、event kindはversioned contractとしてテストする。
+- API仕様、権限、通信先、依存関係を変更するときは、実装前に要件・設計・脅威モデル・テストを同時に更新する。
+- 修正は関連テストで再現し、最後に全検証を1回通す。
+- 公開対象にはソース、検証済み成果物、利用者向け文書だけを含める。利用者のCookie、バックアップ、ログ、`.env`、ローカル専用文書が混入していないことを監査する。
+- push、GitHub Release、外部配布は、ローカル検証と公開対象監査の後に明示承認を得て実行する。

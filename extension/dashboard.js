@@ -2,6 +2,7 @@
 
 import { MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
 import { openDatabase } from "./lib/database.js";
+import { createFavoriteGroupOptions } from "./lib/favorite-groups.js";
 import {
   commandErrorMessage,
   eventDetail,
@@ -15,6 +16,8 @@ import {
   normalizeStatusResponse,
   presentEventKind,
   presentStatus,
+  presentThumbnailProgress,
+  readThumbnailCount,
   purgeErrorMessage,
   summarizeHistory,
   takeVisibleItems,
@@ -29,7 +32,7 @@ import {
 /** @typedef {import("./lib/ui.js").UiStatus} UiStatus */
 
 const PAGE_SIZE = 200;
-const STORAGE_WARNING_BYTES = 20 * 1024 * 1024;
+const STORAGE_WARNING_BYTES = 250 * 1024 * 1024;
 const WORLD_WARNING_COUNT = 8_000;
 const EVENT_WARNING_COUNT = 80_000;
 const SETTINGS_SCHEDULE_WARNING = "SCHEDULE_REPAIR_FAILED";
@@ -40,8 +43,8 @@ const SETTINGS_UPDATE_OUTCOMES = Object.freeze({
   unconfirmed: "unconfirmed"
 });
 const VALID_TABS = new Set(["worlds", "events", "settings"]);
-const VALID_FILTERS = new Set(["all", "favorite", "missing", "unavailable", "pending"]);
-const VALID_EVENT_FILTERS = new Set(["all", "renamed", "group", "missing", "unavailable", "restored"]);
+const VALID_FILTERS = new Set(["attention", "all", "favorite", "missing", "unavailable", "pending"]);
+const VALID_EVENT_FILTERS = new Set(["attention", "all", "renamed", "group", "missing", "unavailable", "restored"]);
 
 const connectionBadge = requiredElement("connection-badge");
 const noticePanel = requiredElement("notice-panel");
@@ -49,14 +52,21 @@ const noticeTitle = requiredElement("notice-title");
 const noticeDetail = requiredElement("notice-detail");
 const noticeActionButton = /** @type {HTMLButtonElement} */ (requiredElement("notice-action"));
 const onboarding = requiredElement("onboarding");
+const primaryFocus = requiredElement("primary-focus");
+const primaryFocusTitle = requiredElement("primary-focus-title");
+const primaryFocusDetail = requiredElement("primary-focus-detail");
+const primaryFocusButton = /** @type {HTMLButtonElement} */ (requiredElement("primary-focus-button"));
 const openVrchatButton = /** @type {HTMLButtonElement} */ (requiredElement("open-vrchat-button"));
 const syncNowButton = /** @type {HTMLButtonElement} */ (requiredElement("sync-now-button"));
 const worldSearch = /** @type {HTMLInputElement} */ (requiredElement("world-search"));
 const worldFilter = /** @type {HTMLSelectElement} */ (requiredElement("world-filter"));
 const groupFilter = /** @type {HTMLSelectElement} */ (requiredElement("group-filter"));
+const worldFilterPanel = /** @type {HTMLDetailsElement} */ (requiredElement("world-filter-panel"));
 const worldResultCount = requiredElement("world-result-count");
 const worldList = requiredElement("world-list");
 const worldEmpty = requiredElement("world-empty");
+const worldEmptyTitle = requiredElement("world-empty-title");
+const worldEmptyDetail = requiredElement("world-empty-detail");
 const eventList = requiredElement("event-list");
 const eventEmpty = requiredElement("event-empty");
 const eventFilter = /** @type {HTMLSelectElement} */ (requiredElement("event-filter"));
@@ -70,6 +80,8 @@ const settingsUnreadEvents = requiredElement("settings-unread-events");
 const settingsWorldCount = requiredElement("settings-world-count");
 const settingsEventCount = requiredElement("settings-event-count");
 const settingsGroupCount = requiredElement("settings-group-count");
+const settingsThumbnailCount = requiredElement("settings-thumbnail-count");
+const thumbnailCaptureNotice = requiredElement("thumbnail-capture-notice");
 const settingsStorageUsage = requiredElement("settings-storage-usage");
 const settingsLastBackup = requiredElement("settings-last-backup");
 const storageWarning = requiredElement("storage-warning");
@@ -81,9 +93,10 @@ const purgeMessage = requiredElement("purge-message");
 const summaryTotal = requiredElement("summary-total");
 const summaryUnavailable = requiredElement("summary-unavailable");
 const summaryMissing = requiredElement("summary-missing");
-const summaryRenamed = requiredElement("summary-renamed");
+const summaryAttention = requiredElement("summary-attention");
 const historyUnreadBadge = requiredElement("history-unread-badge");
 const tabButtons = Array.from(document.querySelectorAll(".tab"));
+const summaryButtons = Array.from(document.querySelectorAll(".summary-card[data-world-filter]"));
 
 /** @type {DatabaseRepository | null} */
 let repository = null;
@@ -94,6 +107,12 @@ let visibleEventCount = PAGE_SIZE;
 let restoring = false;
 let markingHistoryRead = false;
 let purging = false;
+let thumbnailRenderGeneration = 0;
+let progressEpoch = 0;
+let pageClosed = false;
+let progressPolling = false;
+/** @type {Set<string>} */
+const activeThumbnailObjectUrls = new Set();
 
 const state = {
   /** @type {ProfileRecord | null} */
@@ -104,6 +123,7 @@ const state = {
   events: [],
   /** @type {FavoriteGroupRecord[]} */
   favoriteGroups: [],
+  thumbnailCount: /** @type {number | null} */ (0),
   /** @type {UiStatus} */
   status: normalizeStatusResponse({}),
   statusAvailable: true,
@@ -229,6 +249,8 @@ async function selectProfile(preferredUserId) {
  * @param {string | null} [preferredUserId]
  */
 async function loadData(preferredUserId = null) {
+  progressEpoch += 1;
+  thumbnailRenderGeneration += 1;
   const database = requireRepository();
   let runtimeStatus = normalizeStatusResponse({});
   state.statusAvailable = true;
@@ -247,12 +269,18 @@ async function loadData(preferredUserId = null) {
     state.worlds = [];
     state.events = [];
     state.favoriteGroups = [];
+    state.thumbnailCount = 0;
   } else {
-    [state.worlds, state.events, state.favoriteGroups] = await Promise.all([
+    const [worlds, events, favoriteGroups, thumbnailCount] = await Promise.all([
       database.listWorlds(state.profile.userId),
       database.listEvents(state.profile.userId),
-      database.listFavoriteGroups(state.profile.userId)
+      database.listFavoriteGroups(state.profile.userId),
+      readThumbnailCount(database, state.profile.userId)
     ]);
+    state.worlds = worlds;
+    state.events = events;
+    state.favoriteGroups = favoriteGroups;
+    state.thumbnailCount = thumbnailCount;
   }
 
   const [autoSyncEnabled, notificationsEnabled, storedNextSyncAt, lastBackupAt, storageEstimate] = await Promise.all([
@@ -266,15 +294,21 @@ async function loadData(preferredUserId = null) {
   state.settings.notificationsEnabled = notificationsEnabled !== false;
   state.settings.lastBackupAt = dateSetting(lastBackupAt);
   state.storageEstimate = storageEstimate;
+  const localSummary = summarizeHistory(state.worlds, state.events);
   state.status = {
     ...runtimeStatus,
+    thumbnailProgress: runtimeStatus.activeProfileId === state.profile?.userId ? runtimeStatus.thumbnailProgress : null,
     activeProfileId: state.profile?.userId ?? runtimeStatus.activeProfileId,
     lastSuccessfulSyncAt:
       state.profile?.lastSuccessfulSyncAt ?? runtimeStatus.lastSuccessfulSyncAt,
     nextSyncAt: runtimeStatus.nextSyncAt ?? dateSetting(storedNextSyncAt),
     worldCount: state.worlds.length,
-    eventCount: state.events.length
+    eventCount: state.events.length,
+    attentionWorldCount: localSummary.attention,
+    missingCount: localSummary.missing,
+    unavailableCount: localSummary.unavailable
   };
+  renderThumbnailProgressNotice();
   visibleWorldCount = PAGE_SIZE;
   visibleEventCount = PAGE_SIZE;
   renderAll();
@@ -361,6 +395,7 @@ function formatStorageUsage(bytes) {
 
 function renderAll() {
   renderConnection();
+  renderPrimaryFocus();
   renderSummary();
   renderGroupFilter();
   renderWorlds();
@@ -369,11 +404,43 @@ function renderAll() {
   onboarding.hidden = state.profile !== null && state.status.lastSuccessfulSyncAt !== null;
 }
 
+function renderPrimaryFocus() {
+  primaryFocus.classList.toggle(
+    "is-alert",
+    state.status.unavailableCount > 0 || state.status.missingCount > 0
+  );
+  if (state.profile === null || state.status.lastSuccessfulSyncAt === null) {
+    primaryFocusTitle.textContent = "最初の確認で、消える前の情報を保存します";
+    primaryFocusDetail.textContent = "VRChat公式サイトへログインし、「今すぐ確認」を押してください。";
+    primaryFocusButton.hidden = true;
+    return;
+  }
+  if (state.status.unavailableCount > 0) {
+    primaryFocusTitle.textContent = `現在アクセスできないワールドが${state.status.unavailableCount.toLocaleString("ja-JP")}件あります`;
+    primaryFocusDetail.textContent = "削除・非公開などの可能性があります。保存済みの名前、作者、リスト、サムネイルを最優先で確認できます。";
+    primaryFocusButton.hidden = false;
+    primaryFocusButton.textContent = "保存済みの名前と画像を見る";
+    return;
+  }
+  if (state.status.missingCount > 0) {
+    primaryFocusTitle.textContent = `お気に入り一覧から外れたワールドが${state.status.missingCount.toLocaleString("ja-JP")}件あります`;
+    primaryFocusDetail.textContent = "自分でお気に入り解除した場合も含まれます。保存済みの名前、作者、リスト、サムネイルを確認できます。";
+    primaryFocusButton.hidden = false;
+    primaryFocusButton.textContent = "外れたワールドを見る";
+    return;
+  }
+  primaryFocusTitle.textContent = "現在、消えた可能性のあるワールドはありません";
+  primaryFocusDetail.textContent = "保存中のワールドは、前回の確認時点ですべてお気に入り一覧にあり、アクセス可能でした。";
+  primaryFocusButton.hidden = true;
+}
+
 function renderConnection() {
   const presentation = presentStatus(state.status);
   connectionBadge.className = "badge";
   if (presentation.tone === "ready" || presentation.tone === "working") {
     connectionBadge.classList.add("is-ready");
+  } else if (presentation.tone === "attention") {
+    connectionBadge.classList.add("is-attention");
   } else if (presentation.tone === "error") {
     connectionBadge.classList.add("is-error");
   }
@@ -412,6 +479,18 @@ function renderConnection() {
     );
     return;
   }
+  if (presentation.tone === "attention") {
+    const unavailableFirst = state.status.unavailableCount > 0;
+    showNotice(
+      presentation.title,
+      presentation.detail,
+      {
+        label: unavailableFirst ? "保存済みの名前と画像を見る" : "外れたワールドを見る",
+        run: () => showWorldFilter(unavailableFirst ? "unavailable" : "missing")
+      }
+    );
+    return;
+  }
   if (state.status.favoriteGroupStatus === "stale") {
     showNotice(
       "お気に入りリスト名を今回は更新できませんでした",
@@ -424,10 +503,10 @@ function renderConnection() {
 
 function renderSummary() {
   const summary = summarizeHistory(state.worlds, state.events);
+  summaryAttention.textContent = summary.attention.toLocaleString("ja-JP");
   summaryTotal.textContent = summary.total.toLocaleString("ja-JP");
   summaryUnavailable.textContent = summary.unavailable.toLocaleString("ja-JP");
   summaryMissing.textContent = summary.missing.toLocaleString("ja-JP");
-  summaryRenamed.textContent = summary.renamed.toLocaleString("ja-JP");
   historyUnreadBadge.hidden = state.status.unreadCount === 0;
   historyUnreadBadge.textContent = state.status.unreadCount > 99
     ? "99+"
@@ -440,26 +519,16 @@ function renderGroupFilter() {
   const worldGroups = state.favoriteGroups.filter(
     (group) => group.type === "world" || group.type === "vrcPlusWorld"
   );
-  const knownInternalNames = new Set(worldGroups.map((group) => group.internalName));
-  const groups = [...knownInternalNames]
-    .map((internalName) => ({
-      internalName,
-      displayName: favoriteGroupLabels([internalName], worldGroups)[0] ?? internalName,
-      active: worldGroups.some((group) => group.internalName === internalName && group.active)
-    }))
-    .sort((left, right) => {
-      if (left.active !== right.active) {
-        return left.active ? -1 : 1;
-      }
-      const byName = left.displayName.localeCompare(right.displayName, "ja-JP", {
-        sensitivity: "base"
-      });
-      return byName === 0 ? left.internalName.localeCompare(right.internalName) : byName;
-    });
+  const groups = createFavoriteGroupOptions(worldGroups, [...recordedTags]);
   /** @type {Map<string, number>} */
   const displayNameCounts = new Map();
   for (const group of groups) {
-    displayNameCounts.set(group.displayName, (displayNameCounts.get(group.displayName) ?? 0) + 1);
+    if (group.displayName !== null) {
+      displayNameCounts.set(
+        group.displayName,
+        (displayNameCounts.get(group.displayName) ?? 0) + 1
+      );
+    }
   }
 
   groupFilter.replaceChildren();
@@ -471,21 +540,19 @@ function renderGroupFilter() {
   for (const group of groups) {
     const option = document.createElement("option");
     option.value = group.internalName;
-    const duplicateSuffix = (displayNameCounts.get(group.displayName) ?? 0) > 1
+    const fallbackLabel = group.listNumber === null
+      ? favoriteGroupLabels([group.internalName], [])[0] ?? group.internalName
+      : `リスト${group.listNumber}`;
+    const displayName = group.displayName ?? fallbackLabel;
+    const duplicateSuffix = (displayNameCounts.get(displayName) ?? 0) > 1
       ? `（${group.internalName}）`
       : "";
-    const inactiveSuffix = group.active ? "" : "（以前のリスト）";
-    option.textContent = `${group.displayName}${duplicateSuffix}${inactiveSuffix}`;
-    groupFilter.append(option);
-  }
-  for (const internalName of [...recordedTags].sort((left, right) => left.localeCompare(right))) {
-    if (knownInternalNames.has(internalName)) {
-      continue;
-    }
-    const option = document.createElement("option");
-    option.value = internalName;
-    option.textContent = favoriteGroupLabels([internalName], [])[0]
-      ?? `お気に入りリスト（${internalName}）`;
+    const stateSuffix = group.source === "unused-slot"
+      ? "（未使用）"
+      : group.active === false
+        ? "（以前のリスト）"
+        : "";
+    option.textContent = `${displayName}${duplicateSuffix}${stateSuffix}`;
     groupFilter.append(option);
   }
   groupFilter.value = [...groupFilter.options].some((option) => option.value === selected)
@@ -494,9 +561,11 @@ function renderGroupFilter() {
 }
 
 function renderWorlds() {
+  clearThumbnailObjectUrls();
+  const renderGeneration = ++thumbnailRenderGeneration;
   const requestedFilter = worldFilter.value;
   const filter = VALID_FILTERS.has(requestedFilter)
-    ? /** @type {"all" | "favorite" | "missing" | "unavailable" | "pending"} */ (requestedFilter)
+    ? /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} */ (requestedFilter)
     : "all";
   const matching = filterWorlds(
     state.worlds,
@@ -544,6 +613,18 @@ function renderWorlds() {
   }
   worldResultCount.textContent = `${matching.length.toLocaleString("ja-JP")}件中 ${visible.length.toLocaleString("ja-JP")}件を表示`;
   worldEmpty.hidden = matching.length !== 0;
+  const hasRefinement = worldSearch.value.trim().length > 0 || groupFilter.value.length > 0;
+  if (filter === "attention" && state.profile !== null && !hasRefinement) {
+    worldEmptyTitle.textContent = "現在、要確認のワールドはありません";
+    worldEmptyDetail.textContent = "お気に入り一覧にないワールドや、現在アクセスできないワールドは確認されていません。";
+  } else if (filter === "attention") {
+    worldEmptyTitle.textContent = "この条件に該当する要確認のワールドはありません";
+    worldEmptyDetail.textContent = "検索語やお気に入りリストの絞り込みを変えてください。";
+  } else {
+    worldEmptyTitle.textContent = "該当するワールドはありません";
+    worldEmptyDetail.textContent = "検索語や状態の絞り込みを変えてください。";
+  }
+  void hydrateWorldThumbnails(visible, renderGeneration);
 }
 
 /**
@@ -554,6 +635,13 @@ function renderWorlds() {
  */
 function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
   const card = textElement("article", "world-card", "");
+  card.dataset.worldId = world.worldId;
+  card.classList.toggle("is-unavailable", world.availabilityState === "unavailable");
+  const thumbnail = textElement(
+    "div",
+    "world-thumbnail",
+    "保存画像を読み込み中…"
+  );
   const content = document.createElement("div");
   content.append(
     textElement("h3", "", world.currentName ?? "名前を確認できないワールド"),
@@ -561,8 +649,7 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
       "p",
       "world-meta",
       `${world.authorName ?? "作者名を確認できません"} · 最終更新 ${formatDateTime(world.updatedAt)}`
-    ),
-    textElement("p", "world-meta", world.worldId)
+    )
   );
   const previousNames = recordedPreviousNames
     .filter((name, index, names) => name !== world.currentName && names.indexOf(name) === index)
@@ -578,6 +665,15 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
       textElement("p", "world-meta world-group-meta", `${prefix}: ${favoriteGroupNames.join(" / ")}`)
     );
   }
+  const details = /** @type {HTMLDetailsElement} */ (document.createElement("details"));
+  details.className = "world-details";
+  details.append(
+    textElement("summary", "", "日時とWorld IDを見る"),
+    textElement("p", "world-meta", `初回記録: ${formatDateTime(world.firstSeenAt)}`),
+    textElement("p", "world-meta", `最後にお気に入りで確認: ${formatDateTime(world.lastSeenFavoriteAt)}`),
+    textElement("p", "world-meta", world.worldId)
+  );
+  content.append(details);
 
   const tags = document.createElement("div");
   tags.className = "state-tags";
@@ -590,14 +686,107 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
     }
     tags.append(tag);
   }
-  card.append(content, tags);
+  card.append(thumbnail, content, tags);
   return card;
+}
+
+function clearThumbnailObjectUrls() {
+  for (const objectUrl of activeThumbnailObjectUrls) {
+    URL.revokeObjectURL(objectUrl);
+  }
+  activeThumbnailObjectUrls.clear();
+}
+
+/**
+ * Load binary images only for cards that are currently visible. Blob URLs are
+ * revoked on every rerender so filtering a large history cannot retain image
+ * data in page memory.
+ *
+ * @param {readonly WorldRecord[]} worlds
+ * @param {number} renderGeneration
+ */
+async function hydrateWorldThumbnails(worlds, renderGeneration) {
+  if (repository === null || state.profile === null || worlds.length === 0) {
+    return;
+  }
+  const profileId = state.profile.userId;
+  const worldIds = worlds.map((world) => world.worldId);
+  /** @type {string[][]} */
+  const batches = [];
+  for (let index = 0; index < worldIds.length; index += 50) {
+    batches.push(worldIds.slice(index, index + 50));
+  }
+  const isCurrent = () => renderGeneration === thumbnailRenderGeneration
+    && state.profile?.userId === profileId && repository !== null;
+  /** @type {Awaited<ReturnType<DatabaseRepository["getThumbnails"]>>} */
+  let records;
+  try {
+    records = (await Promise.all(
+      batches.map((batch) => requireRepository().getThumbnails(profileId, batch))
+    )).flat();
+  } catch {
+    if (isCurrent()) {
+      for (const container of worldList.querySelectorAll(".world-thumbnail")) {
+        if (container instanceof HTMLElement) {
+          showThumbnailMessage(container, "保存画像を読み出せませんでした", "再読み込み", renderWorlds);
+        }
+      }
+    }
+    return;
+  }
+  if (!isCurrent()) {
+    return;
+  }
+  const recordsById = new Map(records.map((record) => [record.worldId, record]));
+  const cards = Array.from(worldList.querySelectorAll(".world-card[data-world-id]"))
+    .filter((candidate) => candidate instanceof HTMLElement);
+  for (const world of worlds) {
+    const card = cards.find((candidate) => candidate.dataset.worldId === world.worldId);
+    const container = card?.querySelector(".world-thumbnail");
+    if (!(container instanceof HTMLElement)) {
+      continue;
+    }
+    if (container.querySelector("img") !== null) continue;
+    const record = recordsById.get(world.worldId);
+    if (record === undefined) {
+      if (world.availabilityState === "unavailable") {
+        showThumbnailMessage(container, "画像は未保存です。現在アクセスできないため取得できません。");
+      } else {
+        const progress = state.status.thumbnailProgress;
+        const pending = progress?.state === "running" || progress?.state === "waiting";
+        showThumbnailMessage(container, pending ? "画像の自動取得を待っています" : "画像はまだ保存されていません");
+      }
+      continue;
+    }
+    const showImageFailure = () => {
+      if (isCurrent()) {
+        showThumbnailMessage(container, "保存画像を表示できませんでした", "再読み込み", renderWorlds);
+      }
+    };
+    try {
+      const objectUrl = URL.createObjectURL(record.blob);
+      activeThumbnailObjectUrls.add(objectUrl);
+      const image = document.createElement("img");
+      image.addEventListener("error", () => {
+        URL.revokeObjectURL(objectUrl);
+        activeThumbnailObjectUrls.delete(objectUrl);
+        showImageFailure();
+      }, { once: true });
+      image.alt = `「${world.currentName ?? "名前を確認できないワールド"}」の保存済みサムネイル`;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.src = objectUrl;
+      container.replaceChildren(image);
+    } catch {
+      showImageFailure();
+    }
+  }
 }
 
 function renderEvents() {
   const requestedFilter = eventFilter.value;
   const filter = VALID_EVENT_FILTERS.has(requestedFilter)
-    ? /** @type {"all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} */ (requestedFilter)
+    ? /** @type {"attention" | "all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} */ (requestedFilter)
     : "all";
   const matching = filterEvents(state.events, filter);
   const visible = takeVisibleItems(matching, visibleEventCount);
@@ -630,6 +819,24 @@ function renderEvents() {
   }
   eventResultCount.textContent = `${matching.length.toLocaleString("ja-JP")}件中 ${visible.length.toLocaleString("ja-JP")}件を表示`;
   eventEmpty.hidden = matching.length !== 0;
+}
+
+/**
+ * @param {HTMLElement} container
+ * @param {string} message
+ * @param {string} [actionLabel]
+ * @param {() => void} [action]
+ */
+function showThumbnailMessage(container, message, actionLabel, action) {
+  const content = textElement("div", "thumbnail-message", "");
+  content.append(textElement("span", "", message));
+  if (actionLabel !== undefined && action !== undefined) {
+    const button = /** @type {HTMLButtonElement} */ (textElement("button", "thumbnail-retry", actionLabel));
+    button.type = "button";
+    button.addEventListener("click", action);
+    content.append(button);
+  }
+  container.replaceChildren(content);
 }
 
 /**
@@ -785,6 +992,7 @@ function renderSettings() {
   settingsWorldCount.textContent = `${state.worlds.length.toLocaleString("ja-JP")}件`;
   settingsEventCount.textContent = `${state.events.length.toLocaleString("ja-JP")}件`;
   settingsGroupCount.textContent = `${state.favoriteGroups.length.toLocaleString("ja-JP")}件`;
+  settingsThumbnailCount.textContent = state.thumbnailCount === null ? "確認できません" : `${state.thumbnailCount.toLocaleString("ja-JP")}件`;
   settingsStorageUsage.textContent = formatStorageUsage(state.storageEstimate.usage);
   settingsLastBackup.textContent = state.settings.lastBackupAt === null
     ? "まだありません"
@@ -801,7 +1009,7 @@ function renderSettings() {
     state.storageEstimate.usage !== null
     && state.storageEstimate.usage >= STORAGE_WARNING_BYTES
   ) {
-    warnings.push("概算使用量が20MiB以上あります。");
+    warnings.push("概算使用量が250MiB以上あります。");
   }
   storageWarning.hidden = warnings.length === 0;
   storageWarning.textContent = warnings.length === 0
@@ -843,15 +1051,54 @@ function activateTab(tabName, moveFocus = false) {
 }
 
 /**
+ * Open a world-state view from a summary card or attention notice. Search and
+ * favorite-list filters are cleared so the requested records cannot stay
+ * hidden behind an earlier refinement.
+ *
+ * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {boolean} [moveFocus]
+ */
+function showWorldFilter(filter, moveFocus = false) {
+  worldSearch.value = "";
+  groupFilter.value = "";
+  worldFilter.value = filter;
+  visibleWorldCount = PAGE_SIZE;
+  activateTab("worlds");
+  renderWorlds();
+  if (moveFocus) {
+    worldFilterPanel.open = true;
+    worldFilter.focus();
+  }
+}
+
+/**
  * Interpret only known local tab routes. Unknown or malformed hashes always
- * fall back to the normal worlds view.
+ * fall back to the complete worlds view.
  *
  * @param {string} hash
  * @returns {string}
  */
 function initialTabFromHash(hash) {
-  const tabName = hash.startsWith("#") ? hash.slice(1) : "";
+  const routeName = hash.startsWith("#") ? hash.slice(1) : "";
+  if (routeName === "attention") {
+    return "worlds";
+  }
+  if (routeName === "attention-events") {
+    return "events";
+  }
+  const tabName = routeName;
   return VALID_TABS.has(tabName) ? tabName : "worlds";
+}
+
+/**
+ * Apply only the two allowlisted attention routes. Existing tab routes retain
+ * their normal filter, and unknown hashes cannot inject a filter value.
+ *
+ * @param {string} hash
+ */
+function applyInitialRouteFilters(hash) {
+  worldFilter.value = hash === "#attention" ? "attention" : "all";
+  eventFilter.value = hash === "#attention-events" ? "attention" : "all";
 }
 
 async function markHistoryAsRead() {
@@ -918,8 +1165,30 @@ for (const [index, candidate] of tabButtons.entries()) {
   panel.setAttribute("aria-labelledby", candidate.id);
 }
 document.querySelector(".tabs")?.setAttribute("role", "tablist");
+applyInitialRouteFilters(window.location.hash);
 const initialTab = initialTabFromHash(window.location.hash);
 activateTab(initialTab);
+
+for (const candidate of summaryButtons) {
+  if (!(candidate instanceof HTMLButtonElement)) {
+    continue;
+  }
+  candidate.addEventListener("click", () => {
+    const requestedFilter = candidate.dataset.worldFilter;
+    if (requestedFilter === undefined || !VALID_FILTERS.has(requestedFilter)) {
+      return;
+    }
+    showWorldFilter(
+      /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} */ (
+        requestedFilter
+      )
+    );
+  });
+}
+
+primaryFocusButton.addEventListener("click", () => {
+  showWorldFilter(state.status.unavailableCount > 0 ? "unavailable" : "missing");
+});
 
 worldSearch.addEventListener("input", () => {
   visibleWorldCount = PAGE_SIZE;
@@ -1103,6 +1372,8 @@ importInput.addEventListener("change", async () => {
     return;
   }
   restoring = true;
+  progressEpoch += 1;
+  thumbnailRenderGeneration += 1;
   renderConnection();
   renderSettings();
   backupMessage.textContent = "バックアップを確認しています…";
@@ -1130,10 +1401,14 @@ importInput.addEventListener("change", async () => {
       return;
     }
     const freshStatus = normalizeStatusResponse(statusResponse);
+    const localSummary = summarizeHistory(state.worlds, state.events);
     state.status = {
       ...freshStatus,
       worldCount: state.worlds.length,
-      eventCount: state.events.length
+      eventCount: state.events.length,
+      attentionWorldCount: localSummary.attention,
+      missingCount: localSummary.missing,
+      unavailableCount: localSummary.unavailable
     };
     state.statusAvailable = true;
     if (freshStatus.syncing) {
@@ -1230,6 +1505,7 @@ function showDeletedState(message) {
   state.worlds = [];
   state.events = [];
   state.favoriteGroups = [];
+  state.thumbnailCount = 0;
   state.status = normalizeStatusResponse({});
   state.settings.lastBackupAt = null;
   state.storageEstimate = { usage: 0, quota: state.storageEstimate.quota };
@@ -1250,6 +1526,8 @@ purgeUninstallButton.addEventListener("click", async () => {
   }
 
   purging = true;
+  progressEpoch += 1;
+  thumbnailRenderGeneration += 1;
   renderConnection();
   renderSettings();
   purgeMessage.textContent = "次に表示されるブラウザの確認ダイアログで「削除」を押すと完了します。";
@@ -1277,9 +1555,73 @@ purgeUninstallButton.addEventListener("click", async () => {
   await reopenAfterPurgeFailure(message);
 });
 
+function renderThumbnailProgressNotice() {
+  const progress = presentThumbnailProgress(state.status.thumbnailProgress, { savedCount: state.thumbnailCount, hasProfile: state.profile !== null });
+  const warning = state.thumbnailCount === null
+    ? "保存画像の件数を読み込めませんでした。ワールドと履歴は表示しています。画像の状態は自動で再確認します。"
+    : "";
+  thumbnailCaptureNotice.textContent = [progress, warning].filter(Boolean).join(" ");
+  thumbnailCaptureNotice.hidden = thumbnailCaptureNotice.textContent.length === 0;
+}
+
+// Refresh only progress and visible local images; keep filters, pagination and scroll.
+async function refreshThumbnailProgress() {
+  if (pageClosed || document.hidden || restoring || purging || progressPolling || repository === null) return;
+  progressPolling = true;
+  const epoch = progressEpoch;
+  const profileId = state.profile?.userId;
+  const database = repository;
+  const current = () => !pageClosed && !restoring && !purging && epoch === progressEpoch
+    && repository === database && state.profile?.userId === profileId;
+  try {
+    const response = await sendMessage({ type: "GET_STATUS" });
+    if (!current()) return;
+    if (isRecord(response) && response.ok === false) throw new Error("Status request failed");
+    const status = normalizeStatusResponse(response);
+    if (status.activeProfileId !== profileId) return;
+    const previousProgress = state.status.thumbnailProgress;
+    const previousSavedCount = state.status.thumbnailSavedCount;
+    state.status.thumbnailSavedCount = status.thumbnailSavedCount;
+    state.status.thumbnailProgress = status.thumbnailProgress;
+    renderThumbnailProgressNotice();
+    const progress = status.thumbnailProgress;
+    const imageStatusChanged = JSON.stringify(previousProgress) !== JSON.stringify(progress)
+      || previousSavedCount !== status.thumbnailSavedCount;
+    if (imageStatusChanged || progress?.state === "running" || progress?.state === "waiting") {
+      const ids = new Set(Array.from(worldList.querySelectorAll(".world-card[data-world-id]"))
+        .filter((card) => card instanceof HTMLElement)
+        .filter((card) => card.querySelector(".world-thumbnail img") === null)
+        .map((card) => card.dataset.worldId));
+      await hydrateWorldThumbnails(state.worlds.filter((world) => ids.has(world.worldId)), thumbnailRenderGeneration);
+    }
+    if (!current()) return;
+    if ((imageStatusChanged || state.thumbnailCount === null) && profileId !== undefined) {
+      const count = await readThumbnailCount(database, profileId);
+      if (!current()) return;
+      state.thumbnailCount = count;
+      settingsThumbnailCount.textContent = count === null ? "確認できません" : `${count.toLocaleString("ja-JP")}件`;
+      renderThumbnailProgressNotice();
+    }
+  } catch {
+    if (current()) {
+      thumbnailCaptureNotice.textContent = `${presentThumbnailProgress(null, { savedCount: state.thumbnailCount, hasProfile: state.profile !== null })} 画像の保存状況を読み込めませんでした。自動で表示を再確認します。保存済みの記録はそのままです。`;
+      thumbnailCaptureNotice.hidden = false;
+    }
+  } finally {
+    progressPolling = false;
+  }
+}
+const progressTimer = setInterval(() => { void refreshThumbnailProgress(); }, 3_000);
+document.addEventListener("visibilitychange", () => { void refreshThumbnailProgress(); });
+
 window.addEventListener(
   "pagehide",
   () => {
+    pageClosed = true;
+    progressEpoch += 1;
+    thumbnailRenderGeneration += 1;
+    clearInterval(progressTimer);
+    clearThumbnailObjectUrls();
     repository?.close();
   },
   { once: true }

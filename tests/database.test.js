@@ -14,13 +14,16 @@ import {
   RevisionConflictError,
   STORES,
   SYNC_RUN_RETENTION_ANONYMOUS,
-  SYNC_RUN_RETENTION_PER_PROFILE
+  SYNC_RUN_RETENTION_PER_PROFILE,
+  THUMBNAIL_BATCH_LIMIT,
+  THUMBNAIL_MAX_BYTE_LENGTH
 } from "../extension/lib/database.js";
 
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listWorlds"]>>[number]} WorldRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listEvents"]>>[number]} HistoryEvent */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
 /** @typedef {Parameters<DatabaseRepository["commitSync"]>[0]["syncRun"]} SyncRunRecord */
+/** @typedef {Parameters<DatabaseRepository["putThumbnail"]>[0]} ThumbnailRecord */
 
 const USER_A = "usr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const USER_B = "usr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -80,6 +83,28 @@ function world(userId, worldId, revision = 1) {
     lastEvidenceStatus: 200,
     revision,
     updatedAt: AT_2
+  };
+}
+
+/**
+ * @param {string} userId
+ * @param {string} worldId
+ * @param {Partial<ThumbnailRecord>} [overrides]
+ * @returns {ThumbnailRecord}
+ */
+function thumbnail(userId, worldId, overrides = {}) {
+  const blob = overrides.blob ?? new Blob([`webp:${worldId}`], { type: "image/webp" });
+  const fileId = worldId.replace(/^wrld_/u, "file_");
+  return {
+    userId,
+    worldId,
+    width: 320,
+    height: 180,
+    capturedAt: AT_2,
+    sourceUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/1/file`,
+    ...overrides,
+    blob,
+    byteLength: overrides.byteLength ?? blob.size
   };
 }
 
@@ -235,7 +260,7 @@ async function readAllStores(factory, name) {
 
 /**
  * Create the exact store/index surface shipped as schema v1 and seed records
- * that must survive the v2 upgrade.
+ * that must survive later upgrades.
  *
  * @param {IDBFactory} factory
  * @param {string} name
@@ -285,6 +310,69 @@ async function createV1Database(factory, name) {
     transaction.objectStore("meta").put({ key: "schemaVersion", value: 1 });
     transaction.objectStore("meta").put({ key: "backupFormatVersion", value: 1 });
     transaction.objectStore("meta").put({ key: "lastMigration", value: 1 });
+  });
+  const raw = await requestValue(request);
+  raw.close();
+}
+
+/**
+ * Build a valid schema-v2 database from the v1 fixture so the v2 -> v3 path is
+ * exercised independently from the direct v1 -> v3 migration.
+ *
+ * @param {IDBFactory} factory
+ * @param {string} name
+ * @returns {Promise<void>}
+ */
+async function createV2Database(factory, name) {
+  await createV1Database(factory, name);
+  const request = factory.open(name, 2);
+  request.addEventListener("upgradeneeded", () => {
+    const raw = request.result;
+    const groups = raw.createObjectStore("favoriteGroups", {
+      keyPath: ["userId", "groupId"]
+    });
+    groups.createIndex("by-user", "userId", { unique: false });
+    groups.createIndex("by-user-internal-name", ["userId", "internalName"], {
+      unique: false
+    });
+    groups.put(favoriteGroup(USER_A, GROUP_A));
+
+    const transaction = request.transaction;
+    if (transaction === null) {
+      throw new Error("v2 upgrade transaction is unavailable");
+    }
+    const runs = transaction.objectStore("syncRuns");
+    runs.createIndex(
+      "by-retention-owner-started-at",
+      ["retentionOwner", "startedAt", "syncId"],
+      { unique: false }
+    );
+    const runRequest = runs.openCursor();
+    runRequest.addEventListener("success", () => {
+      const cursor = runRequest.result;
+      if (cursor === null) {
+        return;
+      }
+      const existing = /** @type {SyncRunRecord} */ (cursor.value);
+      cursor.update({ ...existing, retentionOwner: existing.userId ?? ANONYMOUS_RETENTION_OWNER });
+      cursor.continue();
+    });
+
+    const eventRequest = transaction.objectStore("events").openCursor();
+    eventRequest.addEventListener("success", () => {
+      const cursor = eventRequest.result;
+      if (cursor === null) {
+        return;
+      }
+      cursor.update({
+        ...(/** @type {Record<string, unknown>} */ (cursor.value)),
+        notificationEligible: true
+      });
+      cursor.continue();
+    });
+    transaction.objectStore("meta").put({ key: "schemaVersion", value: 2 });
+    transaction.objectStore("meta").put({ key: "backupFormatVersion", value: 2 });
+    transaction.objectStore("meta").put({ key: "lastMigration", value: 2 });
   });
   const raw = await requestValue(request);
   raw.close();
@@ -382,6 +470,176 @@ test("commitSync stores a profile, worlds, groups, and events atomically", async
 
   await database.setSetting("autoSyncEnabled", true);
   assert.equal(await database.getSetting("autoSyncEnabled"), true);
+});
+
+test("thumbnail reads are profile-scoped, projected, and batched in caller order", async (context) => {
+  const database = await repository(`database-thumbnails-${context.name}`);
+  context.after(() => database.close());
+  await database.commitSync({
+    profile: profile(USER_A),
+    worlds: [world(USER_A, WORLD_A), world(USER_A, WORLD_B)],
+    favoriteGroups: [],
+    events: [],
+    syncRun: syncRun(USER_A),
+    expectedWorldRevisions: [
+      { userId: USER_A, worldId: WORLD_A, revision: null },
+      { userId: USER_A, worldId: WORLD_B, revision: null }
+    ],
+    expectedGeneration: 0,
+    settings: successSettings(USER_A)
+  });
+
+  const first = thumbnail(USER_A, WORLD_A);
+  const second = thumbnail(USER_A, WORLD_B, { capturedAt: AT_1, width: 256, height: 144 });
+  await database.putThumbnail(first, 1);
+  await database.putThumbnail(second);
+
+  const stored = await database.getThumbnail(USER_A, WORLD_A);
+  assert.equal(stored?.blob.type, "image/webp");
+  assert.equal(await stored?.blob.text(), await first.blob.text());
+  assert.equal(await database.getThumbnail(USER_B, WORLD_A), null);
+  assert.deepEqual(
+    (await database.getThumbnails(USER_A, [WORLD_B, WORLD_A, WORLD_B, WORLD_C]))
+      .map((record) => record.worldId),
+    [WORLD_B, WORLD_A]
+  );
+
+  const metadata = await database.listThumbnailMetadata(USER_A);
+  assert.deepEqual(metadata.map((record) => record.worldId), [WORLD_A, WORLD_B]);
+  assert.equal(Object.hasOwn(metadata[0] ?? {}, "blob"), false);
+  assert.equal(metadata[0]?.byteLength, first.blob.size);
+  assert.deepEqual(await database.listThumbnailMetadata(USER_B), []);
+
+  await assert.rejects(
+    database.getThumbnails(
+      USER_A,
+      Array.from({ length: THUMBNAIL_BATCH_LIMIT + 1 }, (_, index) => `wrld_${index}`)
+    ),
+    /limited/u
+  );
+  await assert.rejects(
+    database.getThumbnails(USER_A, /** @type {string[]} */ (/** @type {unknown} */ (null))),
+    /must be an array/u
+  );
+  await assert.rejects(database.getThumbnails(USER_A, [" "]), /bounded string/u);
+});
+
+test("thumbnail writes validate durable data and retain the previous image on failure", async (context) => {
+  const database = await repository(`database-thumbnail-validation-${context.name}`);
+  context.after(() => database.close());
+  await database.commitSync({
+    profile: profile(USER_A),
+    worlds: [world(USER_A, WORLD_A)],
+    favoriteGroups: [],
+    events: [],
+    syncRun: syncRun(USER_A),
+    expectedWorldRevisions: [{ userId: USER_A, worldId: WORLD_A, revision: null }],
+    expectedGeneration: 0,
+    settings: successSettings(USER_A)
+  });
+  const original = thumbnail(USER_A, WORLD_A);
+  await database.putThumbnail(original, 1);
+
+  const oversizedBlob = new Blob(
+    [new Uint8Array(THUMBNAIL_MAX_BYTE_LENGTH + 1)],
+    { type: "image/webp" }
+  );
+  const invalidRecords = [
+    thumbnail(USER_A, WORLD_A, {
+      blob: new Blob(["png"], { type: "image/png" })
+    }),
+    thumbnail(USER_A, WORLD_A, { byteLength: original.byteLength + 1 }),
+    thumbnail(USER_A, WORLD_A, { blob: oversizedBlob }),
+    thumbnail(USER_A, WORLD_A, { width: 0 }),
+    thumbnail(USER_A, WORLD_A, { width: 321 }),
+    thumbnail(USER_A, WORLD_A, { height: 321 }),
+    thumbnail(USER_A, WORLD_A, { capturedAt: "not-a-timestamp" }),
+    thumbnail(USER_A, WORLD_A, { sourceUrl: "javascript:alert(1)" }),
+    thumbnail(USER_A, WORLD_A, { sourceUrl: "https://user:secret@example.com/image.webp" }),
+    thumbnail(USER_A, WORLD_A, { sourceUrl: "https://example.com/image.webp" }),
+    thumbnail(USER_A, WORLD_A, { sourceUrl: `https://example.com/${"a".repeat(8_192)}` })
+  ];
+  for (const invalid of invalidRecords) {
+    await assert.rejects(database.putThumbnail(invalid, 1));
+  }
+  await assert.rejects(
+    database.putThumbnail(thumbnail(USER_A, WORLD_B), 1),
+    /target world is not stored/u
+  );
+
+  const afterFailures = await database.getThumbnail(USER_A, WORLD_A);
+  assert.equal(await afterFailures?.blob.text(), await original.blob.text());
+  assert.equal(afterFailures?.capturedAt, original.capturedAt);
+});
+
+test("thumbnail writes snapshot allowed fields before the first asynchronous boundary", async (context) => {
+  const database = await repository(`database-thumbnail-snapshot-${context.name}`);
+  context.after(() => database.close());
+  await database.commitSync({
+    profile: profile(USER_A),
+    worlds: [world(USER_A, WORLD_A)],
+    favoriteGroups: [],
+    events: [],
+    syncRun: syncRun(USER_A),
+    expectedWorldRevisions: [{ userId: USER_A, worldId: WORLD_A, revision: null }],
+    expectedGeneration: 0,
+    settings: successSettings(USER_A)
+  });
+
+  const originalBlob = new Blob(["immutable-webp"], { type: "image/webp" });
+  const candidate = /** @type {ThumbnailRecord & { unexpectedPayload: Blob }} */ ({
+    ...thumbnail(USER_A, WORLD_A, { blob: originalBlob, capturedAt: AT_1 }),
+    unexpectedPayload: new Blob([new Uint8Array(THUMBNAIL_MAX_BYTE_LENGTH)])
+  });
+  const write = database.putThumbnail(candidate, 1);
+  candidate.userId = USER_B;
+  candidate.worldId = WORLD_B;
+  candidate.blob = new Blob(
+    [new Uint8Array(THUMBNAIL_MAX_BYTE_LENGTH + 1)],
+    { type: "image/webp" }
+  );
+  candidate.byteLength = candidate.blob.size;
+  candidate.width = 0;
+  candidate.sourceUrl = "javascript:alert(1)";
+  await write;
+
+  const stored = await database.getThumbnail(USER_A, WORLD_A);
+  assert.equal(await stored?.blob.text(), await originalBlob.text());
+  assert.equal(stored?.capturedAt, AT_1);
+  assert.equal(stored?.width, 320);
+  assert.equal(Object.hasOwn(stored ?? {}, "unexpectedPayload"), false);
+  assert.equal(await database.getThumbnail(USER_B, WORLD_B), null);
+});
+
+test("thumbnail writes honor generation conflicts and the durable purge guard", async (context) => {
+  const database = await repository(`database-thumbnail-conflict-${context.name}`);
+  context.after(() => database.close());
+  await database.commitSync({
+    profile: profile(USER_A),
+    worlds: [world(USER_A, WORLD_A)],
+    favoriteGroups: [],
+    events: [],
+    syncRun: syncRun(USER_A),
+    expectedWorldRevisions: [{ userId: USER_A, worldId: WORLD_A, revision: null }],
+    expectedGeneration: 0,
+    settings: successSettings(USER_A)
+  });
+  const original = thumbnail(USER_A, WORLD_A);
+  await database.putThumbnail(original, 1);
+  await database.replaceProfileData({
+    profile: profile(USER_A, "Restored"),
+    worlds: [world(USER_A, WORLD_A)],
+    favoriteGroups: [],
+    events: []
+  });
+
+  const replacement = thumbnail(USER_A, WORLD_A, { capturedAt: AT_1 });
+  await assert.rejects(database.putThumbnail(replacement, 1), GenerationConflictError);
+  assert.equal((await database.getThumbnail(USER_A, WORLD_A))?.capturedAt, AT_2);
+
+  assert.equal(await database.beginPurge(), true);
+  await assert.rejects(database.putThumbnail(replacement), PurgePendingError);
+  assert.equal((await database.getThumbnail(USER_A, WORLD_A))?.capturedAt, AT_2);
 });
 
 test("a failed commitSync rolls back every store", async (context) => {
@@ -588,6 +846,8 @@ test("replace and clear affect only the selected profile", async (context) => {
     expectedGeneration: 0,
     settings: successSettings(USER_B)
   });
+  await database.putThumbnail(thumbnail(USER_A, WORLD_A), 1);
+  await database.putThumbnail(thumbnail(USER_B, WORLD_B), 1);
 
   const replacementGeneration = await database.replaceProfileData({
     profile: profile(USER_A, "Alice restored"),
@@ -606,6 +866,8 @@ test("replace and clear affect only the selected profile", async (context) => {
     [WORLD_B]
   );
   assert.equal(await database.getSetting("notificationsEnabled"), false);
+  assert.equal((await database.getThumbnail(USER_A, WORLD_A))?.worldId, WORLD_A);
+  assert.equal((await database.getThumbnail(USER_B, WORLD_B))?.worldId, WORLD_B);
 
   const clearedGeneration = await database.clearProfile(USER_A);
   assert.equal(clearedGeneration, 3);
@@ -613,6 +875,8 @@ test("replace and clear affect only the selected profile", async (context) => {
   assert.equal(await database.getProfile(USER_A), null);
   assert.equal((await database.getProfile(USER_B))?.displayName, "Bob");
   assert.equal((await database.listEvents(USER_B)).length, 1);
+  assert.equal(await database.getThumbnail(USER_A, WORLD_A), null);
+  assert.equal((await database.getThumbnail(USER_B, WORLD_B))?.worldId, WORLD_B);
   assert.equal(await database.getDataGeneration(USER_B), 1);
 });
 
@@ -819,6 +1083,7 @@ test("v1 databases migrate in place without losing records", async (context) => 
 
   const stores = await readAllStores(factory, name);
   assert.equal(stores.favoriteGroups?.length, 0);
+  assert.deepEqual(stores.thumbnails, []);
   assert.equal(
     (/** @type {Array<{ retentionOwner?: string }>} */ (stores.syncRuns))[0]?.retentionOwner,
     USER_A
@@ -835,17 +1100,53 @@ test("v1 databases migrate in place without losing records", async (context) => 
 
   const raw = await openRawDatabase(factory, name);
   try {
-    const transaction = raw.transaction(STORES.syncRuns, "readonly");
+    const transaction = raw.transaction([STORES.syncRuns, STORES.thumbnails], "readonly");
     assert.equal(
       transaction.objectStore(STORES.syncRuns).indexNames.contains(
         "by-retention-owner-started-at"
       ),
       true
     );
+    const thumbnailStore = transaction.objectStore(STORES.thumbnails);
+    assert.deepEqual(thumbnailStore.keyPath, ["userId", "worldId"]);
+    assert.equal(thumbnailStore.indexNames.contains("by-user"), true);
     await transactionDone(transaction);
   } finally {
     raw.close();
   }
+});
+
+test("v2 databases add the thumbnail store without rewriting existing data", async (context) => {
+  const name = `database-v2-migration-${context.name}`;
+  const factory = new IDBFactory();
+  await createV2Database(factory, name);
+  const database = new DatabaseRepository({ factory, name });
+  await database.open();
+  context.after(() => database.close());
+
+  assert.equal((await database.getProfile(USER_A))?.displayName, "v1 Alice");
+  assert.deepEqual((await database.listWorlds(USER_A)).map((record) => record.worldId), [WORLD_A]);
+  assert.deepEqual(
+    (await database.listFavoriteGroups(USER_A)).map((record) => record.groupId),
+    [GROUP_A]
+  );
+  assert.equal((await database.listEvents(USER_A)).length, 1);
+  assert.deepEqual(await database.listThumbnailMetadata(USER_A), []);
+
+  const stores = await readAllStores(factory, name);
+  assert.deepEqual(stores.thumbnails, []);
+  assert.equal((/** @type {unknown[]} */ (stores.profiles)).length, 1);
+  assert.equal((/** @type {unknown[]} */ (stores.worlds)).length, 1);
+  assert.equal((/** @type {unknown[]} */ (stores.favoriteGroups)).length, 1);
+  assert.deepEqual(
+    (/** @type {Array<{ key: string, value: unknown }>} */ (stores.meta))
+      .sort((left, right) => left.key.localeCompare(right.key)),
+    [
+      { key: "backupFormatVersion", value: 2 },
+      { key: "lastMigration", value: DATABASE_VERSION },
+      { key: "schemaVersion", value: DATABASE_VERSION }
+    ]
+  );
 });
 
 test("sync run retention is independent per profile and bounded for anonymous failures", async (context) => {
@@ -964,7 +1265,13 @@ test("getProfileStats counts worlds, events, and pending probes without double c
       availabilityState: /** @type {const} */ ("unavailable_once"),
       unavailableCount: /** @type {const} */ (1)
     },
-    world(USER_A, WORLD_D)
+    {
+      ...world(USER_A, WORLD_D),
+      membershipState: /** @type {const} */ ("not_in_favorites"),
+      membershipMissCount: /** @type {const} */ (2),
+      availabilityState: /** @type {const} */ ("unavailable"),
+      unavailableCount: /** @type {const} */ (2)
+    }
   ];
   await database.commitSync({
     profile: profile(USER_A),
@@ -984,12 +1291,18 @@ test("getProfileStats counts worlds, events, and pending probes without double c
   assert.deepEqual(await database.getProfileStats(USER_A), {
     worldCount: 4,
     eventCount: 2,
-    pendingProbeCount: 3
+    pendingProbeCount: 3,
+    attentionWorldCount: 1,
+    missingCount: 1,
+    unavailableCount: 1
   });
   assert.deepEqual(await database.getProfileStats(USER_B), {
     worldCount: 0,
     eventCount: 0,
-    pendingProbeCount: 0
+    pendingProbeCount: 0,
+    attentionWorldCount: 0,
+    missingCount: 0,
+    unavailableCount: 0
   });
 });
 
@@ -1032,6 +1345,7 @@ test("purgeAllData atomically leaves only the purge guard and schema metadata", 
     expectedGeneration: 0,
     settings: successSettings(USER_A)
   });
+  await database.putThumbnail(thumbnail(USER_A, WORLD_A), 1);
   await database.recordSyncRun(failedSyncRun(null, "anonymous-before-purge", 0));
   await database.setSettings({
     autoSyncEnabled: true,
@@ -1044,6 +1358,7 @@ test("purgeAllData atomically leaves only the purge guard and schema metadata", 
 
   assert.deepEqual(await database.listProfiles(), []);
   assert.deepEqual(await database.listWorlds(USER_A), []);
+  assert.deepEqual(await database.listThumbnailMetadata(USER_A), []);
   assert.deepEqual(await database.listFavoriteGroups(USER_A), []);
   assert.deepEqual(await database.listEvents(USER_A), []);
   assert.equal(await database.getUnreadCount(USER_A), 0);
@@ -1052,7 +1367,14 @@ test("purgeAllData atomically leaves only the purge guard and schema metadata", 
   assert.equal(await database.getSetting("purgePending"), true);
 
   const stores = await readAllStores(factory, name);
-  for (const storeName of ["profiles", "worlds", "favoriteGroups", "events", "syncRuns"]) {
+  for (const storeName of [
+    "profiles",
+    "worlds",
+    "thumbnails",
+    "favoriteGroups",
+    "events",
+    "syncRuns"
+  ]) {
     assert.deepEqual(stores[storeName], []);
   }
   assert.deepEqual(stores.settings, [{ key: "purgePending", value: true }]);
@@ -1080,6 +1402,7 @@ test("purgeAllData aborts without partial deletion when a store operation fails"
     expectedGeneration: 0,
     settings: successSettings(USER_A)
   });
+  await database.putThumbnail(thumbnail(USER_A, WORLD_A), 1);
   assert.equal(await database.beginPurge(), true);
 
   const originalClear = IDBObjectStore.prototype.clear;
@@ -1097,6 +1420,7 @@ test("purgeAllData aborts without partial deletion when a store operation fails"
 
   assert.equal((await database.getProfile(USER_A))?.displayName, "Before failed purge");
   assert.equal((await database.listWorlds(USER_A)).length, 1);
+  assert.equal((await database.listThumbnailMetadata(USER_A)).length, 1);
   assert.equal((await database.listFavoriteGroups(USER_A)).length, 1);
   assert.equal((await database.listEvents(USER_A)).length, 1);
   assert.equal(await database.getUnreadCount(USER_A), 1);
@@ -1225,4 +1549,23 @@ test("a restore started before the guard commits first and is then erased by pur
   assert.equal(await dashboard.getUnreadCount(USER_A), 0);
   assert.equal(await dashboard.getDataGeneration(USER_A), 0);
   assert.equal(await dashboard.getSetting("purgePending"), true);
+});
+
+test("thumbnail checkpoints validate bounded data and atomically reject stale profiles, generations, and purge", async (context) => {
+  const database = await repository(`thumbnail-checkpoint-${context.name}`);
+  context.after(() => database.close());
+  await database.setSetting("activeProfileId", USER_A);
+  const job = {version: 1, userId: USER_A, generation: 0, capturedAt: AT_1,
+    items: [{id: WORLD_A, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256", attempts: 0}],
+    nextAttemptAt: null, state: "waiting"};
+  await database.setThumbnailSettings(USER_A, 0, {thumbnailJob: job});
+  await assert.rejects(database.setThumbnailSettings(USER_A, 1, {thumbnailJob: job}), GenerationConflictError);
+  await assert.rejects(database.setSetting("thumbnailJob", {...job, token: "synthetic-not-a-secret"}), /Invalid thumbnail job/);
+  await assert.rejects(database.setSetting("thumbnailJob", {...job, items: Array(10_001).fill(job.items[0])}), /Invalid thumbnail job/);
+  await assert.rejects(database.setSetting("thumbnailJob", {...job, items: [{...job.items[0], thumbnailImageUrl: "https://example.com/image?signature=synthetic"}]}), /Invalid thumbnail job/);
+  assert.deepEqual(await database.getSetting("thumbnailJob"), job);
+  await database.setSetting("activeProfileId", USER_B);
+  await assert.rejects(database.setThumbnailSettings(USER_A, 0, {thumbnailJob: job}), GenerationConflictError);
+  await database.beginPurge();
+  await assert.rejects(database.setThumbnailSettings(USER_A, 0, {thumbnailJob: job}), PurgePendingError);
 });

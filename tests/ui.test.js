@@ -5,10 +5,19 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  ALL_WORLDS_DASHBOARD_PATH,
+  createAllWorldsDashboardOpener,
+  ATTENTION_DASHBOARD_PATH,
   HISTORY_DASHBOARD_PATH,
+  createAttentionDashboardOpener,
   createHistoryDashboardOpener,
   createHistoryNotificationHandlers
 } from "../extension/background.js";
+import {
+  ATTENTION_NOTIFICATION_ID_PREFIX,
+  NOTIFICATION_ID_PREFIX,
+  createNotificationPresentation
+} from "../extension/lib/sync-service.js";
 import {
   commandErrorMessage,
   eventDetail,
@@ -19,6 +28,9 @@ import {
   normalizeCommandResponse,
   normalizePurgeResponse,
   normalizeStatusResponse,
+  normalizeThumbnailProgress,
+  presentThumbnailProgress,
+  readThumbnailCount,
   parseFavoriteGroupTags,
   presentEventKind,
   presentStatus,
@@ -38,12 +50,16 @@ const USER_ID = "usr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const WORLD_A = "wrld_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const WORLD_B = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-test("notification and history actions open the fixed events route", async () => {
+test("popup opens all records while notifications retain their attention or history routes", async () => {
   /** @type {string[]} */
   const resolvedPaths = [];
   /** @type {{url: string}[]} */
   const openedTabs = [];
-  const openHistoryDashboard = createHistoryDashboardOpener({
+  /** @type {{
+   *   resolveExtensionUrl: (path: string) => string,
+   *   createTab: (details: {url: string}) => Promise<void>
+   * }} */
+  const openerDependencies = {
     resolveExtensionUrl: (path) => {
       resolvedPaths.push(path);
       return `chrome-extension://fixed-id/${path}`;
@@ -51,19 +67,41 @@ test("notification and history actions open the fixed events route", async () =>
     createTab: async (details) => {
       openedTabs.push(details);
     }
+  };
+  const openAttentionDashboard = createAttentionDashboardOpener(openerDependencies);
+  const openHistoryDashboard = createHistoryDashboardOpener(openerDependencies);
+  const handlers = createHistoryNotificationHandlers({
+    openHistoryDashboard,
+    openAttentionDashboard
   });
-  const handlers = createHistoryNotificationHandlers({ openHistoryDashboard });
 
-  await handlers.onClicked("vrc-favworld-check-change-sync-1");
-  await handlers.onButtonClicked("vrc-favworld-check-change-sync-2", 0);
+  await createAllWorldsDashboardOpener(openerDependencies)();
+  await openAttentionDashboard();
+  await handlers.onClicked(`${NOTIFICATION_ID_PREFIX}sync-1`);
+  await handlers.onButtonClicked(`${NOTIFICATION_ID_PREFIX}sync-2`, 0);
+  await handlers.onClicked(`${ATTENTION_NOTIFICATION_ID_PREFIX}sync-3`);
+  await handlers.onButtonClicked(`${ATTENTION_NOTIFICATION_ID_PREFIX}sync-4`, 0);
   await handlers.onClicked("another-extension-notification");
-  await handlers.onButtonClicked("vrc-favworld-check-change-sync-3", 1);
+  await handlers.onButtonClicked(`${ATTENTION_NOTIFICATION_ID_PREFIX}sync-5`, 1);
 
   assert.equal(HISTORY_DASHBOARD_PATH, "dashboard.html#events");
-  assert.deepEqual(resolvedPaths, [HISTORY_DASHBOARD_PATH, HISTORY_DASHBOARD_PATH]);
+  assert.equal(ATTENTION_DASHBOARD_PATH, "dashboard.html#attention");
+  assert.equal(ALL_WORLDS_DASHBOARD_PATH, "dashboard.html#all");
+  assert.deepEqual(resolvedPaths, [
+    ALL_WORLDS_DASHBOARD_PATH,
+    ATTENTION_DASHBOARD_PATH,
+    HISTORY_DASHBOARD_PATH,
+    HISTORY_DASHBOARD_PATH,
+    ATTENTION_DASHBOARD_PATH,
+    ATTENTION_DASHBOARD_PATH
+  ]);
   assert.deepEqual(openedTabs, [
+    { url: "chrome-extension://fixed-id/dashboard.html#all" },
+    { url: "chrome-extension://fixed-id/dashboard.html#attention" },
     { url: "chrome-extension://fixed-id/dashboard.html#events" },
-    { url: "chrome-extension://fixed-id/dashboard.html#events" }
+    { url: "chrome-extension://fixed-id/dashboard.html#events" },
+    { url: "chrome-extension://fixed-id/dashboard.html#attention" },
+    { url: "chrome-extension://fixed-id/dashboard.html#attention" }
   ]);
 });
 
@@ -121,6 +159,63 @@ function historyEvent(overrides) {
   };
 }
 
+test("notification copy prioritizes unique attention worlds without exposing names", () => {
+  const attention = createNotificationPresentation([
+    historyEvent({
+      eventId: "missing-a",
+      worldId: WORLD_A,
+      kind: "favorite_missing_confirmed"
+    }),
+    historyEvent({
+      eventId: "unavailable-a",
+      worldId: WORLD_A,
+      kind: "access_unavailable_confirmed",
+      evidence: { source: "probe", httpStatus: 404 }
+    }),
+    historyEvent({
+      eventId: "missing-b",
+      worldId: WORLD_B,
+      kind: "favorite_missing_confirmed"
+    }),
+    historyEvent({
+      eventId: "renamed-b",
+      worldId: WORLD_B,
+      kind: "name_changed",
+      before: "秘密にしたい以前の名前",
+      after: "秘密にしたい現在名"
+    })
+  ]);
+  assert.deepEqual(attention, {
+    attention: true,
+    title: "現在アクセスできないワールドがあります",
+    message: "要確認: 2件（現在アクセス不可1件・お気に入り一覧にない2件）。その他の変化: 1件。",
+    buttonTitle: "保存済みの情報を見る"
+  });
+  assert.doesNotMatch(JSON.stringify(attention), /秘密にしたい|wrld_/u);
+
+  assert.deepEqual(createNotificationPresentation([
+    historyEvent({ eventId: "renamed-a", worldId: WORLD_A, kind: "name_changed" })
+  ]), {
+    attention: false,
+    title: "お気に入りワールドに変化があります",
+    message: "1件の変化を記録しました。履歴を確認してください。",
+    buttonTitle: "履歴を見る"
+  });
+
+  assert.deepEqual(createNotificationPresentation([
+    historyEvent({
+      eventId: "missing-only",
+      worldId: WORLD_A,
+      kind: "favorite_missing_confirmed"
+    })
+  ]), {
+    attention: true,
+    title: "お気に入り一覧にないワールドがあります",
+    message: "要確認: 1件（お気に入り一覧にない1件）。手動でお気に入り解除した場合も含まれます。",
+    buttonTitle: "保存済みの情報を見る"
+  });
+});
+
 /**
  * @param {Partial<FavoriteGroupRecord>} [overrides]
  * @returns {FavoriteGroupRecord}
@@ -158,6 +253,9 @@ test("service-worker status is normalized without reflecting unknown values", ()
       eventCount: -1,
       pendingProbeCount: 3,
       unreadCount: 2,
+      attentionWorldCount: 4,
+      missingCount: 2,
+      unavailableCount: 3,
       favoriteGroupStatus: "success",
       lastResult: "success",
       unexpected: "do not display"
@@ -165,6 +263,8 @@ test("service-worker status is normalized without reflecting unknown values", ()
   });
 
   assert.deepEqual(status, {
+    thumbnailProgress: null,
+    thumbnailSavedCount: null,
     syncing: true,
     authRequired: false,
     activeProfileId: USER_ID,
@@ -174,6 +274,9 @@ test("service-worker status is normalized without reflecting unknown values", ()
     eventCount: 0,
     pendingProbeCount: 3,
     unreadCount: 2,
+    attentionWorldCount: 4,
+    missingCount: 2,
+    unavailableCount: 3,
     favoriteGroupStatus: "success",
     lastResult: "success"
   });
@@ -184,10 +287,16 @@ test("new status counters fail closed and stale sync is actionable after 36 hour
   const malformed = normalizeStatusResponse({
     pendingProbeCount: -1,
     unreadCount: Number.NaN,
+    attentionWorldCount: -1,
+    missingCount: "1",
+    unavailableCount: Number.NaN,
     favoriteGroupStatus: "unknown"
   });
   assert.equal(malformed.pendingProbeCount, 0);
   assert.equal(malformed.unreadCount, 0);
+  assert.equal(malformed.attentionWorldCount, 0);
+  assert.equal(malformed.missingCount, 0);
+  assert.equal(malformed.unavailableCount, 0);
   assert.equal(malformed.favoriteGroupStatus, null);
 
   const status = normalizeStatusResponse({
@@ -202,6 +311,22 @@ test("new status counters fail closed and stale sync is actionable after 36 hour
   assert.equal(stalled.tone, "error");
   assert.match(stalled.title, /36時間/u);
   assert.match(stalled.detail, /今すぐ確認/u);
+
+  const attention = normalizeStatusResponse({
+    lastSuccessfulSyncAt: "2026-08-11T00:00:00.000Z",
+    lastResult: "success",
+    attentionWorldCount: 2,
+    missingCount: 2,
+    unavailableCount: 1
+  });
+  const attentionPresentation = presentStatus(
+    attention,
+    Date.parse("2026-08-11T01:00:00.000Z")
+  );
+  assert.equal(attentionPresentation.tone, "attention");
+  assert.match(attentionPresentation.title, /アクセスできないワールドが1件/u);
+  assert.match(attentionPresentation.detail, /一覧から外れたワールドは2件/u);
+  assert.match(attentionPresentation.detail, /保存済みの名前と画像/u);
 });
 
 test("auth and failure status use actionable Japanese messages", () => {
@@ -380,12 +505,68 @@ test("world filters distinguish confirmed and pending states", () => {
 
   assert.equal(worldMatchesFilter(missing, "missing"), true);
   assert.equal(worldMatchesFilter(missing, "unavailable"), true);
+  assert.equal(worldMatchesFilter(missing, "attention"), true);
   assert.equal(worldMatchesFilter(pending, "pending"), true);
+  assert.equal(worldMatchesFilter(pending, "attention"), false);
   assert.deepEqual(worldStateTags(missing).map((tag) => tag.label), [
     "お気に入り一覧にない",
     "現在アクセス不可"
   ]);
   assert.ok(worldStateTags(pending).every((tag) => tag.tone === "pending"));
+});
+
+test("attention view shows each confirmed world once and orders latest confirmations first", () => {
+  const olderBothStates = world({
+    worldId: WORLD_A,
+    membershipState: "not_in_favorites",
+    membershipMissCount: 2,
+    availabilityState: "unavailable",
+    unavailableCount: 2
+  });
+  const newerUnavailable = world({
+    worldId: WORLD_B,
+    availabilityState: "unavailable",
+    unavailableCount: 2
+  });
+  const events = [
+    historyEvent({
+      eventId: "older-missing",
+      worldId: WORLD_A,
+      kind: "favorite_missing_confirmed",
+      observedAt: "2026-08-10T00:00:00.000Z"
+    }),
+    historyEvent({
+      eventId: "older-unavailable",
+      worldId: WORLD_A,
+      kind: "access_unavailable_confirmed",
+      observedAt: "2026-08-10T00:00:00.000Z",
+      evidence: { source: "probe", httpStatus: 404 }
+    }),
+    historyEvent({
+      eventId: "newer-unavailable",
+      worldId: WORLD_B,
+      kind: "access_unavailable_confirmed",
+      observedAt: "2026-08-11T00:00:00.000Z",
+      evidence: { source: "probe", httpStatus: 404 }
+    })
+  ];
+
+  assert.deepEqual(
+    filterWorlds([olderBothStates, newerUnavailable], events, "", "attention")
+      .map((item) => item.worldId),
+    [WORLD_B, WORLD_A]
+  );
+  assert.deepEqual(
+    filterEvents(events, "attention").map((event) => event.eventId),
+    ["newer-unavailable", "older-missing", "older-unavailable"]
+  );
+  assert.deepEqual(summarizeHistory([olderBothStates, newerUnavailable], events), {
+    attention: 2,
+    total: 2,
+    unavailable: 2,
+    missing: 1,
+    renamed: 0
+  });
 });
 
 test("event filtering groups recovery events and always sorts newest first", () => {
@@ -434,6 +615,7 @@ test("event and summary copy does not claim deletion or privacy", () => {
   assert.equal(presentEventKind(unavailableEvent.kind).title, "現在アクセスできないことを確認しました");
   assert.match(eventDetail(unavailableEvent, unavailableWorld), /断定しません/u);
   assert.deepEqual(summarizeHistory([unavailableWorld], [unavailableEvent]), {
+    attention: 1,
     total: 1,
     unavailable: 1,
     missing: 1,
@@ -481,6 +663,36 @@ test("backup restore keeps restored data explicit across settings follow-up outc
   assert.doesNotMatch(dashboard, /followupCompleted/u);
 });
 
+test("dashboard keeps native select options readable and shows all records by default", async () => {
+  const [html, css, popupHtml, popupScript, popupCss] = await Promise.all([
+    readFile(new URL("../extension/dashboard.html", import.meta.url), "utf8"),
+    readFile(new URL("../extension/styles/dashboard.css", import.meta.url), "utf8"),
+    readFile(new URL("../extension/popup.html", import.meta.url), "utf8"),
+    readFile(new URL("../extension/popup.js", import.meta.url), "utf8"),
+    readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8")
+  ]);
+
+  assert.match(html, /<option value="all" selected>すべての記録<\/option>/u);
+  assert.match(html, /<button class="summary-card[^>]+data-world-filter="attention">/u);
+  assert.match(html, /id="primary-focus"/u);
+  assert.match(html, /保存済みの名前と画像を見る/u);
+  assert.match(css, /select\s*\{\s*color-scheme:\s*light;/u);
+  assert.match(
+    css,
+    /select option\s*\{[^}]*color:\s*#15142a;[^}]*background-color:\s*#fff;/iu
+  );
+  assert.match(
+    css,
+    /\.select-field select\s*\{[^}]*color:\s*#15142a;[^}]*background:\s*#fff;/iu
+  );
+  assert.ok(html.indexOf('id="primary-focus"') < html.indexOf('id="notice-panel"'));
+  assert.ok(popupHtml.indexOf('id="attention-card"') < popupHtml.indexOf('class="status-card"'));
+  assert.ok(popupHtml.indexOf('id="dashboard-button"') < popupHtml.indexOf('id="sync-button"'));
+  assert.match(popupScript, /attentionCard\.classList\.toggle\("is-alert", hasAttention\)/u);
+  assert.match(popupScript, /presentation\.tone === "attention"/u);
+  assert.match(popupCss, /\.attention-card\.is-alert/u);
+});
+
 test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   const sources = await Promise.all([
     readFile(new URL("../extension/popup.js", import.meta.url), "utf8"),
@@ -495,12 +707,14 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   const dashboard = sources[1] ?? "";
   assert.ok(dashboard.indexOf("file.size > MAX_BACKUP_BYTES") < dashboard.indexOf("await file.text()"));
   assert.ok(dashboard.indexOf("parseBackup(text)") < dashboard.indexOf("globalThis.confirm"));
-  const restoreStatusCheck = dashboard.lastIndexOf('type: "GET_STATUS"');
+  const restoreStatusCheck = dashboard.indexOf('type: "GET_STATUS"', dashboard.indexOf("parseBackup(text)"));
   assert.ok(dashboard.indexOf("parseBackup(text)") < restoreStatusCheck);
   assert.ok(restoreStatusCheck < dashboard.indexOf("globalThis.confirm"));
   assert.ok(dashboard.indexOf("globalThis.confirm") < dashboard.indexOf("await restoreBackup"));
   assert.match(dashboard, /preview\.exportedAt/u);
   assert.match(dashboard, /URL\.revokeObjectURL/u);
+  assert.match(dashboard, /URL\.createObjectURL\(record\.blob\)/u);
+  assert.doesNotMatch(dashboard, /image\.src\s*=\s*record\.sourceUrl/u);
   assert.match(dashboard, /const PAGE_SIZE = 200/u);
   assert.match(dashboard, /type: "MARK_HISTORY_READ"/u);
   assert.match(
@@ -517,7 +731,7 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   assert.match(dashboard, /navigator\.storage\.estimate\(\)/u);
   assert.match(dashboard, /const WORLD_WARNING_COUNT = 8_000/u);
   assert.match(dashboard, /const EVENT_WARNING_COUNT = 80_000/u);
-  assert.match(dashboard, /const STORAGE_WARNING_BYTES = 20 \* 1024 \* 1024/u);
+  assert.match(dashboard, /const STORAGE_WARNING_BYTES = 250 \* 1024 \* 1024/u);
   assert.match(dashboard, /favoriteGroupStatus === "stale"/u);
   assert.match(dashboard, /rawResponse\.settingsSaved !== true/u);
   assert.match(dashboard, /rawResponse\.scheduleWarning === SETTINGS_SCHEDULE_WARNING/u);
@@ -534,4 +748,299 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   assert.match(dashboard, /syncNowButton\.disabled = state\.status\.syncing \|\| restoring/u);
   assert.match(dashboard, /if \(freshStatus\.syncing\)/u);
   assert.match(dashboard, /if \(restoring\)/u);
+});
+
+test("thumbnail loading distinguishes missing, read errors, image errors and stale profiles", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function hydrateWorldThumbnails(");
+  const end = source.indexOf("\n/**", start);
+  const functionSource = source.slice(start, end);
+  class Element {
+    dataset = { worldId: WORLD_A };
+    /** @type {Element[]} */
+    children = [];
+    /** @type {Map<string, () => void>} */
+    listeners = new Map();
+    /** @param {string} selector */
+    querySelector(selector) { return selector === "img" ? null : this; }
+    /** @param {...Element} children */
+    replaceChildren(...children) { this.children = children; }
+    /** @param {string} type @param {() => void} callback */
+    addEventListener(type, callback) { this.listeners.set(type, callback); }
+  }
+  const container = new Element();
+  /** @type {Element[]} */
+  const images = [];
+  /** @type {[Element, string, string?, (() => void)?][]} */
+  const messages = [];
+  /** @type {string[]} */
+  const revoked = [];
+  const profileState = { profile: { userId: "user-a" }, status: { thumbnailProgress: null } };
+  /** @type {() => Promise<{worldId: string, blob: Blob}[]>} */
+  let fetchRecords = async () => [];
+  const repository = { getThumbnails: () => fetchRecords() };
+  const hydrate = new Function(
+    "repository", "state", "thumbnailRenderGeneration", "requireRepository", "worldList",
+    "HTMLElement", "showThumbnailMessage", "renderWorlds", "syncNowButton", "URL",
+    "activeThumbnailObjectUrls", "document",
+    `${functionSource}; return hydrateWorldThumbnails;`
+  )(
+    repository, profileState, 1, () => repository, { querySelectorAll: () => [container] },
+    Element, /** @param {[Element, string, string?, (() => void)?]} args */ (...args) => messages.push(args), () => {}, { click() {} },
+    { createObjectURL: () => "blob:test", revokeObjectURL: /** @param {string} url */ (url) => revoked.push(url) },
+    new Set(), { createElement: () => { const image = new Element(); images.push(image); return image; } }
+  );
+  const world = { worldId: WORLD_A, currentName: "Test", availabilityState: "available" };
+  await hydrate([world], 1);
+  assert.equal(messages[messages.length - 1]?.[1], "画像はまだ保存されていません");
+  assert.equal(messages[messages.length - 1]?.[2], undefined);
+  await hydrate([{ ...world, availabilityState: "unavailable" }], 1);
+  assert.match(messages[messages.length - 1]?.[1] ?? "", /現在アクセスできないため取得できません/u);
+  fetchRecords = async () => { throw new Error("read failed"); };
+  await hydrate([world], 1);
+  assert.equal(messages[messages.length - 1]?.[1], "保存画像を読み出せませんでした");
+  assert.equal(messages[messages.length - 1]?.[2], "再読み込み");
+  fetchRecords = async () => [{ worldId: WORLD_A, blob: new Blob(["image"]) }];
+  await hydrate([world], 1);
+  assert.equal(container.children[0], images[0]);
+  images[0]?.listeners.get("error")?.();
+  assert.equal(messages[messages.length - 1]?.[1], "保存画像を表示できませんでした");
+  assert.deepEqual(revoked, ["blob:test"]);
+  const before = messages.length;
+  profileState.profile.userId = "user-b";
+  images[0]?.listeners.get("error")?.();
+  assert.equal(messages.length, before, "old profile's image error cannot replace the current UI");
+  fetchRecords = async () => { profileState.profile.userId = "user-c"; return []; };
+  await hydrate([world], 1);
+  assert.equal(messages.length, before, "pending reads cannot replace the new profile's UI");
+});
+
+test("dashboard routes show all records by default and preserve explicit attention links", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("function applyInitialRouteFilters(");
+  const end = source.indexOf("\n}\n", start) + 2;
+  const worldFilter = { value: "" };
+  const eventFilter = { value: "" };
+  const applyRoute = new Function("worldFilter", "eventFilter", `${source.slice(start, end)}; return applyInitialRouteFilters;`)(worldFilter, eventFilter);
+  for (const hash of ["", "#all", "#worlds", "#unexpected"]) {
+    applyRoute(hash);
+    assert.equal(worldFilter.value, "all");
+  }
+  applyRoute("#attention");
+  assert.equal(worldFilter.value, "attention");
+  applyRoute("#attention-events");
+  assert.equal(eventFilter.value, "attention");
+});
+
+test("thumbnail progress rejects malformed counts and presents automatic continuation separately", () => {
+  const running = { total: 300, saved: 30, remaining: 268, failed: 2, state: "running", nextAttemptAt: null };
+  const progress = normalizeThumbnailProgress(running);
+  assert.notEqual(progress, null);
+  assert.match(presentThumbnailProgress(progress), /保存済み30\/300件（残り268件）/u);
+  assert.match(presentThumbnailProgress(progress), /繰り返す必要はありません/u);
+  for (const patch of [
+    { saved: -1 }, { saved: "30" }, { remaining: Number.NaN }, { total: 301 },
+    { failed: 1.5 }, { state: "unknown" }, { state: "complete" },
+    { nextAttemptAt: "invalid" }, { nextAttemptAt: 1 }
+  ]) assert.equal(normalizeThumbnailProgress({ ...running, ...patch }), null);
+  assert.equal(normalizeThumbnailProgress(null), null);
+  const waiting = normalizeThumbnailProgress({ ...running, state: "waiting", nextAttemptAt: "2026-09-09T00:00:00.000Z" });
+  assert.match(presentThumbnailProgress(waiting), /以降に自動再開/u);
+  const partial = normalizeThumbnailProgress({ ...running, saved: 298, remaining: 0, state: "partial" });
+  assert.match(presentThumbnailProgress(partial), /一部の画像を取得できませんでした/u);
+  assert.doesNotMatch(presentThumbnailProgress(partial), /保存が完了/u);
+  const complete = normalizeThumbnailProgress({ ...running, saved: 300, remaining: 0, failed: 0, state: "complete" });
+  assert.match(presentThumbnailProgress(complete), /画像の保存が完了/u);
+});
+
+test("dashboard progress polling stays local, does not overlap and discards obsolete responses", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function refreshThumbnailProgress()");
+  const end = source.indexOf("\nconst progressTimer", start);
+  const functionSource = source.slice(start, end);
+  assert.doesNotMatch(functionSource, /loadData\(|renderWorlds\(|START_SYNC/u);
+  /** @type {(value: unknown) => void} */
+  let resolveStatus = () => {};
+  let calls = 0;
+  let hydrated = 0;
+  const state = { profile: { userId: "user-a" }, status: normalizeStatusResponse({}), worlds: [], thumbnailCount: 0 };
+  const notice = { textContent: "", hidden: true };
+  const createPoller = new Function(
+    "state", "thumbnailCaptureNotice", "sendMessage", "normalizeStatusResponse", "isRecord", "presentThumbnailProgress", "hydrateWorldThumbnails", "readThumbnailCount",
+    `let pageClosed = false, restoring = false, purging = false, progressPolling = false, progressEpoch = 0;
+     let repository = {}, thumbnailRenderGeneration = 1;
+     const document = {hidden: false}, worldList = { querySelectorAll: () => [] }, settingsThumbnailCount = {};
+     const renderThumbnailProgressNotice = () => { thumbnailCaptureNotice.textContent = presentThumbnailProgress(state.status.thumbnailProgress, {savedCount: state.thumbnailCount}); };
+     ${functionSource}
+     return { poll: refreshThumbnailProgress, invalidate: () => { progressEpoch += 1; }, close: () => { pageClosed = true; } };`
+  );
+  const poller = createPoller(state, notice,
+    () => { calls += 1; return new Promise((resolve) => { resolveStatus = resolve; }); },
+    normalizeStatusResponse, /** @param {unknown} value */ (value) => typeof value === "object" && value !== null,
+    presentThumbnailProgress, async () => { hydrated += 1; }, async () => 80
+  );
+  const response = { activeProfileId: "user-a", thumbnailProgress: { total: 300, saved: 30, remaining: 270, failed: 0, nextAttemptAt: null, state: "running" } };
+  const first = poller.poll();
+  await poller.poll();
+  assert.equal(calls, 1);
+  poller.invalidate();
+  resolveStatus(response);
+  await first;
+  assert.equal(hydrated, 0);
+  assert.equal(notice.textContent, "");
+  const second = poller.poll();
+  resolveStatus(response);
+  await second;
+  assert.equal(hydrated, 1);
+  assert.match(notice.textContent, /30\/300/u);
+  assert.equal(state.thumbnailCount, 80, "total stored count includes historical images outside this job");
+  const third = poller.poll();
+  resolveStatus({ ...response, activeProfileId: "user-b" });
+  await third;
+  assert.equal(hydrated, 1);
+  const fourth = poller.poll();
+  resolveStatus({activeProfileId: "user-a", thumbnailProgress: null, thumbnailSavedCount: 70});
+  await fourth;
+  const fifth = poller.poll();
+  resolveStatus({activeProfileId: "user-a", thumbnailProgress: null, thumbnailSavedCount: 80});
+  await fifth;
+  assert.equal(hydrated, 3, "saved count changes refresh images even when both progress values are null");
+  assert.match(notice.textContent, /保存済み画像80件/u);
+  const failed = poller.poll();
+  resolveStatus({ok: false});
+  await failed;
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /保存済み画像80件/u);
+  assert.match(notice.textContent, /保存状況を読み込めませんでした/u);
+  poller.close();
+  await poller.poll();
+  assert.equal(calls, 6);
+});
+
+
+test("thumbnail count failure leaves main history load usable and count unknown", async () => {
+  const failedRepository = { listThumbnailMetadata: async () => { throw new Error("image metadata unavailable"); } };
+  assert.equal(await readThumbnailCount(failedRepository, USER_ID), null);
+  assert.equal(await readThumbnailCount({ listThumbnailMetadata: async () => [] }, USER_ID), 0);
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function loadData(");
+  const end = source.indexOf("\n/**", start);
+  const state = { profile: null, status: normalizeStatusResponse({}), settings: {}, worlds: [], events: [], favoriteGroups: [], thumbnailCount: 999 };
+  const worlds = [{ worldId: WORLD_A }];
+  const events = [{ worldId: WORLD_A, kind: "name_changed" }];
+  const database = {
+    ...failedRepository,
+    listWorlds: async () => worlds,
+    listEvents: async () => events,
+    listFavoriteGroups: async () => [],
+    getSetting: async () => null
+  };
+  let rendered = 0;
+  let warned = false;
+  const load = new Function("state", "database", "normalizeStatusResponse", "readThumbnailCount", "renderAll", "renderThumbnailProgressNotice", `
+    let progressEpoch = 0, thumbnailRenderGeneration = 0, visibleWorldCount = 0, visibleEventCount = 0;
+    const PAGE_SIZE = 200;
+    const requireRepository = () => database;
+    const sendMessage = async () => ({activeProfileId: "user-a"});
+    const isRecord = value => typeof value === "object" && value !== null;
+    const selectProfile = async () => ({userId: "user-a", lastSuccessfulSyncAt: null});
+    const readStorageEstimate = async () => ({usage: 0, quota: 0});
+    const dateSetting = () => null;
+    const summarizeHistory = () => ({attention: 0, missing: 0, unavailable: 0});
+    ${source.slice(start, end)}
+    return loadData;
+  `)(state, database, normalizeStatusResponse, readThumbnailCount, () => { rendered += 1; }, () => { warned = state.thumbnailCount === null; });
+  await load();
+  assert.equal(rendered, 1);
+  assert.equal(warned, true);
+  assert.equal(state.thumbnailCount, null);
+  assert.deepEqual(state.worlds, worlds);
+  assert.deepEqual(state.events, events);
+});
+
+test("in-flight image saving copy allows closing the extension page", () => {
+  const status = normalizeStatusResponse({syncing: true, thumbnailProgress: {total: 300, saved: 30, remaining: 270, failed: 0, nextAttemptAt: null, state: "running"}});
+  const presentation = presentStatus(status);
+  assert.equal(presentation.title, "画像を保存しています");
+  assert.match(presentation.detail, /この画面を閉じても/u);
+  assert.doesNotMatch(presentation.detail, /このままお待ち/u);
+});
+
+
+test("dashboard always renders thumbnail counts or an explicit unavailable state", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("function renderThumbnailProgressNotice()");
+  const end = source.indexOf("\n// Refresh only", start);
+  const state = {profile: /** @type {{userId: string} | null} */ ({userId: USER_ID}), status: normalizeStatusResponse({}), thumbnailCount: /** @type {number | null} */ (30), statusAvailable: false};
+  const notice = {textContent: "", hidden: true};
+  const render = new Function("state", "thumbnailCaptureNotice", "presentThumbnailProgress", `${source.slice(start, end)}; return renderThumbnailProgressNotice;`)(state, notice, presentThumbnailProgress);
+  render();
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /保存済み画像30件/u);
+  assert.match(notice.textContent, /残り件数は現在確認できません/u);
+  assert.doesNotMatch(notice.textContent, /自動で保存しています/u);
+  state.status.thumbnailProgress = {total: 0, saved: 0, remaining: 0, failed: 0, nextAttemptAt: null, state: "complete"};
+  render();
+  assert.match(notice.textContent, /保存済み画像30件/u);
+  assert.match(notice.textContent, /取得対象は0件/u);
+  state.status.thumbnailProgress = {total: 300, saved: 30, remaining: 270, failed: 0, nextAttemptAt: null, state: "running"};
+  render();
+  assert.match(notice.textContent, /保存済み30\/300件（残り270件）/u);
+  state.status.thumbnailProgress = null;
+  state.thumbnailCount = null;
+  render();
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /件数を現在確認できません/u);
+  assert.doesNotMatch(notice.textContent, /保存済み画像0件/u);
+  state.profile = null;
+  state.thumbnailCount = 0;
+  render();
+  assert.match(notice.textContent, /最初の確認後/u);
+});
+
+test("popup passes independent saved count into the progress presentation", async () => {
+  const source = await readFile(new URL("../extension/popup.js", import.meta.url), "utf8");
+  const start = source.indexOf("  thumbnailProgress.textContent =");
+  const end = source.indexOf("  const presentation =", start);
+  const notice = {textContent: "", hidden: true};
+  const render = new Function("status", "thumbnailProgress", "presentThumbnailProgress", source.slice(start, end));
+  for (const value of [30, 0, null, -1, "30"]) {
+    const status = normalizeStatusResponse({activeProfileId: USER_ID, thumbnailSavedCount: value});
+    render(status, notice, presentThumbnailProgress);
+    assert.equal(notice.hidden, false);
+    if (typeof value === "number" && value >= 0) assert.match(notice.textContent, new RegExp(`保存済み画像${value}件`, "u"));
+    else assert.match(notice.textContent, /件数を現在確認できません/u);
+  }
+});
+
+
+test("popup status failure keeps known saved count without stale running text", async () => {
+  const source = await readFile(new URL("../extension/popup.js", import.meta.url), "utf8");
+  const start = source.indexOf("function showUnavailableStatus()");
+  const end = source.indexOf("\nsyncButton.addEventListener", start);
+  const notice = {textContent: "", hidden: true};
+  const handler = new Function("thumbnailProgress", "normalizeStatusResponse", "presentThumbnailProgress", `
+    let pageClosed = false, lastKnownThumbnailSavedCount = null;
+    const statusDot = {}, statusTitle = {}, statusDetail = {}, lastSync = {};
+    const attentionCard = {classList: {remove: () => {}}};
+    const attentionTitle = {}, attentionDetail = {}, dashboardButton = {};
+    ${source.slice(start, end)}
+    const receive = response => {
+      ${source.slice(source.indexOf("  const status = normalizeStatusResponse(response);"), source.indexOf("  const presentation ="))}
+    };
+    return {fail: showUnavailableStatus, receive};
+  `)(notice, normalizeStatusResponse, presentThumbnailProgress);
+  handler.fail();
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /画像の保存状況を読み込めませんでした/u);
+  assert.doesNotMatch(notice.textContent, /保存済み画像0件/u);
+  handler.receive({activeProfileId: USER_ID, thumbnailSavedCount: 30, thumbnailProgress: {total: 300, saved: 30, remaining: 270, failed: 0, nextAttemptAt: null, state: "running"}});
+  assert.match(notice.textContent, /自動で保存しています/u);
+  handler.fail();
+  assert.match(notice.textContent, /保存済み画像30件/u);
+  assert.match(notice.textContent, /読み込めませんでした/u);
+  assert.doesNotMatch(notice.textContent, /自動で保存しています/u);
+  handler.receive({activeProfileId: USER_ID, thumbnailSavedCount: null});
+  handler.fail();
+  assert.doesNotMatch(notice.textContent, /保存済み画像30件/u);
 });
