@@ -9,48 +9,34 @@
   <body>
     <main class="popup-shell">
       <header class="brand">
-        <img src="icons/icon48.png" width="44" height="44" alt="">
-        <div>
-          <p class="eyebrow">VRC FAVORITE WORLD HISTORY</p>
-          <h1>お気に入り記録</h1>
-        </div>
+        <img src="icons/icon48.png" width="32" height="32" alt="">
+        <h1>お気に入りワールド記録</h1>
       </header>
 
       <section id="attention-card" class="attention-card" aria-live="polite">
-        <p class="eyebrow">CHECK FIRST</p>
-        <strong id="attention-title">消えたワールドを確認</strong>
-        <p id="attention-detail">保存済みの名前と画像をすぐ確認できます。</p>
-        <button id="dashboard-button" class="button button-attention" type="button">
-          記録とサムネイルを見る
-        </button>
+        <h2 id="attention-title">保存済みの状態を確認しています</h2>
+        <p id="attention-detail">しばらくお待ちください。</p>
+        <button id="dashboard-button" class="button button-primary" type="button">名前と画像を見る</button>
       </section>
 
-      <section class="status-card" aria-live="polite">
+      <section id="status-card" class="status-card" aria-live="polite" hidden>
         <div class="status-line">
           <span id="status-dot" class="status-dot is-idle" aria-hidden="true"></span>
           <strong id="status-title">状態を確認しています</strong>
         </div>
         <p id="status-detail">しばらくお待ちください。</p>
-        <p id="last-sync" class="muted">最終確認: まだありません</p>
       </section>
 
-      <p id="thumbnail-progress" class="muted" role="status" hidden></p>
-
-      <button id="sync-button" class="button button-primary" type="button">
-        今すぐ確認
-      </button>
-      <button id="login-button" class="button button-secondary" type="button">
-        VRChat公式サイトを開く
-      </button>
-
-      <p class="muted">開始した画像の保存は、この画面を閉じても、Chrome起動中は続きます。Chromeを閉じた場合は、次の起動時に再開します。</p>
-
+      <button id="login-button" class="button button-secondary" type="button" hidden>VRChat公式サイトを開く</button>
+      <button id="sync-button" class="button button-secondary" type="button" disabled>今すぐ確認</button>
+      <p id="last-sync" class="muted">最終確認: まだありません</p>
       <p id="action-message" class="action-message" role="status"></p>
 
-      <footer>
-        <span class="privacy-mark" aria-hidden="true">●</span>
-        記録はこのブラウザ内だけに保存されます
-      </footer>
+      <details class="record-status">
+        <summary>画像の保存状況</summary>
+        <p id="thumbnail-progress" class="muted" role="status" hidden></p>
+      </details>
+      <footer>記録はこのブラウザ内だけに保存されます</footer>
     </main>
     <script type="module" src="popup.js"></script>
   </body>
