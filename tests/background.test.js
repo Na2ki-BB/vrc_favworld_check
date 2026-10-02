@@ -401,6 +401,7 @@ test("thumbnail capture aborts a stalled encoder at the overall deadline", async
       encoderTimeout = options.timeoutMs;
       return new Promise(() => {});
     },
+    clock: () => 0,
     timeBudgetMs: 20
   });
 

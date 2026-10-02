@@ -34,6 +34,7 @@ import {
   parseFavoriteGroupTags,
   presentEventKind,
   presentStatus,
+  presentWorldOverview,
   purgeErrorMessage,
   summarizeHistory,
   takeVisibleItems,
@@ -50,7 +51,7 @@ const USER_ID = "usr_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const WORLD_A = "wrld_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const WORLD_B = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-test("popup opens all records while notifications retain their attention or history routes", async () => {
+test("explicit all-record opener and notifications retain their fixed routes", async () => {
   /** @type {string[]} */
   const resolvedPaths = [];
   /** @type {{url: string}[]} */
@@ -663,7 +664,7 @@ test("backup restore keeps restored data explicit across settings follow-up outc
   assert.doesNotMatch(dashboard, /followupCompleted/u);
 });
 
-test("dashboard keeps native select options readable and shows all records by default", async () => {
+test("dashboard prioritizes confirmed attention and puts secondary controls behind disclosure", async () => {
   const [html, css, popupHtml, popupScript, popupCss] = await Promise.all([
     readFile(new URL("../extension/dashboard.html", import.meta.url), "utf8"),
     readFile(new URL("../extension/styles/dashboard.css", import.meta.url), "utf8"),
@@ -672,10 +673,12 @@ test("dashboard keeps native select options readable and shows all records by de
     readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8")
   ]);
 
-  assert.match(html, /<option value="all" selected>すべての記録<\/option>/u);
-  assert.match(html, /<button class="summary-card[^>]+data-world-filter="attention">/u);
+  assert.match(html, /<option value="attention" selected>消えた可能性のあるワールド<\/option>/u);
+  assert.doesNotMatch(html, /summary-card|primary-focus-button/u);
+  assert.match(html, /<details id="world-filter-panel"/u);
+  assert.match(html, /href="#settings"/u);
   assert.match(html, /id="primary-focus"/u);
-  assert.match(html, /保存済みの名前と画像を見る/u);
+  assert.match(html, /保存済みの記録を読み込んでいます/u);
   assert.match(css, /select\s*\{\s*color-scheme:\s*light;/u);
   assert.match(
     css,
@@ -685,7 +688,7 @@ test("dashboard keeps native select options readable and shows all records by de
     css,
     /\.select-field select\s*\{[^}]*color:\s*#15142a;[^}]*background:\s*#fff;/iu
   );
-  assert.ok(html.indexOf('id="primary-focus"') < html.indexOf('id="notice-panel"'));
+  assert.ok(html.indexOf('id="primary-focus"') < html.indexOf('id="world-list"'));
   assert.ok(popupHtml.indexOf('id="attention-card"') < popupHtml.indexOf('class="status-card"'));
   assert.ok(popupHtml.indexOf('id="dashboard-button"') < popupHtml.indexOf('id="sync-button"'));
   assert.match(popupScript, /attentionCard\.classList\.toggle\("is-alert", hasAttention\)/u);
@@ -815,17 +818,19 @@ test("thumbnail loading distinguishes missing, read errors, image errors and sta
   assert.equal(messages.length, before, "pending reads cannot replace the new profile's UI");
 });
 
-test("dashboard routes show all records by default and preserve explicit attention links", async () => {
+test("dashboard defaults to attention while preserving explicit all and history links", async () => {
   const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
   const start = source.indexOf("function applyInitialRouteFilters(");
   const end = source.indexOf("\n}\n", start) + 2;
   const worldFilter = { value: "" };
   const eventFilter = { value: "" };
   const applyRoute = new Function("worldFilter", "eventFilter", `${source.slice(start, end)}; return applyInitialRouteFilters;`)(worldFilter, eventFilter);
-  for (const hash of ["", "#all", "#worlds", "#unexpected"]) {
+  for (const hash of ["", "#worlds", "#unexpected"]) {
     applyRoute(hash);
-    assert.equal(worldFilter.value, "all");
+    assert.equal(worldFilter.value, "attention");
   }
+  applyRoute("#all");
+  assert.equal(worldFilter.value, "all");
   applyRoute("#attention");
   assert.equal(worldFilter.value, "attention");
   applyRoute("#attention-events");
@@ -1043,4 +1048,66 @@ test("popup status failure keeps known saved count without stale running text", 
   handler.receive({activeProfileId: USER_ID, thumbnailSavedCount: null});
   handler.fail();
   assert.doesNotMatch(notice.textContent, /保存済み画像30件/u);
+});
+
+
+test("focused overview distinguishes baseline, pending, stale, failures and confirmed union", () => {
+  const ready = normalizeStatusResponse({activeProfileId: USER_ID, lastSuccessfulSyncAt: new Date().toISOString(), lastResult: "success"});
+  for (const status of [normalizeStatusResponse({}), normalizeStatusResponse({activeProfileId: USER_ID})]) {
+    assert.match(presentWorldOverview(status).title, /最初の記録/u);
+    assert.doesNotMatch(presentWorldOverview(status).title, /ありません/u);
+  }
+  assert.match(presentWorldOverview(ready).title, /確認できたワールドはありません/u);
+  assert.doesNotMatch(presentWorldOverview(ready).detail, /すべて.*アクセス可能/u);
+  assert.match(presentWorldOverview(ready, {pendingWorldCount: 3}).detail, /状態を確認中/u);
+  assert.match(presentWorldOverview({...ready, pendingProbeCount: 1}).detail, /状態を確認中/u);
+  assert.match(presentWorldOverview({...ready, syncing: true}).title, /確認しています/u);
+  for (const patch of [{authRequired: true}, {lastResult: "offline"}, {lastResult: "failed"}, {lastSuccessfulSyncAt: "2020-01-01T00:00:00Z"}]) {
+    assert.match(presentWorldOverview({...ready, ...patch}).title, /最新の状態はまだ確認できていません/u);
+  }
+  assert.match(presentWorldOverview(ready, {statusAvailable: false}).title, /最新の状態/u);
+  const confirmed = {...ready, attentionWorldCount: 2, unavailableCount: 1, missingCount: 2};
+  assert.equal(presentWorldOverview(confirmed).title, "消えた可能性のあるワールド 2件");
+  assert.match(presentWorldOverview({...confirmed, authRequired: true}).detail, /最後に保存できた/u);
+  assert.match(presentWorldOverview({...confirmed, syncing: true}).detail, /前回の記録/u);
+});
+
+test("dashboard navigation supports native links and Back/Forward without fake tabs", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  assert.match(source, /window.addEventListener\("hashchange", navigateFromHash\)/u);
+  assert.match(source, /aria-current/u);
+  assert.doesNotMatch(source, /role", "tablist"|role", "tab"/u);
+  assert.match(source, /if \(state.status.syncing \|\| purging\) return/u);
+});
+
+
+test("popup primary entry is composed with the focused attention opener", async () => {
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  assert.match(source, /const openDashboard = createAttentionDashboardOpener\(openerDependencies\)/u);
+});
+
+
+test("dashboard text and button palette stays above WCAG AA contrast", async () => {
+  const css = await readFile(new URL("../extension/styles/dashboard.css", import.meta.url), "utf8");
+  /** @param {string} hex */
+  const luminance = (hex) => {
+    const components = [1, 3, 5].map((start) => {
+      const value = Number.parseInt(hex.slice(start, start + 2), 16) / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return (components[0] ?? 0) * 0.2126 + (components[1] ?? 0) * 0.7152 + (components[2] ?? 0) * 0.0722;
+  };
+  for (const [foreground, background] of [
+    ["#10252a", "#8ae9dc"], ["#f6f6fb", "#344157"], ["#b5bfd0", "#1d2635"],
+    ["#b5bfd0", "#131925"], ["#ffdacb", "#53372f"], ["#ffe2a8", "#493d25"],
+    ["#e0e7f1", "#1d2635"], ["#ffe0d9", "#582e32"], ["#c4cede", "#344157"]
+  ]) {
+    assert.ok(foreground && background);
+    assert.ok(css.includes(foreground) && css.includes(background), "tested colors must exist in the stylesheet");
+    const values = [luminance(foreground), luminance(background)].sort((a, b) => a - b);
+    assert.ok(((values[1] ?? 0) + 0.05) / ((values[0] ?? 0) + 0.05) >= 4.5, `${foreground} on ${background}`);
+  }
+  assert.match(css, /summary:focus-visible/u);
+  assert.match(css, /file-button:focus-within/u);
+  assert.match(css, /@media \(forced-colors: active\)/u);
 });

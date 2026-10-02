@@ -553,7 +553,7 @@ function registerChromeBackground() {
       await chrome.tabs.create(details);
     }
   };
-  const openDashboard = createAllWorldsDashboardOpener(openerDependencies);
+  const openDashboard = createAttentionDashboardOpener(openerDependencies);
   const openHistoryDashboard = createHistoryDashboardOpener(openerDependencies);
   const notificationHandlers = createHistoryNotificationHandlers({
     openHistoryDashboard,
