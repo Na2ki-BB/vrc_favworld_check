@@ -16,11 +16,13 @@ import {
   normalizeStatusResponse,
   presentEventKind,
   presentStatus,
+  presentWorldOverview,
   presentThumbnailProgress,
   readThumbnailCount,
   purgeErrorMessage,
   summarizeHistory,
   takeVisibleItems,
+  worldMatchesFilter,
   worldStateTags
 } from "./lib/ui.js";
 
@@ -55,13 +57,13 @@ const onboarding = requiredElement("onboarding");
 const primaryFocus = requiredElement("primary-focus");
 const primaryFocusTitle = requiredElement("primary-focus-title");
 const primaryFocusDetail = requiredElement("primary-focus-detail");
-const primaryFocusButton = /** @type {HTMLButtonElement} */ (requiredElement("primary-focus-button"));
+const lastSync = requiredElement("last-sync");
+const worldFilterSummary = requiredElement("world-filter-summary");
 const openVrchatButton = /** @type {HTMLButtonElement} */ (requiredElement("open-vrchat-button"));
 const syncNowButton = /** @type {HTMLButtonElement} */ (requiredElement("sync-now-button"));
 const worldSearch = /** @type {HTMLInputElement} */ (requiredElement("world-search"));
 const worldFilter = /** @type {HTMLSelectElement} */ (requiredElement("world-filter"));
 const groupFilter = /** @type {HTMLSelectElement} */ (requiredElement("group-filter"));
-const worldFilterPanel = /** @type {HTMLDetailsElement} */ (requiredElement("world-filter-panel"));
 const worldResultCount = requiredElement("world-result-count");
 const worldList = requiredElement("world-list");
 const worldEmpty = requiredElement("world-empty");
@@ -90,13 +92,8 @@ const importInput = /** @type {HTMLInputElement} */ (requiredElement("import-inp
 const backupMessage = requiredElement("backup-message");
 const purgeUninstallButton = /** @type {HTMLButtonElement} */ (requiredElement("purge-uninstall-button"));
 const purgeMessage = requiredElement("purge-message");
-const summaryTotal = requiredElement("summary-total");
-const summaryUnavailable = requiredElement("summary-unavailable");
-const summaryMissing = requiredElement("summary-missing");
-const summaryAttention = requiredElement("summary-attention");
 const historyUnreadBadge = requiredElement("history-unread-badge");
 const tabButtons = Array.from(document.querySelectorAll(".tab"));
-const summaryButtons = Array.from(document.querySelectorAll(".summary-card[data-world-filter]"));
 
 /** @type {DatabaseRepository | null} */
 let repository = null;
@@ -401,37 +398,21 @@ function renderAll() {
   renderWorlds();
   renderEvents();
   renderSettings();
-  onboarding.hidden = state.profile !== null && state.status.lastSuccessfulSyncAt !== null;
+  onboarding.hidden = state.status.authRequired || (state.profile !== null && state.status.lastSuccessfulSyncAt !== null);
 }
 
 function renderPrimaryFocus() {
-  primaryFocus.classList.toggle(
-    "is-alert",
-    state.status.unavailableCount > 0 || state.status.missingCount > 0
-  );
-  if (state.profile === null || state.status.lastSuccessfulSyncAt === null) {
-    primaryFocusTitle.textContent = "最初の確認で、消える前の情報を保存します";
-    primaryFocusDetail.textContent = "VRChat公式サイトへログインし、「今すぐ確認」を押してください。";
-    primaryFocusButton.hidden = true;
-    return;
-  }
-  if (state.status.unavailableCount > 0) {
-    primaryFocusTitle.textContent = `現在アクセスできないワールドが${state.status.unavailableCount.toLocaleString("ja-JP")}件あります`;
-    primaryFocusDetail.textContent = "削除・非公開などの可能性があります。保存済みの名前、作者、リスト、サムネイルを最優先で確認できます。";
-    primaryFocusButton.hidden = false;
-    primaryFocusButton.textContent = "保存済みの名前と画像を見る";
-    return;
-  }
-  if (state.status.missingCount > 0) {
-    primaryFocusTitle.textContent = `お気に入り一覧から外れたワールドが${state.status.missingCount.toLocaleString("ja-JP")}件あります`;
-    primaryFocusDetail.textContent = "自分でお気に入り解除した場合も含まれます。保存済みの名前、作者、リスト、サムネイルを確認できます。";
-    primaryFocusButton.hidden = false;
-    primaryFocusButton.textContent = "外れたワールドを見る";
-    return;
-  }
-  primaryFocusTitle.textContent = "現在、消えた可能性のあるワールドはありません";
-  primaryFocusDetail.textContent = "保存中のワールドは、前回の確認時点ですべてお気に入り一覧にあり、アクセス可能でした。";
-  primaryFocusButton.hidden = true;
+  const overview = presentWorldOverview(state.status, {
+    hasProfile: state.profile !== null,
+    statusAvailable: state.statusAvailable,
+    pendingWorldCount: state.worlds.filter((world) => worldMatchesFilter(world, "pending")).length
+  });
+  primaryFocus.classList.toggle("is-alert", state.status.attentionWorldCount > 0);
+  primaryFocusTitle.textContent = overview.title;
+  primaryFocusDetail.textContent = overview.detail;
+  lastSync.textContent = state.status.lastSuccessfulSyncAt === null
+    ? "最終確認: まだありません"
+    : `最終確認: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
 }
 
 function renderConnection() {
@@ -444,7 +425,7 @@ function renderConnection() {
   } else if (presentation.tone === "error") {
     connectionBadge.classList.add("is-error");
   }
-  connectionBadge.textContent = presentation.title;
+  connectionBadge.textContent = state.statusAvailable ? presentation.title : "状態を読み込めませんでした";
   syncNowButton.disabled = state.status.syncing || restoring || purging;
   syncNowButton.textContent = purging
     ? "削除しています…"
@@ -473,21 +454,7 @@ function renderConnection() {
     showNotice(
       presentation.title,
       presentation.detail,
-      state.status.lastResult === "rate_limited"
-        ? null
-        : { label: "もう一度確認", run: performSync }
-    );
-    return;
-  }
-  if (presentation.tone === "attention") {
-    const unavailableFirst = state.status.unavailableCount > 0;
-    showNotice(
-      presentation.title,
-      presentation.detail,
-      {
-        label: unavailableFirst ? "保存済みの名前と画像を見る" : "外れたワールドを見る",
-        run: () => showWorldFilter(unavailableFirst ? "unavailable" : "missing")
-      }
+      null
     );
     return;
   }
@@ -502,11 +469,6 @@ function renderConnection() {
 }
 
 function renderSummary() {
-  const summary = summarizeHistory(state.worlds, state.events);
-  summaryAttention.textContent = summary.attention.toLocaleString("ja-JP");
-  summaryTotal.textContent = summary.total.toLocaleString("ja-JP");
-  summaryUnavailable.textContent = summary.unavailable.toLocaleString("ja-JP");
-  summaryMissing.textContent = summary.missing.toLocaleString("ja-JP");
   historyUnreadBadge.hidden = state.status.unreadCount === 0;
   historyUnreadBadge.textContent = state.status.unreadCount > 99
     ? "99+"
@@ -566,7 +528,7 @@ function renderWorlds() {
   const requestedFilter = worldFilter.value;
   const filter = VALID_FILTERS.has(requestedFilter)
     ? /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} */ (requestedFilter)
-    : "all";
+    : "attention";
   const matching = filterWorlds(
     state.worlds,
     state.events,
@@ -611,18 +573,26 @@ function renderWorlds() {
     });
     worldList.append(moreButton);
   }
-  worldResultCount.textContent = `${matching.length.toLocaleString("ja-JP")}件中 ${visible.length.toLocaleString("ja-JP")}件を表示`;
-  worldEmpty.hidden = matching.length !== 0;
   const hasRefinement = worldSearch.value.trim().length > 0 || groupFilter.value.length > 0;
-  if (filter === "attention" && state.profile !== null && !hasRefinement) {
-    worldEmptyTitle.textContent = "現在、要確認のワールドはありません";
-    worldEmptyDetail.textContent = "お気に入り一覧にないワールドや、現在アクセスできないワールドは確認されていません。";
-  } else if (filter === "attention") {
-    worldEmptyTitle.textContent = "この条件に該当する要確認のワールドはありません";
-    worldEmptyDetail.textContent = "検索語やお気に入りリストの絞り込みを変えてください。";
+  const filterLabel = worldFilter.selectedOptions[0]?.textContent ?? "消えた可能性のあるワールド";
+  worldResultCount.textContent = `${filterLabel} · ${matching.length.toLocaleString("ja-JP")}件${visible.length < matching.length ? `（${visible.length.toLocaleString("ja-JP")}件を表示）` : ""}`;
+  worldFilterSummary.textContent = filter === "attention" && !hasRefinement
+    ? "すべての記録・検索"
+    : `表示を変更・検索（${filterLabel}${hasRefinement ? "・絞り込み中" : ""}）`;
+  worldEmpty.hidden = matching.length !== 0;
+  if (filter === "attention" && !hasRefinement) {
+    const overview = presentWorldOverview(state.status, {
+      hasProfile: state.profile !== null,
+      statusAvailable: state.statusAvailable,
+      pendingWorldCount: state.worlds.filter((world) => worldMatchesFilter(world, "pending")).length
+    });
+    worldEmptyTitle.textContent = overview.title;
+    worldEmptyDetail.textContent = overview.detail;
+    // The overview already explains the unfiltered empty state above the list.
+    worldEmpty.hidden = true;
   } else {
-    worldEmptyTitle.textContent = "該当するワールドはありません";
-    worldEmptyDetail.textContent = "検索語や状態の絞り込みを変えてください。";
+    worldEmptyTitle.textContent = "この条件に該当するワールドはありません";
+    worldEmptyDetail.textContent = "「表示を変更・検索」から検索語や絞り込みを変えてください。";
   }
   void hydrateWorldThumbnails(visible, renderGeneration);
 }
@@ -648,7 +618,7 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
     textElement(
       "p",
       "world-meta",
-      `${world.authorName ?? "作者名を確認できません"} · 最終更新 ${formatDateTime(world.updatedAt)}`
+      world.authorName ?? "作者名を確認できません"
     )
   );
   const previousNames = recordedPreviousNames
@@ -668,7 +638,8 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
   const details = /** @type {HTMLDetailsElement} */ (document.createElement("details"));
   details.className = "world-details";
   details.append(
-    textElement("summary", "", "日時とWorld IDを見る"),
+    textElement("summary", "", "詳細"),
+    textElement("p", "world-meta", `最終更新: ${formatDateTime(world.updatedAt)}`),
     textElement("p", "world-meta", `初回記録: ${formatDateTime(world.firstSeenAt)}`),
     textElement("p", "world-meta", `最後にお気に入りで確認: ${formatDateTime(world.lastSeenFavoriteAt)}`),
     textElement("p", "world-meta", world.worldId)
@@ -1033,47 +1004,22 @@ function activateTab(tabName, moveFocus = false) {
     return;
   }
   for (const candidate of tabButtons) {
-    if (!(candidate instanceof HTMLButtonElement)) {
-      continue;
-    }
+    if (!(candidate instanceof HTMLAnchorElement)) continue;
     const active = candidate.dataset.tab === tabName;
     candidate.classList.toggle("is-active", active);
-    candidate.setAttribute("aria-selected", String(active));
-    candidate.tabIndex = active ? 0 : -1;
-    if (active && moveFocus) {
-      candidate.focus();
-    }
+    if (active) candidate.setAttribute("aria-current", "page");
+    else candidate.removeAttribute("aria-current");
   }
   for (const name of VALID_TABS) {
     const panel = requiredElement(`${name}-panel`);
     panel.hidden = name !== tabName;
-  }
-}
-
-/**
- * Open a world-state view from a summary card or attention notice. Search and
- * favorite-list filters are cleared so the requested records cannot stay
- * hidden behind an earlier refinement.
- *
- * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
- * @param {boolean} [moveFocus]
- */
-function showWorldFilter(filter, moveFocus = false) {
-  worldSearch.value = "";
-  groupFilter.value = "";
-  worldFilter.value = filter;
-  visibleWorldCount = PAGE_SIZE;
-  activateTab("worlds");
-  renderWorlds();
-  if (moveFocus) {
-    worldFilterPanel.open = true;
-    worldFilter.focus();
+    if (name === tabName && moveFocus) panel.focus();
   }
 }
 
 /**
  * Interpret only known local tab routes. Unknown or malformed hashes always
- * fall back to the complete worlds view.
+ * fall back to the attention worlds view.
  *
  * @param {string} hash
  * @returns {string}
@@ -1091,13 +1037,13 @@ function initialTabFromHash(hash) {
 }
 
 /**
- * Apply only the two allowlisted attention routes. Existing tab routes retain
- * their normal filter, and unknown hashes cannot inject a filter value.
+ * Only an explicit #all route opens every record. Unknown routes fail back to
+ * the focused attention view; no hash is used as an unchecked filter value.
  *
  * @param {string} hash
  */
 function applyInitialRouteFilters(hash) {
-  worldFilter.value = hash === "#attention" ? "attention" : "all";
+  worldFilter.value = hash === "#all" ? "all" : "attention";
   eventFilter.value = hash === "#attention-events" ? "attention" : "all";
 }
 
@@ -1128,67 +1074,32 @@ async function markHistoryAsRead() {
   }
 }
 
-for (const [index, candidate] of tabButtons.entries()) {
-  if (!(candidate instanceof HTMLButtonElement)) {
-    continue;
-  }
-  const tabName = candidate.dataset.tab;
-  if (tabName === undefined || !VALID_TABS.has(tabName)) {
-    continue;
-  }
-  candidate.id = `${tabName}-tab`;
-  candidate.setAttribute("role", "tab");
-  candidate.setAttribute("aria-controls", `${tabName}-panel`);
-  candidate.addEventListener("click", () => {
-    activateTab(tabName);
-    if (tabName === "events") {
-      void markHistoryAsRead();
-    }
-  });
-  candidate.addEventListener("keydown", (event) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
-      return;
-    }
-    event.preventDefault();
-    const offset = event.key === "ArrowRight" ? 1 : -1;
-    const nextIndex = (index + offset + tabButtons.length) % tabButtons.length;
-    const nextTab = tabButtons[nextIndex];
-    if (nextTab instanceof HTMLButtonElement && nextTab.dataset.tab !== undefined) {
-      activateTab(nextTab.dataset.tab, true);
-      if (nextTab.dataset.tab === "events") {
-        void markHistoryAsRead();
-      }
-    }
-  });
-  const panel = requiredElement(`${tabName}-panel`);
-  panel.setAttribute("role", "tabpanel");
-  panel.setAttribute("aria-labelledby", candidate.id);
-}
-document.querySelector(".tabs")?.setAttribute("role", "tablist");
+for (const name of VALID_TABS) requiredElement(`${name}-panel`).tabIndex = -1;
 applyInitialRouteFilters(window.location.hash);
 const initialTab = initialTabFromHash(window.location.hash);
 activateTab(initialTab);
 
-for (const candidate of summaryButtons) {
-  if (!(candidate instanceof HTMLButtonElement)) {
-    continue;
+function navigateFromHash() {
+  const tab = initialTabFromHash(window.location.hash);
+  if (tab === "worlds") {
+    applyInitialRouteFilters(window.location.hash);
+    worldSearch.value = "";
+    groupFilter.value = "";
+    visibleWorldCount = PAGE_SIZE;
+    renderWorlds();
+  } else if (tab === "events") {
+    eventFilter.value = window.location.hash === "#attention-events" ? "attention" : "all";
+    renderEvents();
+    void markHistoryAsRead();
   }
-  candidate.addEventListener("click", () => {
-    const requestedFilter = candidate.dataset.worldFilter;
-    if (requestedFilter === undefined || !VALID_FILTERS.has(requestedFilter)) {
-      return;
-    }
-    showWorldFilter(
-      /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} */ (
-        requestedFilter
-      )
-    );
+  activateTab(tab, true);
+}
+window.addEventListener("hashchange", navigateFromHash);
+for (const link of document.querySelectorAll("a[href^=\"#\"]")) {
+  link.addEventListener("click", () => {
+    if (link.getAttribute("href") === window.location.hash) navigateFromHash();
   });
 }
-
-primaryFocusButton.addEventListener("click", () => {
-  showWorldFilter(state.status.unavailableCount > 0 ? "unavailable" : "missing");
-});
 
 worldSearch.addEventListener("input", () => {
   visibleWorldCount = PAGE_SIZE;
@@ -1229,6 +1140,7 @@ openVrchatButton.addEventListener("click", async () => {
 });
 
 async function performSync() {
+  if (state.status.syncing || purging) return;
   if (restoring) {
     showNotice(
       "バックアップを復元しています",
@@ -1238,6 +1150,7 @@ async function performSync() {
   }
   state.status = { ...state.status, syncing: true };
   renderConnection();
+  renderPrimaryFocus();
   try {
     const response = normalizeCommandResponse(
       await sendMessage({ type: "START_SYNC", trigger: "manual" })
@@ -1245,6 +1158,7 @@ async function performSync() {
     if (!response.ok) {
       state.status = { ...state.status, syncing: false };
       renderConnection();
+      renderPrimaryFocus();
       showNotice("確認を開始できませんでした", commandErrorMessage(response.error, response.retryAt));
       return;
     }
@@ -1252,6 +1166,7 @@ async function performSync() {
   } catch {
     state.status = { ...state.status, syncing: false };
     renderConnection();
+    renderPrimaryFocus();
     showNotice(
       "確認を開始できませんでした",
       "拡張を開き直して、もう一度お試しください。保存済みの記録はそのままです。"
@@ -1636,6 +1551,8 @@ try {
 } catch {
   connectionBadge.className = "badge is-error";
   connectionBadge.textContent = "記録を読み込めません";
+  primaryFocusTitle.textContent = "記録を読み込めませんでした";
+  primaryFocusDetail.textContent = "保存済みのワールドをまだ確認できていません。ブラウザを再起動して開き直してください。";
   syncNowButton.disabled = true;
   exportButton.disabled = true;
   importInput.disabled = true;

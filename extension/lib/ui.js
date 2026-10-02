@@ -306,6 +306,44 @@ export function presentStatus(status, now = Date.now()) {
 }
 
 /**
+ * Present saved observations, never infer deletion or current availability from
+ * an empty confirmed list. This changes copy only, not classification rules.
+ * @param {UiStatus} status
+ * @param {{hasProfile?: boolean, statusAvailable?: boolean, pendingWorldCount?: number}} [context]
+ * @returns {{title: string, detail: string}}
+ */
+export function presentWorldOverview(status, context = {}) {
+  const count = Math.max(status.attentionWorldCount, status.unavailableCount, status.missingCount);
+  const hasBaseline = context.hasProfile !== false && status.lastSuccessfulSyncAt !== null;
+  const pending = Math.max(status.pendingProbeCount, context.pendingWorldCount ?? 0);
+  if (count > 0) {
+    return {
+      title: `消えた可能性のあるワールド ${count.toLocaleString("ja-JP")}件`,
+      detail: `最後に保存できた名前と画像です。${status.syncing ? "確認中も前回の記録を表示しています。" : ""}${pending > 0 ? `ほかに状態を確認中のワールドがあります。` : ""}`
+    };
+  }
+  if (!hasBaseline) {
+    return {
+      title: status.syncing ? "最初の記録を保存しています" : "最初の記録を保存しましょう",
+      detail: "現在のお気に入りを保存すると、次回から消えた可能性のあるワールドをここに表示します。"
+    };
+  }
+  if (status.syncing) {
+    return {title: "お気に入りを確認しています", detail: "前回の記録には、消えたと確認できたワールドはありません。確認が終わるまでお待ちください。"};
+  }
+  if (context.statusAvailable === false || presentStatus(status).tone === "error") {
+    return {title: "最新の状態はまだ確認できていません", detail: "保存済みの記録には、消えたと確認できたワールドはありません。上の案内を確認してください。"};
+  }
+  if (pending > 0) {
+    return {title: "消えたと確認できたワールドはありません", detail: "状態を確認中のワールドがあります。正常な確認で同じ状態が2回続いてから表示します。「すべての記録・検索」で確認中の記録も見られます。"};
+  }
+  return {
+    title: "消えたと確認できたワールドはありません",
+    detail: "前回の確認では、一覧からの消失・アクセス不可は確認されていません。保存済みの全ワールドは「すべての記録・検索」で見られます。"
+  };
+}
+
+/**
  * @param {unknown} response
  * @returns {{ ok: true } | { ok: false, error: string, retryAt: string | null }}
  */
