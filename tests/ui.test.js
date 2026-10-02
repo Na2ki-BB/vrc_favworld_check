@@ -875,6 +875,7 @@ test("dashboard progress polling stays local, does not overlap and discards obso
     `let pageClosed = false, restoring = false, purging = false, progressPolling = false, progressEpoch = 0;
      let repository = {}, thumbnailRenderGeneration = 1;
      const document = {hidden: false}, worldList = { querySelectorAll: () => [] }, settingsThumbnailCount = {};
+     const refreshObservedStatus = async () => false, renderConnection = () => {}, renderPrimaryFocus = () => {};
      const renderThumbnailProgressNotice = () => { thumbnailCaptureNotice.textContent = presentThumbnailProgress(state.status.thumbnailProgress, {savedCount: state.thumbnailCount}); };
      ${functionSource}
      return { poll: refreshThumbnailProgress, invalidate: () => { progressEpoch += 1; }, close: () => { pageClosed = true; } };`
@@ -944,7 +945,8 @@ test("thumbnail count failure leaves main history load usable and count unknown"
   let warned = false;
   const load = new Function("state", "database", "normalizeStatusResponse", "readThumbnailCount", "renderAll", "renderThumbnailProgressNotice", `
     let progressEpoch = 0, thumbnailRenderGeneration = 0, visibleWorldCount = 0, visibleEventCount = 0;
-    const PAGE_SIZE = 200;
+    const PAGE_SIZE = 200, pageClosed = false;
+    const repository = database;
     const requireRepository = () => database;
     const sendMessage = async () => ({activeProfileId: "user-a"});
     const isRecord = value => typeof value === "object" && value !== null;
@@ -1077,7 +1079,7 @@ test("dashboard navigation supports native links and Back/Forward without fake t
   assert.match(source, /window.addEventListener\("hashchange", navigateFromHash\)/u);
   assert.match(source, /aria-current/u);
   assert.doesNotMatch(source, /role", "tablist"|role", "tab"/u);
-  assert.match(source, /if \(state.status.syncing \|\| purging\) return/u);
+  assert.match(source, /if \(state.status.syncing \|\| purging \|\| manualSyncInFlight\) return/u);
 });
 
 
@@ -1169,4 +1171,251 @@ test("popup keeps image progress available behind a native disclosure and matche
   assert.match(css, /\.button-secondary\s*\{[^}]*color: #f6f6fb;[^}]*background: #344157;/u);
   assert.match(css, /summary:focus-visible/u);
   assert.doesNotMatch(css, /min-height: 560px|animation: pulse/u);
+});
+
+
+test("dashboard observes external sync completion without restarting sync or resetting the view", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function refreshObservedStatus(");
+  const end = source.indexOf("\n}\n", start) + 2;
+  const oldTime = "2026-01-01T00:00:00Z";
+  const state = {profile: {userId: USER_ID}, status: normalizeStatusResponse({activeProfileId: USER_ID, lastSuccessfulSyncAt: oldTime, syncing: true, attentionWorldCount: 2}), statusAvailable: true};
+  /** @type {unknown[][]} */
+  const loads = [];
+  /** @type {string[]} */
+  const notices = [];
+  let renders = 0;
+  let rejectLoad = false;
+  let incoming = state.status;
+  const refresh = new Function("state", "loadData", "renderConnection", "showNotice", `
+    const pageClosed = false, restoring = false, purging = false;
+    const renderPrimaryFocus = renderConnection, renderSummary = renderConnection, renderSettings = renderConnection;
+    ${source.slice(start, end)}
+    return refreshObservedStatus;
+  `)(state, /** @param {unknown[]} args */ async (...args) => {
+    loads.push(args);
+    if (rejectLoad) throw new Error("synthetic storage read failure");
+    state.status = {...incoming};
+    state.profile = {userId: incoming.activeProfileId ?? USER_ID};
+  }, () => { renders += 1; }, /** @param {string} title */ (title) => notices.push(title));
+  incoming = normalizeStatusResponse({activeProfileId: USER_ID, lastSuccessfulSyncAt: oldTime, syncing: false, authRequired: true, attentionWorldCount: 99});
+  assert.equal(await refresh(incoming), false);
+  assert.equal(state.status.syncing, false);
+  assert.equal(state.status.authRequired, true);
+  assert.equal(state.status.attentionWorldCount, 2, "runtime counters do not replace counts derived from the displayed local records");
+  assert.equal(renders, 4);
+  assert.equal(loads.length, 0);
+  incoming = {...incoming, lastSuccessfulSyncAt: "2026-01-02T00:00:00Z", authRequired: false};
+  assert.equal(await refresh(incoming), true);
+  assert.deepEqual(loads, [[null, true]], "new saved results retain the current pagination and filters");
+  assert.equal(await refresh(incoming), false);
+  assert.equal(loads.length, 1, "an unchanged successful observation does not reload cards");
+  incoming = {...incoming, activeProfileId: "usr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"};
+  assert.equal(await refresh(incoming), true);
+  assert.equal(loads.length, 2);
+  incoming = {...incoming, lastSuccessfulSyncAt: "2026-01-03T00:00:00Z"};
+  rejectLoad = true;
+  assert.equal(await refresh(incoming), true);
+  assert.equal(state.statusAvailable, false);
+  assert.deepEqual(notices, ["最新の記録を読み込めませんでした"]);
+  assert.doesNotMatch(source.slice(start, end), /START_SYNC|worldSearch\.value|groupFilter\.value|activateTab/u);
+  assert.match(source, /if \(!preserveView\) \{\s+visibleWorldCount = PAGE_SIZE;/u);
+});
+
+test("native dashboard routes handle hash changes, repeated same-link clicks and late history reads", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  /** @param {string} name */
+  const functionSource = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    return source.slice(start, source.indexOf("\n}\n", start) + 2);
+  };
+  const start = source.indexOf("for (const name of VALID_TABS) requiredElement");
+  const end = source.indexOf("worldSearch.addEventListener", start);
+  const create = new Function(`
+    const VALID_TABS = new Set(["worlds", "events", "settings"]), PAGE_SIZE = 200;
+    let visibleWorldCount = 0, worldRenders = 0, historyReads = 0;
+    const focus = [], handlers = new Map();
+    class HTMLAnchorElement {
+      constructor(tab, href) { this.dataset = {tab}; this.attrs = new Map([["href", href]]); this.handlers = new Map(); this.classList = {toggle() {}}; }
+      getAttribute(key) { return this.attrs.get(key); }
+      setAttribute(key, value) { this.attrs.set(key, value); }
+      removeAttribute(key) { this.attrs.delete(key); }
+      addEventListener(type, action) { this.handlers.set(type, action); }
+    }
+    const tabButtons = [...VALID_TABS].map(name => new HTMLAnchorElement(name, name === "worlds" ? "#attention" : "#" + name));
+    const panels = Object.fromEntries([...VALID_TABS].map(name => [name + "-panel", {hidden: true, focus() {focus.push(name);}}]));
+    const requiredElement = id => panels[id];
+    const worldFilter = {value: ""}, eventFilter = {value: ""}, worldSearch = {value: ""}, groupFilter = {value: ""};
+    const window = {location: {hash: "#all"}, addEventListener(type, action) {handlers.set(type, action);}};
+    const document = {querySelectorAll() {return tabButtons;}};
+    const renderWorlds = () => {worldRenders += 1;}, renderEvents = () => {};
+    let finishRead;
+    const markHistoryAsRead = () => {historyReads += 1; return new Promise(resolve => {finishRead = resolve;});};
+    ${functionSource("activateTab")}
+    ${functionSource("initialTabFromHash")}
+    ${functionSource("applyInitialRouteFilters")}
+    ${source.slice(start, end)}
+    return {panels, worldFilter, worldSearch, groupFilter, tabButtons, focus,
+      route(hash) {window.location.hash = hash; handlers.get("hashchange")();},
+      sameLink() {tabButtons[0].handlers.get("click")();},
+      finishRead() {finishRead?.();}, counts: () => ({worldRenders, historyReads})};
+  `);
+  const ui = create();
+  assert.equal(ui.worldFilter.value, "all");
+  ui.route("#attention");
+  assert.equal(ui.worldFilter.value, "attention");
+  ui.worldSearch.value = "old search";
+  ui.groupFilter.value = "worlds2";
+  ui.sameLink();
+  assert.equal(ui.worldSearch.value, "");
+  assert.equal(ui.groupFilter.value, "");
+  assert.equal(ui.counts().worldRenders, 2);
+  ui.route("#events");
+  ui.route("#settings");
+  ui.finishRead();
+  assert.equal(ui.panels["settings-panel"].hidden, false);
+  assert.equal(ui.panels["events-panel"].hidden, true);
+  assert.equal(ui.counts().historyReads, 1);
+  assert.equal(ui.tabButtons[2].getAttribute("aria-current"), "page");
+  ui.route("#events");
+  assert.equal(ui.panels["events-panel"].hidden, false, "Back-like hash navigation selects its matching panel");
+  ui.route("#unexpected");
+  assert.equal(ui.worldFilter.value, "attention");
+  assert.equal(ui.panels["worlds-panel"].hidden, false);
+  assert.equal(ui.focus.at(-1), "worlds");
+});
+
+test("dashboard manual command stays busy through lagging status and clears only its own progress", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const start = source.indexOf("async function performSync()");
+  const end = source.indexOf("\nsyncNowButton.addEventListener", start);
+  const create = new Function("normalizeCommandResponse", "commandErrorMessage", `
+    let manualSyncInFlight = false, restoring = false, purging = false, commands = 0;
+    let finish, working = false, notice = "";
+    const state = {status: {syncing: false}}, syncNowButton = {};
+    const renderConnection = () => {working = state.status.syncing || manualSyncInFlight;};
+    const renderPrimaryFocus = renderConnection, renderSettings = () => {};
+    const showNotice = title => {notice = title;};
+    const loadData = async () => {state.status.syncing = false; renderConnection(); return true;};
+    const sendMessage = () => {commands += 1; return new Promise(resolve => {finish = resolve;});};
+    ${source.slice(start, end)}
+    return {run: performSync, state, syncNowButton, finish: result => finish(result), snapshot: () => ({commands, working, notice})};
+  `);
+  const controller = create(normalizeCommandResponse, commandErrorMessage);
+  const first = controller.run();
+  assert.equal(controller.snapshot().working, true);
+  controller.state.status.syncing = false;
+  await controller.run();
+  assert.equal(controller.snapshot().commands, 1, "a late idle observation cannot start another command");
+  controller.finish({ok: true});
+  await first;
+  assert.equal(controller.snapshot().working, false);
+  assert.equal(controller.syncNowButton.disabled, false);
+  const failed = controller.run();
+  controller.finish({ok: false, error: "offline"});
+  await failed;
+  assert.equal(controller.snapshot().notice, "確認を開始できませんでした");
+  assert.equal(controller.snapshot().working, false);
+  assert.equal(controller.syncNowButton.disabled, false);
+});
+
+test("dashboard publishes only one current snapshot after delayed reads and maintenance", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  /** @param {string} declaration */
+  const extract = (declaration) => {
+    const start = source.indexOf(declaration);
+    return source.slice(start, source.indexOf("\n}\n", start) + 2);
+  };
+  const create = new Function("normalizeStatusResponse", "readThumbnailCount", "phase", `
+    let progressEpoch = 0, thumbnailRenderGeneration = 0, visibleWorldCount = 400, visibleEventCount = 400;
+    let pageClosed = false, activeId = "a", release, rejectRead, signalReady;
+    const ready = new Promise(resolve => {signalReady = resolve;});
+    const pause = () => new Promise((resolve, reject) => {release = resolve; rejectRead = reject; signalReady();});
+    const times = {a: "2026-01-01T00:00:00Z", b: "2026-02-01T00:00:00Z"};
+    const profiles = ["a", "b"].map(userId => ({userId, lastSuccessfulSyncAt: times[userId], firstSeenAt: times[userId]}));
+    const database = {
+      async listProfiles() {if (activeId === "a" && phase === "profile") await pause(); return profiles;},
+      async listWorlds(id) {if (id === "a" && phase === "worlds") await pause(); return Array.from({length: id === "a" ? 1 : 2}, (_, i) => ({userId: id, worldId: id + i}));},
+      async listEvents(id) {return [{userId: id, worldId: id + "0"}];},
+      async listFavoriteGroups(id) {return [{userId: id}];},
+      async listThumbnailMetadata(id) {return [{userId: id}];},
+      async getSetting(key) {
+        const id = activeId;
+        if (id === "a" && key === "autoSyncEnabled" && phase === "settings") await pause();
+        if (key === "activeProfileId") return id;
+        if (key === "lastBackupAt" || key === "nextSyncAt") return times[id];
+        return id === "b";
+      }
+    };
+    let repository = database;
+    const requireRepository = () => repository;
+    const sendMessage = async () => {
+      const id = activeId;
+      if (id === "a" && phase === "status") await pause();
+      return {activeProfileId: id, lastSuccessfulSyncAt: times[id], lastResult: "success"};
+    };
+    const isRecord = value => typeof value === "object" && value !== null;
+    const readStorageEstimate = async () => ({usage: 10, quota: 100});
+    const dateSetting = value => value;
+    const summarizeHistory = worlds => ({attention: worlds.length, missing: worlds.length, unavailable: 0});
+    const state = {profile: null, worlds: [], events: [], favoriteGroups: [], thumbnailCount: 0, status: normalizeStatusResponse({}), statusAvailable: true, settings: {}, storageEstimate: {quota: 100}};
+    const renders = [], purgeMessage = {}, PAGE_SIZE = 200;
+    const renderAll = () => renders.push({profile: state.profile?.userId, worlds: state.worlds.map(world => world.userId)});
+    const renderThumbnailProgressNotice = () => {};
+    ${extract("async function selectProfile(")}
+    ${extract("async function loadData(")}
+    ${extract("function showDeletedState(")}
+    return {state, renders, ready,
+      load(id) {activeId = id; return loadData(id, true);},
+      release() {release();}, reject() {rejectRead(new Error("synthetic delayed read failure"));},
+      restoreBegins() {progressEpoch += 1;}, clear() {showDeletedState("cleared");},
+      replaceRepository() {repository = {...database};}, close() {pageClosed = true; progressEpoch += 1;},
+      pagination: () => [visibleWorldCount, visibleEventCount]};
+  `);
+  for (const phase of ["status", "profile", "worlds", "settings"]) {
+    const ui = create(normalizeStatusResponse, readThumbnailCount, phase);
+    const staleA = ui.load("a");
+    await ui.ready;
+    assert.equal(ui.state.profile, null, `${phase}: pending reads never publish a partial profile`);
+    assert.deepEqual(ui.state.worlds, []);
+    ui.restoreBegins();
+    assert.equal(await ui.load("b"), true);
+    ui.release();
+    assert.equal(await staleA, false);
+    assert.equal(ui.state.profile.userId, "b");
+    assert.equal(ui.state.status.activeProfileId, "b");
+    assert.equal(ui.state.status.lastSuccessfulSyncAt, "2026-02-01T00:00:00Z");
+    assert.deepEqual(ui.state.worlds.map((/** @type {{userId: string}} */ world) => world.userId), ["b", "b"]);
+    assert.equal(ui.state.events[0].userId, "b");
+    assert.equal(ui.state.favoriteGroups[0].userId, "b");
+    assert.equal(ui.state.settings.autoSyncEnabled, true);
+    assert.equal(ui.renders.length, 1, `${phase}: stale completion does not rerender`);
+    assert.deepEqual(ui.pagination(), [400, 400]);
+  }
+  for (const boundary of ["restoreBegins", "clear", "replaceRepository", "close"]) {
+    const ui = create(normalizeStatusResponse, readThumbnailCount, "worlds");
+    const stale = ui.load("a");
+    await ui.ready;
+    ui[boundary]();
+    ui.release();
+    assert.equal(await stale, false, boundary);
+    assert.equal(ui.state.profile, null);
+    assert.deepEqual(ui.state.worlds, []);
+    assert.equal(ui.renders.length, boundary === "clear" ? 1 : 0);
+  }
+  const failed = create(normalizeStatusResponse, readThumbnailCount, "worlds");
+  const currentRead = failed.load("a");
+  await failed.ready;
+  failed.reject();
+  await assert.rejects(currentRead, /synthetic delayed read failure/u);
+  assert.equal(failed.state.profile, null);
+  assert.deepEqual(failed.state.worlds, []);
+  const obsolete = create(normalizeStatusResponse, readThumbnailCount, "worlds");
+  const obsoleteRead = obsolete.load("a");
+  await obsolete.ready;
+  await obsolete.load("b");
+  obsolete.reject();
+  assert.equal(await obsoleteRead, false, "a rejected old read must not turn a newer successful view into an error");
+  assert.equal(obsolete.state.profile.userId, "b");
+  assert.equal(obsolete.state.statusAvailable, true);
 });
