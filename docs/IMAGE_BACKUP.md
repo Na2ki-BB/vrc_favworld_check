@@ -26,6 +26,7 @@ thumbnails/<world-id>.webp
 - ZIP内の画像は同じIndexedDB transactionで追加または更新する。
 - ZIPに含まれない既存画像は削除しない。
 - JSONだけの復元でも既存画像を削除しない。
+- 旧JSONの復元などで現在のワールド記録に対応しない画像が残った場合、その孤立画像はローカルでは削除しない。ただし`backup.json`に対応Worldがないため、画像込みZIPからは除外する。World記録が再び現れれば次回のZIP対象になる。
 - 検証失敗時はtransactionを開始しない。不整合や書き込み失敗時は記録と画像をまとめてrollbackする。
 
 ## ZIPの安全境界
@@ -39,7 +40,8 @@ thumbnails/<world-id>.webp
 - central/local headerの名前、方式、CRC、サイズ、offsetが一致することを確認
 - entryの重なり、gap、末尾の隠しdataを拒否
 - indexにない画像、画像のないindex、別profile／未知world／重複worldを拒否
-- WebP構造、寸法、byte数、VRChat画像URLを再検証
+- RIFF全長と全chunk境界、静止画VP8 / VP8L本体、WebP寸法、byte数、VRChat画像URLを再検証。寸法だけを持つVP8X containerは画像として受け入れない
+- 復元書き込み前にChromeの画像decoderで各WebPを実際に開き、decode後の寸法も照合する。decode不能ならtransactionを開始せず、既存記録と既存画像を変更しない
 
 ## 秘密情報を含めない仕組み
 

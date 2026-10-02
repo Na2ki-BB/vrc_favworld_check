@@ -351,6 +351,85 @@ function inputBytes(input) {
   invalid("input must be ZIP bytes");
 }
 
+/** @param {Uint8Array} bytes @param {number} offset */
+function readFourCc(bytes, offset) {
+  if (offset < 0 || offset + 4 > bytes.byteLength) return null;
+  return String.fromCharCode(
+    bytes[offset] ?? 0,
+    bytes[offset + 1] ?? 0,
+    bytes[offset + 2] ?? 0,
+    bytes[offset + 3] ?? 0
+  );
+}
+
+/**
+ * The dimension reader is intentionally suitable for early source limiting,
+ * so a VP8X canvas header alone is enough for it. Restores need a stronger
+ * boundary: require one complete static image chunk and an exact RIFF body so
+ * metadata-only WebP containers cannot replace a previously usable image.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {{width:number,height:number} | null}
+ */
+function readCompleteStaticWebpDimensions(bytes) {
+  const canvas = readWebpDimensions(bytes);
+  if (canvas === null || bytes.byteLength < 20 || read32(bytes, 4) + 8 !== bytes.byteLength) {
+    return null;
+  }
+
+  /** @type {{width:number,height:number} | null} */
+  let image = null;
+  let cursor = 12;
+  while (cursor < bytes.byteLength) {
+    if (cursor + 8 > bytes.byteLength) return null;
+    const chunkType = readFourCc(bytes, cursor);
+    const chunkSize = read32(bytes, cursor + 4);
+    const payload = cursor + 8;
+    const payloadEnd = payload + chunkSize;
+    const paddedEnd = payloadEnd + (chunkSize % 2);
+    if (payloadEnd < payload || paddedEnd > bytes.byteLength) return null;
+
+    if (chunkType === "VP8 ") {
+      if (
+        image !== null
+        || chunkSize <= 10
+        || ((bytes[payload] ?? 0) & 1) !== 0
+        || bytes[payload + 3] !== 0x9d
+        || bytes[payload + 4] !== 0x01
+        || bytes[payload + 5] !== 0x2a
+      ) {
+        return null;
+      }
+      image = {
+        width: read16(bytes, payload + 6) & 0x3fff,
+        height: read16(bytes, payload + 8) & 0x3fff
+      };
+    } else if (chunkType === "VP8L") {
+      if (image !== null || chunkSize <= 5 || bytes[payload] !== 0x2f) return null;
+      const packed = read32(bytes, payload + 1);
+      if ((packed >>> 29) !== 0) return null;
+      image = {
+        width: (packed & 0x3fff) + 1,
+        height: ((packed >>> 14) & 0x3fff) + 1
+      };
+    } else if (chunkType === "ANIM" || chunkType === "ANMF") {
+      return null;
+    }
+    cursor = paddedEnd;
+  }
+  if (
+    cursor !== bytes.byteLength
+    || image === null
+    || image.width <= 0
+    || image.height <= 0
+    || image.width !== canvas.width
+    || image.height !== canvas.height
+  ) {
+    return null;
+  }
+  return canvas;
+}
+
 /** @param {ThumbnailRecord} thumbnail @param {Uint8Array} bytes */
 function requireThumbnailBytes(thumbnail, bytes) {
   if (
@@ -362,13 +441,15 @@ function requireThumbnailBytes(thumbnail, bytes) {
   }
   let dimensions;
   try {
-    dimensions = readWebpDimensions(bytes);
+    dimensions = readCompleteStaticWebpDimensions(bytes);
   } catch {
     invalid("thumbnail is not a structurally valid WebP image");
   }
+  if (dimensions === null) {
+    invalid("thumbnail is not a structurally valid WebP image");
+  }
   if (
-    dimensions === null
-    || dimensions.width !== thumbnail.width
+    dimensions.width !== thumbnail.width
     || dimensions.height !== thumbnail.height
     || dimensions.width > THUMBNAIL_MAX_DIMENSION
     || dimensions.height > THUMBNAIL_MAX_DIMENSION
@@ -395,10 +476,17 @@ export async function createImageBackup(repository, userId, options = {}) {
   const imageEntries = [];
   const indexRows = [];
   for (const thumbnail of thumbnails) {
+    if (thumbnail.userId !== userId) {
+      invalid("stored thumbnail metadata is inconsistent with the profile");
+    }
+    // A legacy JSON restore deliberately retains existing images. If its
+    // replacement world set no longer contains one of them, keep it local but
+    // do not let that orphan prevent a self-consistent image archive.
+    if (!worldIds.has(thumbnail.worldId)) {
+      continue;
+    }
     if (
-      thumbnail.userId !== userId
-      || !WORLD_ID_PATTERN.test(thumbnail.worldId)
-      || !worldIds.has(thumbnail.worldId)
+      !WORLD_ID_PATTERN.test(thumbnail.worldId)
       || seen.has(thumbnail.worldId)
       || !isAllowedVrchatImageUrl(thumbnail.sourceUrl)
     ) {
@@ -533,12 +621,45 @@ export function imageBackupSummary(input) {
 }
 
 /**
+ * @param {readonly ThumbnailRecord[]} thumbnails
+ * @param {(blob:Blob) => Promise<{width:number,height:number,close?:()=>void}>} decodeImage
+ */
+async function requireDecodableThumbnails(thumbnails, decodeImage) {
+  for (const thumbnail of thumbnails) {
+    /** @type {{width:number,height:number,close?:()=>void}} */
+    let decoded;
+    try {
+      decoded = await decodeImage(thumbnail.blob);
+    } catch {
+      invalid("thumbnail image data cannot be decoded");
+    }
+    try {
+      if (
+        !Number.isSafeInteger(decoded.width)
+        || !Number.isSafeInteger(decoded.height)
+        || decoded.width !== thumbnail.width
+        || decoded.height !== thumbnail.height
+      ) {
+        invalid("decoded thumbnail dimensions do not match its metadata");
+      }
+    } finally {
+      decoded.close?.();
+    }
+  }
+}
+
+/**
  * @param {DatabaseRepository} repository
  * @param {Uint8Array | ArrayBuffer} input
- * @param {{ restoredAt?: string }} [options]
+ * @param {{
+ *   restoredAt?: string,
+ *   decodeImage?: (blob:Blob) => Promise<{width:number,height:number,close?:()=>void}>
+ * }} [options]
  */
 export async function restoreImageBackup(repository, input, options = {}) {
   const parsed = parseImageBackup(input);
+  const decodeImage = options.decodeImage ?? (async (blob) => globalThis.createImageBitmap(blob));
+  await requireDecodableThumbnails(parsed.thumbnails, decodeImage);
   const summary = await restoreValidatedBackup(repository, parsed.backup, {
     ...(options.restoredAt === undefined ? {} : { restoredAt: options.restoredAt }),
     thumbnails: parsed.thumbnails
