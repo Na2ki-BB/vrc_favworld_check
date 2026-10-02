@@ -97,6 +97,7 @@ const tabButtons = Array.from(document.querySelectorAll(".tab"));
 
 /** @type {DatabaseRepository | null} */
 let repository = null;
+let manualSyncInFlight = false;
 /** @type {(() => void | Promise<void>) | null} */
 let noticeAction = null;
 let visibleWorldCount = PAGE_SIZE;
@@ -216,10 +217,10 @@ noticeActionButton.addEventListener("click", async () => {
 
 /**
  * @param {string | null} preferredUserId
+ * @param {DatabaseRepository} database
  * @returns {Promise<ProfileRecord | null>}
  */
-async function selectProfile(preferredUserId) {
-  const database = requireRepository();
+async function selectProfile(preferredUserId, database) {
   const profiles = await database.listProfiles();
   if (profiles.length === 0) {
     return null;
@@ -243,72 +244,92 @@ async function selectProfile(preferredUserId) {
 }
 
 /**
+ * Stage one local snapshot and publish it only while this load still owns the
+ * view. Restore, purge, page close, a repository change, or any newer load
+ * invalidates every pending read before it can replace the displayed account.
  * @param {string | null} [preferredUserId]
+ * @param {boolean} [preserveView]
+ * @returns {Promise<boolean>} Whether this snapshot was applied.
  */
-async function loadData(preferredUserId = null) {
-  progressEpoch += 1;
+async function loadData(preferredUserId = null, preserveView = false) {
+  const epoch = ++progressEpoch;
   thumbnailRenderGeneration += 1;
   const database = requireRepository();
-  let runtimeStatus = normalizeStatusResponse({});
-  state.statusAvailable = true;
+  const current = () => !pageClosed && epoch === progressEpoch && repository === database;
   try {
-    const response = await sendMessage({ type: "GET_STATUS" });
-    if (isRecord(response) && response.ok === false) {
-      throw new Error("Status request failed");
+    let runtimeStatus = normalizeStatusResponse({});
+    let statusAvailable = true;
+    try {
+      const response = await sendMessage({ type: "GET_STATUS" });
+      if (isRecord(response) && response.ok === false) {
+        throw new Error("Status request failed");
+      }
+      runtimeStatus = normalizeStatusResponse(response);
+    } catch {
+      statusAvailable = false;
     }
-    runtimeStatus = normalizeStatusResponse(response);
-  } catch {
-    state.statusAvailable = false;
-  }
+    if (!current()) return false;
 
-  state.profile = await selectProfile(preferredUserId ?? runtimeStatus.activeProfileId);
-  if (state.profile === null) {
-    state.worlds = [];
-    state.events = [];
-    state.favoriteGroups = [];
-    state.thumbnailCount = 0;
-  } else {
-    const [worlds, events, favoriteGroups, thumbnailCount] = await Promise.all([
-      database.listWorlds(state.profile.userId),
-      database.listEvents(state.profile.userId),
-      database.listFavoriteGroups(state.profile.userId),
-      readThumbnailCount(database, state.profile.userId)
+    const profile = await selectProfile(preferredUserId ?? runtimeStatus.activeProfileId, database);
+    if (!current()) return false;
+    /** @type {WorldRecord[]} */
+    let worlds = [];
+    /** @type {HistoryEvent[]} */
+    let events = [];
+    /** @type {FavoriteGroupRecord[]} */
+    let favoriteGroups = [];
+    /** @type {number | null} */
+    let thumbnailCount = 0;
+    if (profile !== null) {
+      [worlds, events, favoriteGroups, thumbnailCount] = await Promise.all([
+        database.listWorlds(profile.userId),
+        database.listEvents(profile.userId),
+        database.listFavoriteGroups(profile.userId),
+        readThumbnailCount(database, profile.userId)
+      ]);
+    }
+    if (!current()) return false;
+
+    const [autoSyncEnabled, notificationsEnabled, storedNextSyncAt, lastBackupAt, storageEstimate] = await Promise.all([
+      database.getSetting("autoSyncEnabled"),
+      database.getSetting("notificationsEnabled"),
+      database.getSetting("nextSyncAt"),
+      database.getSetting("lastBackupAt"),
+      readStorageEstimate()
     ]);
-    state.worlds = worlds;
-    state.events = events;
-    state.favoriteGroups = favoriteGroups;
-    state.thumbnailCount = thumbnailCount;
+    if (!current()) return false;
+    const localSummary = summarizeHistory(worlds, events);
+    Object.assign(state, {
+      profile, worlds, events, favoriteGroups, thumbnailCount, statusAvailable, storageEstimate,
+      settings: {
+        autoSyncEnabled: autoSyncEnabled !== false,
+        notificationsEnabled: notificationsEnabled !== false,
+        lastBackupAt: dateSetting(lastBackupAt)
+      },
+      status: {
+        ...runtimeStatus,
+        thumbnailProgress: runtimeStatus.activeProfileId === profile?.userId ? runtimeStatus.thumbnailProgress : null,
+        activeProfileId: profile?.userId ?? runtimeStatus.activeProfileId,
+        lastSuccessfulSyncAt: profile?.lastSuccessfulSyncAt ?? runtimeStatus.lastSuccessfulSyncAt,
+        nextSyncAt: runtimeStatus.nextSyncAt ?? dateSetting(storedNextSyncAt),
+        worldCount: worlds.length,
+        eventCount: events.length,
+        attentionWorldCount: localSummary.attention,
+        missingCount: localSummary.missing,
+        unavailableCount: localSummary.unavailable
+      }
+    });
+    renderThumbnailProgressNotice();
+    if (!preserveView) {
+      visibleWorldCount = PAGE_SIZE;
+      visibleEventCount = PAGE_SIZE;
+    }
+    renderAll();
+    return true;
+  } catch (error) {
+    if (!current()) return false;
+    throw error;
   }
-
-  const [autoSyncEnabled, notificationsEnabled, storedNextSyncAt, lastBackupAt, storageEstimate] = await Promise.all([
-    database.getSetting("autoSyncEnabled"),
-    database.getSetting("notificationsEnabled"),
-    database.getSetting("nextSyncAt"),
-    database.getSetting("lastBackupAt"),
-    readStorageEstimate()
-  ]);
-  state.settings.autoSyncEnabled = autoSyncEnabled !== false;
-  state.settings.notificationsEnabled = notificationsEnabled !== false;
-  state.settings.lastBackupAt = dateSetting(lastBackupAt);
-  state.storageEstimate = storageEstimate;
-  const localSummary = summarizeHistory(state.worlds, state.events);
-  state.status = {
-    ...runtimeStatus,
-    thumbnailProgress: runtimeStatus.activeProfileId === state.profile?.userId ? runtimeStatus.thumbnailProgress : null,
-    activeProfileId: state.profile?.userId ?? runtimeStatus.activeProfileId,
-    lastSuccessfulSyncAt:
-      state.profile?.lastSuccessfulSyncAt ?? runtimeStatus.lastSuccessfulSyncAt,
-    nextSyncAt: runtimeStatus.nextSyncAt ?? dateSetting(storedNextSyncAt),
-    worldCount: state.worlds.length,
-    eventCount: state.events.length,
-    attentionWorldCount: localSummary.attention,
-    missingCount: localSummary.missing,
-    unavailableCount: localSummary.unavailable
-  };
-  renderThumbnailProgressNotice();
-  visibleWorldCount = PAGE_SIZE;
-  visibleEventCount = PAGE_SIZE;
-  renderAll();
 }
 
 /**
@@ -402,7 +423,7 @@ function renderAll() {
 }
 
 function renderPrimaryFocus() {
-  const overview = presentWorldOverview(state.status, {
+  const overview = presentWorldOverview({...state.status, syncing: state.status.syncing || manualSyncInFlight}, {
     hasProfile: state.profile !== null,
     statusAvailable: state.statusAvailable,
     pendingWorldCount: state.worlds.filter((world) => worldMatchesFilter(world, "pending")).length
@@ -416,7 +437,7 @@ function renderPrimaryFocus() {
 }
 
 function renderConnection() {
-  const presentation = presentStatus(state.status);
+  const presentation = presentStatus({...state.status, syncing: state.status.syncing || manualSyncInFlight});
   connectionBadge.className = "badge";
   if (presentation.tone === "ready" || presentation.tone === "working") {
     connectionBadge.classList.add("is-ready");
@@ -426,12 +447,12 @@ function renderConnection() {
     connectionBadge.classList.add("is-error");
   }
   connectionBadge.textContent = state.statusAvailable ? presentation.title : "状態を読み込めませんでした";
-  syncNowButton.disabled = state.status.syncing || restoring || purging;
+  syncNowButton.disabled = state.status.syncing || restoring || purging || manualSyncInFlight;
   syncNowButton.textContent = purging
     ? "削除しています…"
     : restoring
     ? "復元しています…"
-    : state.status.syncing
+    : state.status.syncing || manualSyncInFlight
       ? "確認しています…"
       : "今すぐ確認";
 
@@ -989,10 +1010,10 @@ function renderSettings() {
 
   const hasProfile = state.profile !== null;
   exportButton.disabled = !hasProfile || restoring || purging;
-  importInput.disabled = repository === null || state.status.syncing || restoring || purging;
+  importInput.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight;
   autoSyncToggle.disabled = restoring || purging;
   notificationToggle.disabled = restoring || purging;
-  purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging;
+  purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight;
 }
 
 /**
@@ -1140,7 +1161,7 @@ openVrchatButton.addEventListener("click", async () => {
 });
 
 async function performSync() {
-  if (state.status.syncing || purging) return;
+  if (state.status.syncing || purging || manualSyncInFlight) return;
   if (restoring) {
     showNotice(
       "バックアップを復元しています",
@@ -1148,8 +1169,11 @@ async function performSync() {
     );
     return;
   }
+  let resultsReloaded = false;
+  manualSyncInFlight = true;
   state.status = { ...state.status, syncing: true };
   renderConnection();
+  renderSettings();
   renderPrimaryFocus();
   try {
     const response = normalizeCommandResponse(
@@ -1162,7 +1186,7 @@ async function performSync() {
       showNotice("確認を開始できませんでした", commandErrorMessage(response.error, response.retryAt));
       return;
     }
-    await loadData();
+    resultsReloaded = await loadData();
   } catch {
     state.status = { ...state.status, syncing: false };
     renderConnection();
@@ -1171,6 +1195,13 @@ async function performSync() {
       "確認を開始できませんでした",
       "拡張を開き直して、もう一度お試しください。保存済みの記録はそのままです。"
     );
+  } finally {
+    manualSyncInFlight = false;
+    if (resultsReloaded) renderConnection();
+    renderPrimaryFocus();
+    syncNowButton.disabled = state.status.syncing || restoring || purging;
+    syncNowButton.textContent = state.status.syncing ? "確認しています…" : "今すぐ確認";
+    renderSettings();
   }
 }
 
@@ -1361,8 +1392,7 @@ importInput.addEventListener("change", async () => {
     }
     let restoredDataLoaded = false;
     try {
-      await loadData(restored.userId);
-      restoredDataLoaded = true;
+      restoredDataLoaded = await loadData(restored.userId);
     } catch {
       restoredDataLoaded = false;
     }
@@ -1416,6 +1446,8 @@ async function reopenAfterPurgeFailure(message) {
  * @param {string} message
  */
 function showDeletedState(message) {
+  progressEpoch += 1;
+  thumbnailRenderGeneration += 1;
   state.profile = null;
   state.worlds = [];
   state.events = [];
@@ -1479,7 +1511,38 @@ function renderThumbnailProgressNotice() {
   thumbnailCaptureNotice.hidden = thumbnailCaptureNotice.textContent.length === 0;
 }
 
-// Refresh only progress and visible local images; keep filters, pagination and scroll.
+// Refresh only local observations and visible images; never start a sync here.
+/** @param {UiStatus} status @returns {Promise<boolean>} Whether the saved results were reloaded. */
+async function refreshObservedStatus(status) {
+  const profileChanged = status.activeProfileId !== null && status.activeProfileId !== state.profile?.userId;
+  const savedResultsChanged = status.lastSuccessfulSyncAt !== null
+    && status.lastSuccessfulSyncAt !== state.status.lastSuccessfulSyncAt;
+  if (profileChanged || savedResultsChanged) {
+    try {
+      await loadData(null, true);
+    } catch {
+      if (!pageClosed && !restoring && !purging) {
+        state.statusAvailable = false;
+        renderConnection();
+        renderPrimaryFocus();
+        showNotice("最新の記録を読み込めませんでした", "保存済みの記録を変更せず、次の表示更新で再確認します。");
+      }
+    }
+    return true;
+  }
+  const fields = /** @type {const} */ (["syncing", "authRequired", "nextSyncAt", "lastResult", "pendingProbeCount", "unreadCount", "favoriteGroupStatus"]);
+  const changed = !state.statusAvailable || fields.some((field) => state.status[field] !== status[field]);
+  state.statusAvailable = true;
+  state.status = {...state.status, ...Object.fromEntries(fields.map((field) => [field, status[field]]))};
+  if (changed) {
+    renderConnection();
+    renderPrimaryFocus();
+    renderSummary();
+    renderSettings();
+  }
+  return false;
+}
+
 async function refreshThumbnailProgress() {
   if (pageClosed || document.hidden || restoring || purging || progressPolling || repository === null) return;
   progressPolling = true;
@@ -1493,7 +1556,8 @@ async function refreshThumbnailProgress() {
     if (!current()) return;
     if (isRecord(response) && response.ok === false) throw new Error("Status request failed");
     const status = normalizeStatusResponse(response);
-    if (status.activeProfileId !== profileId) return;
+    if (await refreshObservedStatus(status)) return;
+    if (!current() || status.activeProfileId !== profileId) return;
     const previousProgress = state.status.thumbnailProgress;
     const previousSavedCount = state.status.thumbnailSavedCount;
     state.status.thumbnailSavedCount = status.thumbnailSavedCount;
@@ -1519,6 +1583,9 @@ async function refreshThumbnailProgress() {
     }
   } catch {
     if (current()) {
+      state.statusAvailable = false;
+      renderConnection();
+      renderPrimaryFocus();
       thumbnailCaptureNotice.textContent = `${presentThumbnailProgress(null, { savedCount: state.thumbnailCount, hasProfile: state.profile !== null })} 画像の保存状況を読み込めませんでした。自動で表示を再確認します。保存済みの記録はそのままです。`;
       thumbnailCaptureNotice.hidden = false;
     }
