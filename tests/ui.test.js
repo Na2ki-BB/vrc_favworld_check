@@ -1026,7 +1026,7 @@ test("popup status failure keeps known saved count without stale running text", 
   const notice = {textContent: "", hidden: true};
   const handler = new Function("thumbnailProgress", "normalizeStatusResponse", "presentThumbnailProgress", `
     let pageClosed = false, lastKnownThumbnailSavedCount = null;
-    const statusDot = {}, statusTitle = {}, statusDetail = {}, lastSync = {};
+    const statusCard = {}, statusDot = {}, statusTitle = {}, statusDetail = {}, lastSync = {};
     const attentionCard = {classList: {remove: () => {}}};
     const attentionTitle = {}, attentionDetail = {}, dashboardButton = {};
     ${source.slice(start, end)}
@@ -1110,4 +1110,63 @@ test("dashboard text and button palette stays above WCAG AA contrast", async () 
   assert.match(css, /summary:focus-visible/u);
   assert.match(css, /file-button:focus-within/u);
   assert.match(css, /@media \(forced-colors: active\)/u);
+});
+
+
+test("popup exposes only the needed daily actions without hiding failures or setup", async () => {
+  const source = await readFile(new URL("../extension/popup.js", import.meta.url), "utf8");
+  const start = source.indexOf("  const presentation = presentStatus(status);");
+  const end = source.indexOf("\n}\n\nfunction showUnavailableStatus()", start);
+  const element = () => ({textContent: "", hidden: false, disabled: false, className: "", classList: {toggle() {}}});
+  const attentionCard = element(), attentionTitle = element(), attentionDetail = element(), dashboardButton = element();
+  const statusCard = element(), statusDot = element(), statusTitle = element(), statusDetail = element(), lastSync = element();
+  const syncButton = element(), loginButton = element();
+  const render = new Function(
+    "status", "presentStatus", "presentWorldOverview", "formatDateTime", "attentionCard", "attentionTitle", "attentionDetail", "dashboardButton",
+    "statusCard", "statusDot", "statusTitle", "statusDetail", "lastSync", "syncButton", "loginButton", "syncInFlight",
+    `let lastKnownSyncing = false; ${source.slice(start, end)}; return lastKnownSyncing;`
+  );
+  /** @param {Record<string, unknown>} status @param {boolean} [inFlight] */
+  const receive = (status, inFlight = false) => render(normalizeStatusResponse(status), presentStatus, presentWorldOverview, formatDateTime,
+    attentionCard, attentionTitle, attentionDetail, dashboardButton, statusCard, statusDot, statusTitle, statusDetail, lastSync, syncButton, loginButton, inFlight);
+  const ready = {activeProfileId: USER_ID, lastSuccessfulSyncAt: new Date().toISOString(), lastResult: "success"};
+  receive({...ready, attentionWorldCount: 2, missingCount: 2, unavailableCount: 1});
+  assert.equal(attentionTitle.textContent, "消えた可能性のあるワールド 2件");
+  assert.equal(dashboardButton.textContent, "名前と画像を見る");
+  assert.equal(loginButton.hidden, true);
+  assert.equal(statusCard.hidden, true);
+  assert.equal(syncButton.disabled, false);
+  receive({});
+  assert.match(attentionTitle.textContent, /最初の記録/u);
+  assert.equal(loginButton.hidden, false);
+  assert.equal(syncButton.className, "button button-primary");
+  receive({...ready, authRequired: true});
+  assert.equal(loginButton.hidden, false);
+  assert.equal(statusCard.hidden, false);
+  assert.match(statusTitle.textContent, /ログイン/u);
+  receive({...ready, lastResult: "offline"});
+  assert.match(attentionTitle.textContent, /最新の状態はまだ/u);
+  assert.equal(statusCard.hidden, false);
+  receive({...ready, pendingProbeCount: 1});
+  assert.equal(statusCard.hidden, false);
+  assert.match(statusDetail.textContent, /個別確認待ち/u);
+  receive({...ready, syncing: true});
+  assert.equal(syncButton.disabled, true);
+  assert.equal(statusCard.hidden, false);
+  assert.equal(loginButton.hidden, true);
+  receive(ready, true);
+  assert.equal(syncButton.disabled, true, "a lagging status response cannot re-enable an in-flight manual action");
+  receive(ready);
+  assert.equal(syncButton.disabled, false);
+});
+
+test("popup keeps image progress available behind a native disclosure and matches dashboard colors", async () => {
+  const html = await readFile(new URL("../extension/popup.html", import.meta.url), "utf8");
+  const css = await readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8");
+  assert.match(html, /<details class="record-status">[\s\S]*id="thumbnail-progress"/u);
+  assert.match(html, /id="login-button"[^>]*hidden/u);
+  assert.match(css, /\.button-primary\s*\{[^}]*color: #10252a;[^}]*background: #8ae9dc;/u);
+  assert.match(css, /\.button-secondary\s*\{[^}]*color: #f6f6fb;[^}]*background: #344157;/u);
+  assert.match(css, /summary:focus-visible/u);
+  assert.doesNotMatch(css, /min-height: 560px|animation: pulse/u);
 });
