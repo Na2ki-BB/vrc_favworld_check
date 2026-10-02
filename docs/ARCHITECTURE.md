@@ -1,5 +1,7 @@
 # vrc_favworld_check 基本・詳細設計
 
+画像込みバックアップのarchive構造、ZIP parserの制限、IndexedDB transaction境界は[画像込みバックアップ設計](IMAGE_BACKUP.md)を正とする。従来JSON serializer / validatorを再利用し、認証情報と端末運用状態をarchiveへ追加しない。
+
 > この文書は開発者向けです。利用方法と画面の見方は[README](../README.md)を参照してください。
 
 ## 1. 設計方針

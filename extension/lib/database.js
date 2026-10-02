@@ -18,7 +18,7 @@ const DATA_GENERATION_PREFIX = "dataGeneration:";
 const UNREAD_COUNT_PREFIX = "unreadCount:";
 const THUMBNAIL_IDENTIFIER_MAX_LENGTH = 256;
 const THUMBNAIL_SOURCE_URL_MAX_LENGTH = 8_192;
-const THUMBNAIL_MAX_DIMENSION = 320;
+export const THUMBNAIL_MAX_DIMENSION = 320;
 const EVENT_KIND_SET = new Set(EVENT_KIND_ORDER);
 const NOTIFICATION_ERROR_SET = /** @type {ReadonlySet<unknown>} */ (new Set([
   "api_rejected",
@@ -267,6 +267,7 @@ const INDEXES = Object.freeze({
  * @property {readonly FavoriteGroupRecord[]} favoriteGroups
  * @property {readonly HistoryEvent[]} events
  * @property {Readonly<Record<string, boolean>>} [preferences]
+ * @property {readonly ThumbnailRecord[]} [thumbnails]
  */
 
 /** @typedef {{ key: string, value: unknown }} StoredValue */
@@ -286,6 +287,7 @@ const INDEXES = Object.freeze({
  * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {HistoryEvent[]} events
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
+ * @property {ThumbnailRecord[]} [thumbnails]
  */
 
 /**
@@ -1159,16 +1161,19 @@ export class DatabaseRepository {
    * settings are intentionally absent from the returned backup snapshot.
    *
    * @param {string} userId
+   * @param {{ includeThumbnails?: boolean }} [options]
    * @returns {Promise<BackupSnapshot>}
    */
-  async getBackupSnapshot(userId) {
+  async getBackupSnapshot(userId, options = {}) {
+    const includeThumbnails = options.includeThumbnails === true;
     const transaction = this.#requireDatabase().transaction(
       [
         STORES.profiles,
         STORES.worlds,
         STORES.favoriteGroups,
         STORES.events,
-        STORES.settings
+        STORES.settings,
+        ...(includeThumbnails ? [STORES.thumbnails] : [])
       ],
       "readonly"
     );
@@ -1178,7 +1183,8 @@ export class DatabaseRepository {
       favoriteGroupValues,
       eventValues,
       autoSyncRecord,
-      notificationRecord
+      notificationRecord,
+      thumbnailValues
     ] =
       await completeRead(
         transaction,
@@ -1197,7 +1203,13 @@ export class DatabaseRepository {
             userId
           ),
           getValue(transaction.objectStore(STORES.settings), "autoSyncEnabled"),
-          getValue(transaction.objectStore(STORES.settings), "notificationsEnabled")
+          getValue(transaction.objectStore(STORES.settings), "notificationsEnabled"),
+          includeThumbnails
+            ? getAllValues(
+                transaction.objectStore(STORES.thumbnails).index(INDEXES.thumbnailsByUser),
+                userId
+              )
+            : Promise.resolve([])
         ])
       );
 
@@ -1207,6 +1219,8 @@ export class DatabaseRepository {
     favoriteGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
     const events = /** @type {HistoryEvent[]} */ (eventValues);
     events.sort((left, right) => left.eventId.localeCompare(right.eventId));
+    const thumbnails = /** @type {ThumbnailRecord[]} */ (thumbnailValues);
+    thumbnails.sort((left, right) => left.worldId.localeCompare(right.worldId));
     /** @type {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} */
     const preferences = {};
     const autoSyncEnabled =
@@ -1229,7 +1243,8 @@ export class DatabaseRepository {
       worlds,
       favoriteGroups,
       events,
-      preferences
+      preferences,
+      ...(includeThumbnails ? { thumbnails } : {})
     };
   }
 
@@ -2141,6 +2156,9 @@ export class DatabaseRepository {
    */
   async replaceProfileData(replacement) {
     const { profile, worlds, favoriteGroups, events, preferences = {} } = replacement;
+    const storedThumbnails = replacement.thumbnails === undefined
+      ? null
+      : replacement.thumbnails.map((thumbnail) => thumbnailRecordSnapshot(thumbnail));
     if (worlds.some((world) => world.userId !== profile.userId)) {
       throw new Error("Replacement contains a world owned by another profile");
     }
@@ -2149,6 +2167,23 @@ export class DatabaseRepository {
     }
     validateFavoriteGroupPlan(favoriteGroups, profile.userId);
     validateEventPlan(events);
+    if (storedThumbnails !== null) {
+      const worldIds = new Set(worlds.map((world) => world.worldId));
+      const thumbnailIds = new Set();
+      for (const thumbnail of storedThumbnails) {
+        validateThumbnailRecord(thumbnail);
+        if (thumbnail.userId !== profile.userId) {
+          throw new Error("Replacement contains a thumbnail owned by another profile");
+        }
+        if (!worldIds.has(thumbnail.worldId)) {
+          throw new Error("Replacement thumbnail does not refer to a replacement world");
+        }
+        if (thumbnailIds.has(thumbnail.worldId)) {
+          throw new Error("Replacement contains duplicate thumbnails");
+        }
+        thumbnailIds.add(thumbnail.worldId);
+      }
+    }
     for (const key of Object.keys(preferences)) {
       if (!BACKUP_PREFERENCE_KEYS.includes(key)) {
         throw new Error(`Replacement contains an unsafe preference: ${key}`);
@@ -2165,7 +2200,8 @@ export class DatabaseRepository {
         STORES.favoriteGroups,
         STORES.events,
         STORES.settings,
-        STORES.meta
+        STORES.meta,
+        ...(storedThumbnails === null ? [] : [STORES.thumbnails])
       ],
       "readwrite"
     );
@@ -2211,6 +2247,12 @@ export class DatabaseRepository {
       const eventStore = transaction.objectStore(STORES.events);
       for (const event of events) {
         eventStore.put(event);
+      }
+      if (storedThumbnails !== null) {
+        const thumbnailStore = transaction.objectStore(STORES.thumbnails);
+        for (const thumbnail of storedThumbnails) {
+          thumbnailStore.put(thumbnail);
+        }
       }
       const settingStore = transaction.objectStore(STORES.settings);
       for (const key of Object.keys(preferences)) {

@@ -693,6 +693,20 @@ test("dashboard keeps native select options readable and shows all records by de
   assert.match(popupCss, /\.attention-card\.is-alert/u);
 });
 
+test("dashboard keeps JSON backup compatibility and adds one image ZIP action", async () => {
+  const [html, source] = await Promise.all([
+    readFile(new URL("../extension/dashboard.html", import.meta.url), "utf8"),
+    readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8")
+  ]);
+  assert.match(html, /id="export-button"/u);
+  assert.match(html, /id="export-images-button"/u);
+  assert.match(html, /accept="application\/json,application\/zip,\.json,\.zip"/u);
+  assert.match(source, /createBackup\(/u);
+  assert.match(source, /createImageBackup\(/u);
+  assert.match(source, /restoreBackup\(/u);
+  assert.match(source, /restoreImageBackup\(/u);
+});
+
 test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   const sources = await Promise.all([
     readFile(new URL("../extension/popup.js", import.meta.url), "utf8"),
@@ -705,12 +719,17 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   assert.doesNotMatch(combined, /https?:\/\//u);
 
   const dashboard = sources[1] ?? "";
-  assert.ok(dashboard.indexOf("file.size > MAX_BACKUP_BYTES") < dashboard.indexOf("await file.text()"));
-  assert.ok(dashboard.indexOf("parseBackup(text)") < dashboard.indexOf("globalThis.confirm"));
-  const restoreStatusCheck = dashboard.indexOf('type: "GET_STATUS"', dashboard.indexOf("parseBackup(text)"));
-  assert.ok(dashboard.indexOf("parseBackup(text)") < restoreStatusCheck);
+  const importHandler = dashboard.indexOf('importInput.addEventListener("change"');
+  const confirmRestore = dashboard.indexOf("globalThis.confirm", importHandler);
+  assert.ok(dashboard.indexOf("file.size > MAX_BACKUP_BYTES", importHandler) < dashboard.indexOf("await file.text()", importHandler));
+  assert.ok(dashboard.indexOf("file.size > MAX_IMAGE_BACKUP_BYTES", importHandler) < dashboard.indexOf("await file.arrayBuffer()", importHandler));
+  assert.ok(dashboard.indexOf("parseBackup(jsonText)", importHandler) < confirmRestore);
+  assert.ok(dashboard.indexOf("parseImageBackup(imageArchiveBytes)", importHandler) < confirmRestore);
+  const restoreStatusCheck = dashboard.indexOf('type: "GET_STATUS"', importHandler);
+  assert.ok(dashboard.indexOf("parseBackup(jsonText)", importHandler) < restoreStatusCheck);
   assert.ok(restoreStatusCheck < dashboard.indexOf("globalThis.confirm"));
-  assert.ok(dashboard.indexOf("globalThis.confirm") < dashboard.indexOf("await restoreBackup"));
+  assert.ok(confirmRestore < dashboard.indexOf("await restoreBackup", importHandler));
+  assert.ok(confirmRestore < dashboard.indexOf("await restoreImageBackup", importHandler));
   assert.match(dashboard, /preview\.exportedAt/u);
   assert.match(dashboard, /URL\.revokeObjectURL/u);
   assert.match(dashboard, /URL\.createObjectURL\(record\.blob\)/u);
@@ -743,7 +762,7 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   assert.doesNotMatch(dashboard, /設定は変更していません/u);
   assert.match(
     dashboard,
-    /importInput\.disabled = repository === null \|\| state\.status\.syncing \|\| restoring/u
+    /importInput\.disabled = repository === null \|\| state\.status\.syncing \|\| exporting \|\| restoring/u
   );
   assert.match(dashboard, /syncNowButton\.disabled = state\.status\.syncing \|\| restoring/u);
   assert.match(dashboard, /if \(freshStatus\.syncing\)/u);

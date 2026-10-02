@@ -11,6 +11,9 @@ import {
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listWorlds"]>>[number]} WorldRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listEvents"]>>[number]} HistoryEvent */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
+/** @typedef {Awaited<ReturnType<DatabaseRepository["getBackupSnapshot"]>>} BackupSnapshot */
+/** @typedef {Awaited<ReturnType<DatabaseRepository["getThumbnail"]>>} NullableThumbnailRecord */
+/** @typedef {NonNullable<NullableThumbnailRecord>} ThumbnailRecord */
 
 export const BACKUP_FORMAT = "vrc_favworld_check-backup";
 export const BACKUP_VERSION = 2;
@@ -941,17 +944,17 @@ export function backupSummary(backup) {
 }
 
 /**
- * Export one profile as deterministic, human-readable JSON.
+ * Serialize an already-consistent repository snapshot. This is shared by the
+ * JSON exporter and the image archive exporter so both formats describe the
+ * exact same IndexedDB transaction.
  *
- * @param {DatabaseRepository} repository
- * @param {string} userId
+ * @param {BackupSnapshot} snapshot
  * @param {{ appVersion?: string, exportedAt?: string }} [options]
- * @returns {Promise<string>}
+ * @returns {string}
  */
-export async function createBackup(repository, userId, options = {}) {
-  const snapshot = await repository.getBackupSnapshot(userId);
+export function serializeBackupSnapshot(snapshot, options = {}) {
   if (snapshot.profile === null) {
-    throw new Error(`Profile not found: ${userId}`);
+    throw new Error("Profile not found in backup snapshot");
   }
 
   const candidate = {
@@ -973,19 +976,35 @@ export async function createBackup(repository, userId, options = {}) {
   return text;
 }
 
+/**
+ * Export one profile as deterministic, human-readable JSON.
+ *
+ * @param {DatabaseRepository} repository
+ * @param {string} userId
+ * @param {{ appVersion?: string, exportedAt?: string }} [options]
+ * @returns {Promise<string>}
+ */
+export async function createBackup(repository, userId, options = {}) {
+  const snapshot = await repository.getBackupSnapshot(userId);
+  if (snapshot.profile === null) {
+    throw new Error(`Profile not found: ${userId}`);
+  }
+  return serializeBackupSnapshot(snapshot, options);
+}
+
 export const exportProfileBackup = createBackup;
 
 /**
- * Validate and atomically restore one profile. Past, unclaimed events are
- * permanently claimed at restore time so importing never emits old notices.
+ * Restore a backup that has already passed the strict JSON validator. Optional
+ * thumbnail records are merged in the same IndexedDB transaction. Existing
+ * thumbnails not present in the archive remain untouched.
  *
  * @param {DatabaseRepository} repository
- * @param {unknown} input
- * @param {{ restoredAt?: string }} [options]
+ * @param {ValidatedBackup} backup
+ * @param {{ restoredAt?: string, thumbnails?: readonly ThumbnailRecord[] }} [options]
  * @returns {Promise<BackupSummary>}
  */
-export async function restoreBackup(repository, input, options = {}) {
-  const backup = validateBackup(input);
+export async function restoreValidatedBackup(repository, backup, options = {}) {
   const restoredAt = isoDate(options.restoredAt ?? new Date().toISOString(), "restoredAt");
   const events = backup.events.map((event) =>
     event.notificationEligible && event.notificationClaimedAt === null
@@ -1001,9 +1020,24 @@ export async function restoreBackup(repository, input, options = {}) {
     worlds: backup.worlds,
     favoriteGroups: backup.favoriteGroups,
     events,
-    preferences: backup.preferences
+    preferences: backup.preferences,
+    ...(options.thumbnails === undefined ? {} : { thumbnails: options.thumbnails })
   });
   return backupSummary(backup);
+}
+
+/**
+ * Validate and atomically restore one profile. Past, unclaimed events are
+ * permanently claimed at restore time so importing never emits old notices.
+ *
+ * @param {DatabaseRepository} repository
+ * @param {unknown} input
+ * @param {{ restoredAt?: string }} [options]
+ * @returns {Promise<BackupSummary>}
+ */
+export async function restoreBackup(repository, input, options = {}) {
+  const backup = validateBackup(input);
+  return restoreValidatedBackup(repository, backup, options);
 }
 
 export const importProfileBackup = restoreBackup;

@@ -190,9 +190,10 @@
               <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。サムネイル画像は現在のJSONには含まれません。</p>
               <div class="stacked-actions">
                 <button id="export-button" class="button button-secondary" type="button">バックアップを書き出す</button>
+                <button id="export-images-button" class="button button-secondary" type="button">画像も含めてバックアップ（ZIP）</button>
                 <label class="button button-ghost file-button">
                   バックアップを復元する
-                  <input id="import-input" type="file" accept="application/json,.json">
+                  <input id="import-input" type="file" accept="application/json,application/zip,.json,.zip">
                 </label>
               </div>
               <p id="backup-message" class="form-message" role="status"></p>

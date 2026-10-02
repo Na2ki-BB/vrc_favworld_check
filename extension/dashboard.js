@@ -1,6 +1,13 @@
 // @ts-check
 
 import { MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
+import {
+  MAX_IMAGE_BACKUP_BYTES,
+  createImageBackup,
+  hasZipSignature,
+  parseImageBackup,
+  restoreImageBackup
+} from "./lib/backup-archive.js";
 import { openDatabase } from "./lib/database.js";
 import { createFavoriteGroupOptions } from "./lib/favorite-groups.js";
 import {
@@ -86,6 +93,7 @@ const settingsStorageUsage = requiredElement("settings-storage-usage");
 const settingsLastBackup = requiredElement("settings-last-backup");
 const storageWarning = requiredElement("storage-warning");
 const exportButton = /** @type {HTMLButtonElement} */ (requiredElement("export-button"));
+const exportImagesButton = /** @type {HTMLButtonElement} */ (requiredElement("export-images-button"));
 const importInput = /** @type {HTMLInputElement} */ (requiredElement("import-input"));
 const backupMessage = requiredElement("backup-message");
 const purgeUninstallButton = /** @type {HTMLButtonElement} */ (requiredElement("purge-uninstall-button"));
@@ -104,6 +112,7 @@ let repository = null;
 let noticeAction = null;
 let visibleWorldCount = PAGE_SIZE;
 let visibleEventCount = PAGE_SIZE;
+let exporting = false;
 let restoring = false;
 let markingHistoryRead = false;
 let purging = false;
@@ -1017,8 +1026,9 @@ function renderSettings() {
     : `${warnings.join(" ")} 大切な記録をバックアップしてください。`;
 
   const hasProfile = state.profile !== null;
-  exportButton.disabled = !hasProfile || restoring || purging;
-  importInput.disabled = repository === null || state.status.syncing || restoring || purging;
+  exportButton.disabled = !hasProfile || exporting || restoring || purging;
+  exportImagesButton.disabled = !hasProfile || exporting || restoring || purging;
+  importInput.disabled = repository === null || state.status.syncing || exporting || restoring || purging;
   autoSyncToggle.disabled = restoring || purging;
   notificationToggle.disabled = restoring || purging;
   purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging;
@@ -1325,11 +1335,12 @@ autoSyncToggle.addEventListener("change", updateSettings);
 notificationToggle.addEventListener("change", updateSettings);
 
 exportButton.addEventListener("click", async () => {
-  if (state.profile === null) {
+  if (state.profile === null || exporting) {
     backupMessage.textContent = "先に一度、お気に入りを確認してください。";
     return;
   }
-  exportButton.disabled = true;
+  exporting = true;
+  renderSettings();
   backupMessage.textContent = "バックアップを準備しています…";
   /** @type {string | null} */
   let objectUrl = null;
@@ -1362,7 +1373,58 @@ exportButton.addEventListener("click", async () => {
     if (objectUrl !== null) {
       URL.revokeObjectURL(objectUrl);
     }
-    exportButton.disabled = state.profile === null || restoring;
+    exporting = false;
+    renderSettings();
+  }
+});
+
+/** @param {Blob} blob @param {string} filename */
+async function downloadBackupBlob(blob, filename) {
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.hidden = true;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+exportImagesButton.addEventListener("click", async () => {
+  if (state.profile === null || exporting) {
+    backupMessage.textContent = "先に一度、お気に入りを確認してください。";
+    return;
+  }
+  exporting = true;
+  renderSettings();
+  backupMessage.textContent = "記録と保存済み画像のバックアップを作成しています…";
+  let downloadStarted = false;
+  try {
+    const blob = await createImageBackup(requireRepository(), state.profile.userId, {
+      appVersion: chrome.runtime.getManifest().version
+    });
+    await downloadBackupBlob(
+      blob,
+      `vrc-favorite-worlds-with-images-${new Date().toISOString().slice(0, 10)}.zip`
+    );
+    downloadStarted = true;
+    const backedUpAt = Date.now();
+    await requireRepository().setSetting("lastBackupAt", backedUpAt);
+    state.settings.lastBackupAt = new Date(backedUpAt).toISOString();
+    backupMessage.textContent =
+      "記録と保存済み画像のバックアップを書き出しました。大切な場所へ保管してください。";
+  } catch {
+    backupMessage.textContent = downloadStarted
+      ? "ZIPの書き出しは開始しましたが、最終バックアップ日時を記録できませんでした。保存済みか確認してください。"
+      : "画像込みバックアップを作成できませんでした。サイズを確認し、少し時間を置いてもう一度お試しください。";
+  } finally {
+    exporting = false;
+    renderSettings();
   }
 });
 
@@ -1379,13 +1441,32 @@ importInput.addEventListener("change", async () => {
   backupMessage.textContent = "バックアップを確認しています…";
   let validationCompleted = false;
   let restoreCompleted = false;
+  /** @type {ReturnType<typeof parseBackup>} */
+  let validated;
+  /** @type {string | null} */
+  let jsonText = null;
+  /** @type {Uint8Array | null} */
+  let imageArchiveBytes = null;
+  let archiveThumbnailCount = 0;
   try {
+    const headerBytes = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    if (hasZipSignature(headerBytes)) {
+      if (file.size > MAX_IMAGE_BACKUP_BYTES) {
+        backupMessage.textContent = "画像込みバックアップが64MBを超えているため復元できません。";
+        return;
+      }
+      imageArchiveBytes = new Uint8Array(await file.arrayBuffer());
+      const parsedArchive = parseImageBackup(imageArchiveBytes);
+      validated = parsedArchive.backup;
+      archiveThumbnailCount = parsedArchive.thumbnails.length;
+    } else {
     if (file.size > MAX_BACKUP_BYTES) {
       backupMessage.textContent = "ファイルが25MBを超えているため復元できません。正しいバックアップを選んでください。";
       return;
     }
-    const text = await file.text();
-    const validated = parseBackup(text);
+    jsonText = await file.text();
+    validated = parseBackup(jsonText);
+    }
     validationCompleted = true;
     let statusResponse;
     try {
@@ -1417,6 +1498,9 @@ importInput.addEventListener("change", async () => {
       return;
     }
     const preview = backupSummary(validated);
+    if (archiveThumbnailCount > 0) {
+      backupMessage.textContent = `画像込みバックアップを確認しました（保存済み画像 ${archiveThumbnailCount.toLocaleString("ja-JP")}件）。`;
+    }
     const previewName = preview.displayName.replace(/\s+/gu, " ").slice(0, 80);
     const approved = globalThis.confirm(
       `${previewName}（${preview.userId}）の記録を復元します。\nワールド: ${preview.worldCount.toLocaleString("ja-JP")}件 / 履歴: ${preview.eventCount.toLocaleString("ja-JP")}件\n書き出し日時: ${formatDateTime(preview.exportedAt)}\n\n同じユーザーの現在の記録は、このバックアップの内容に置き換わります。続けますか？`
@@ -1425,7 +1509,9 @@ importInput.addEventListener("change", async () => {
       backupMessage.textContent = "復元を取り消しました。現在の記録は変更していません。";
       return;
     }
-    const restored = await restoreBackup(requireRepository(), text);
+    const restored = imageArchiveBytes === null
+      ? await restoreBackup(requireRepository(), jsonText)
+      : await restoreImageBackup(requireRepository(), imageArchiveBytes);
     restoreCompleted = true;
     /** @type {ReturnType<typeof classifySettingsUpdateResponse>} */
     let settingsOutcome = SETTINGS_UPDATE_OUTCOMES.unconfirmed;
@@ -1638,6 +1724,7 @@ try {
   connectionBadge.textContent = "記録を読み込めません";
   syncNowButton.disabled = true;
   exportButton.disabled = true;
+  exportImagesButton.disabled = true;
   importInput.disabled = true;
   purgeUninstallButton.disabled = true;
   showNotice(
