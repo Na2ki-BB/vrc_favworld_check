@@ -34,6 +34,7 @@ thumbnails/<world-id>.webp
 一般的なZIP展開は行わず、必要最小限のstored ZIPだけを専用parserで読む。
 
 - 上限: archive全体64MiB、JSON 25MiB、画像index 5MiB、画像1件48KiB、画像最大10,000件
+- 画像件数上限は、現在のワールド記録に対応して実際にZIPへ入る画像だけへ適用する。IndexedDB cursorは孤立画像のBlobを配列へ保持せず、対象画像を上限+1件まで集めた時点で停止する
 - UTF-8の通常ファイルだけを許可
 - 圧縮、暗号化、data descriptor、extra field、comment、multi-disk、Zip64を拒否
 - 絶対パス、ドライブ名、`..`、`.`、空要素、backslash、未知entry、重複entryを拒否

@@ -357,15 +357,29 @@ test("image export skips retained orphan thumbnails without deleting them", asyn
   });
   const generation = await seed(source, USER_A, "Alice", [
     world(USER_A, WORLD_A, "Kept"),
-    world(USER_A, WORLD_B, "Removed by JSON")
+    world(USER_A, WORLD_B, "Removed by JSON"),
+    world(USER_A, WORLD_C, "Also removed by JSON")
   ]);
   await source.putThumbnail(thumbnail(USER_A, WORLD_A), generation, USER_A);
   await source.putThumbnail(thumbnail(USER_A, WORLD_B), generation, USER_A);
+  await source.putThumbnail(thumbnail(USER_A, WORLD_C), generation, USER_A);
+  const boundedBeforeRestore = await source.getBackupSnapshot(USER_A, {
+    includeThumbnails: true,
+    thumbnailLimit: 1
+  });
+  assert.equal(boundedBeforeRestore.thumbnails?.length, 2);
 
   await seed(replacement, USER_A, "Alice", [world(USER_A, WORLD_A, "Kept")]);
   const json = await createBackup(replacement, USER_A, { appVersion: "0.1.10", exportedAt: AT_2 });
   await restoreBackup(source, json, { restoredAt: RESTORED_AT });
   assert.ok(await source.getThumbnail(USER_A, WORLD_B));
+  assert.ok(await source.getThumbnail(USER_A, WORLD_C));
+
+  const boundedAfterRestore = await source.getBackupSnapshot(USER_A, {
+    includeThumbnails: true,
+    thumbnailLimit: 1
+  });
+  assert.equal(boundedAfterRestore.thumbnails?.length, 1);
 
   const archive = await blobBytes(await createImageBackup(source, USER_A, {
     appVersion: "0.1.10",
@@ -374,6 +388,7 @@ test("image export skips retained orphan thumbnails without deleting them", asyn
   assert.equal(imageBackupSummary(archive).thumbnailCount, 1);
   assert.equal(parseImageBackup(archive).thumbnails[0]?.worldId, WORLD_A);
   assert.ok(await source.getThumbnail(USER_A, WORLD_B));
+  assert.ok(await source.getThumbnail(USER_A, WORLD_C));
 });
 
 test("image backup rejects unsafe paths, compression, oversized declarations, corruption, and undeclared images", async (context) => {

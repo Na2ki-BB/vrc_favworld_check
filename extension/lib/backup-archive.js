@@ -465,7 +465,10 @@ function requireThumbnailBytes(thumbnail, bytes) {
  * @returns {Promise<Blob>}
  */
 export async function createImageBackup(repository, userId, options = {}) {
-  const snapshot = await repository.getBackupSnapshot(userId, { includeThumbnails: true });
+  const snapshot = await repository.getBackupSnapshot(userId, {
+    includeThumbnails: true,
+    thumbnailLimit: MAX_IMAGE_BACKUP_THUMBNAILS
+  });
   if (snapshot.profile === null) throw new Error(`Profile not found: ${userId}`);
   const thumbnails = snapshot.thumbnails ?? [];
   if (thumbnails.length > MAX_IMAGE_BACKUP_THUMBNAILS) invalid("too many thumbnails");

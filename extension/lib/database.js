@@ -799,6 +799,73 @@ async function getAllValues(index, query) {
 }
 
 /**
+ * Queue the thumbnail cursor only after the earlier world request succeeds in
+ * the same readonly transaction. Orphan Blob records are visited one at a
+ * time but never retained. Matching records stop at maximum + 1 so callers can
+ * distinguish an exact limit from overflow without loading an unbounded set.
+ *
+ * @param {IDBIndex} thumbnailIndex
+ * @param {string} userId
+ * @param {IDBRequest<unknown[]>} worldRequest
+ * @param {number} maximum
+ * @returns {Promise<unknown[]>}
+ */
+function getBackupThumbnailValues(thumbnailIndex, userId, worldRequest, maximum) {
+  return new Promise((resolve, reject) => {
+    worldRequest.addEventListener("error", () => {
+      reject(worldRequest.error ?? new Error("IndexedDB world request failed"));
+    }, { once: true });
+    worldRequest.addEventListener("success", () => {
+      const worldIds = new Set();
+      for (const value of worldRequest.result) {
+        if (
+          typeof value === "object"
+          && value !== null
+          && "worldId" in value
+          && typeof value.worldId === "string"
+        ) {
+          worldIds.add(value.worldId);
+        }
+      }
+      /** @type {unknown[]} */
+      const records = [];
+      let request;
+      try {
+        request = thumbnailIndex.openCursor(userId);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      request.addEventListener("error", () => {
+        reject(request.error ?? new Error("IndexedDB backup thumbnail cursor failed"));
+      }, { once: true });
+      request.addEventListener("success", () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve(records);
+          return;
+        }
+        const value = cursor.value;
+        if (
+          typeof value === "object"
+          && value !== null
+          && "worldId" in value
+          && typeof value.worldId === "string"
+          && worldIds.has(value.worldId)
+        ) {
+          records.push(value);
+          if (records.length > maximum) {
+            resolve(records);
+            return;
+          }
+        }
+        cursor.continue();
+      });
+    }, { once: true });
+  });
+}
+
+/**
  * Delete every object selected by an index. Cursor deletion keeps the operation
  * inside the caller's transaction.
  *
@@ -1159,13 +1226,22 @@ export class DatabaseRepository {
   /**
    * Read every exported field in one transaction. Generation and operational
    * settings are intentionally absent from the returned backup snapshot.
+   * Optional thumbnails are restricted to this snapshot's worlds and retained
+   * only through the caller's limit plus one overflow sentinel.
    *
    * @param {string} userId
-   * @param {{ includeThumbnails?: boolean }} [options]
+   * @param {{ includeThumbnails?: boolean, thumbnailLimit?: number }} [options]
    * @returns {Promise<BackupSnapshot>}
    */
   async getBackupSnapshot(userId, options = {}) {
     const includeThumbnails = options.includeThumbnails === true;
+    const thumbnailLimit = options.thumbnailLimit ?? Number.MAX_SAFE_INTEGER;
+    if (
+      includeThumbnails
+      && (!Number.isSafeInteger(thumbnailLimit) || thumbnailLimit < 0)
+    ) {
+      throw new RangeError("Backup thumbnail limit must be a non-negative safe integer");
+    }
     const transaction = this.#requireDatabase().transaction(
       [
         STORES.profiles,
@@ -1176,6 +1252,9 @@ export class DatabaseRepository {
         ...(includeThumbnails ? [STORES.thumbnails] : [])
       ],
       "readonly"
+    );
+    const worldRequest = /** @type {IDBRequest<unknown[]>} */ (
+      transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser).getAll(userId)
     );
     const [
       profileValue,
@@ -1190,10 +1269,7 @@ export class DatabaseRepository {
         transaction,
         Promise.all([
           getValue(transaction.objectStore(STORES.profiles), userId),
-          getAllValues(
-            transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
-            userId
-          ),
+          requestResult(worldRequest),
           getAllValues(
             transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
             userId
@@ -1205,9 +1281,11 @@ export class DatabaseRepository {
           getValue(transaction.objectStore(STORES.settings), "autoSyncEnabled"),
           getValue(transaction.objectStore(STORES.settings), "notificationsEnabled"),
           includeThumbnails
-            ? getAllValues(
+            ? getBackupThumbnailValues(
                 transaction.objectStore(STORES.thumbnails).index(INDEXES.thumbnailsByUser),
-                userId
+                userId,
+                worldRequest,
+                thumbnailLimit
               )
             : Promise.resolve([])
         ])
