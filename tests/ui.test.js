@@ -274,6 +274,8 @@ test("service-worker status is normalized without reflecting unknown values", ()
     worldCount: 42,
     eventCount: 0,
     pendingProbeCount: 3,
+    generation: 0, presentationGeneration: 0, hiddenCount: 0,
+    unreadSummary: {exact: true, uncertain: false, count: 2},
     unreadCount: 2,
     attentionWorldCount: 4,
     missingCount: 2,
@@ -682,11 +684,11 @@ test("dashboard prioritizes confirmed attention and puts secondary controls behi
   assert.match(css, /select\s*\{\s*color-scheme:\s*light;/u);
   assert.match(
     css,
-    /select option\s*\{[^}]*color:\s*#15142a;[^}]*background-color:\s*#fff;/iu
+    /select option\s*\{[^}]*color:\s*#252923;[^}]*background-color:\s*#fff;/iu
   );
   assert.match(
     css,
-    /\.select-field select\s*\{[^}]*color:\s*#15142a;[^}]*background:\s*#fff;/iu
+    /\.select-field select\s*\{[^}]*color:\s*#252923;[^}]*background:\s*#fff;/iu
   );
   assert.ok(html.indexOf('id="primary-focus"') < html.indexOf('id="world-list"'));
   assert.ok(popupHtml.indexOf('id="attention-card"') < popupHtml.indexOf('class="status-card"'));
@@ -786,7 +788,7 @@ test("thumbnail loading distinguishes missing, read errors, image errors and sta
     "repository", "state", "thumbnailRenderGeneration", "requireRepository", "worldList",
     "HTMLElement", "showThumbnailMessage", "renderWorlds", "syncNowButton", "URL",
     "activeThumbnailObjectUrls", "document",
-    `${functionSource}; return hydrateWorldThumbnails;`
+    `const pageClosed = false; ${functionSource}; return hydrateWorldThumbnails;`
   )(
     repository, profileState, 1, () => repository, { querySelectorAll: () => [container] },
     Element, /** @param {[Element, string, string?, (() => void)?]} args */ (...args) => messages.push(args), () => {}, { click() {} },
@@ -831,6 +833,8 @@ test("dashboard defaults to attention while preserving explicit all and history 
   }
   applyRoute("#all");
   assert.equal(worldFilter.value, "all");
+  applyRoute("#hidden");
+  assert.equal(worldFilter.value, "hidden");
   applyRoute("#attention");
   assert.equal(worldFilter.value, "attention");
   applyRoute("#attention-events");
@@ -872,7 +876,7 @@ test("dashboard progress polling stays local, does not overlap and discards obso
   const notice = { textContent: "", hidden: true };
   const createPoller = new Function(
     "state", "thumbnailCaptureNotice", "sendMessage", "normalizeStatusResponse", "isRecord", "presentThumbnailProgress", "hydrateWorldThumbnails", "readThumbnailCount",
-    `let pageClosed = false, restoring = false, purging = false, progressPolling = false, progressEpoch = 0;
+    `let recordMutationInFlight = false, pageClosed = false, restoring = false, purging = false, progressPolling = false, progressEpoch = 0;
      let repository = {}, thumbnailRenderGeneration = 1;
      const document = {hidden: false}, worldList = { querySelectorAll: () => [] }, settingsThumbnailCount = {};
      const refreshObservedStatus = async () => false, renderConnection = () => {}, renderPrimaryFocus = () => {};
@@ -936,9 +940,7 @@ test("thumbnail count failure leaves main history load usable and count unknown"
   const events = [{ worldId: WORLD_A, kind: "name_changed" }];
   const database = {
     ...failedRepository,
-    listWorlds: async () => worlds,
-    listEvents: async () => events,
-    listFavoriteGroups: async () => [],
+    getDisplaySnapshot: async () => ({profile: {userId: "user-a", lastSuccessfulSyncAt: null}, worlds, events, favoriteGroups: [], worldDispositions: [], generation: 0, presentationGeneration: 0, unreadSummary: {exact: true, uncertain: false, count: 0}}),
     getSetting: async () => null
   };
   let rendered = 0;
@@ -954,6 +956,7 @@ test("thumbnail count failure leaves main history load usable and count unknown"
     const readStorageEstimate = async () => ({usage: 0, quota: 0});
     const dateSetting = () => null;
     const summarizeHistory = () => ({attention: 0, missing: 0, unavailable: 0});
+    const closeRecordDialogs = () => {}, invalidateRecordDialog = () => {}, hiddenWorldIds = () => new Set();
     ${source.slice(start, end)}
     return loadData;
   `)(state, database, normalizeStatusResponse, readThumbnailCount, () => { rendered += 1; }, () => { warned = state.thumbnailCount === null; });
@@ -1079,7 +1082,7 @@ test("dashboard navigation supports native links and Back/Forward without fake t
   assert.match(source, /window.addEventListener\("hashchange", navigateFromHash\)/u);
   assert.match(source, /aria-current/u);
   assert.doesNotMatch(source, /role", "tablist"|role", "tab"/u);
-  assert.match(source, /if \(state.status.syncing \|\| purging \|\| manualSyncInFlight\) return/u);
+  assert.match(source, /if \(state.status.syncing \|\| purging \|\| manualSyncInFlight \|\| recordMutationInFlight\) return/u);
 });
 
 
@@ -1100,9 +1103,9 @@ test("dashboard text and button palette stays above WCAG AA contrast", async () 
     return (components[0] ?? 0) * 0.2126 + (components[1] ?? 0) * 0.7152 + (components[2] ?? 0) * 0.0722;
   };
   for (const [foreground, background] of [
-    ["#10252a", "#8ae9dc"], ["#f6f6fb", "#344157"], ["#b5bfd0", "#1d2635"],
-    ["#b5bfd0", "#131925"], ["#ffdacb", "#53372f"], ["#ffe2a8", "#493d25"],
-    ["#e0e7f1", "#1d2635"], ["#ffe0d9", "#582e32"], ["#c4cede", "#344157"]
+    ["#FFFFFF", "#356447"], ["#252923", "#E7EEE7"], ["#5C635A", "#FFFFFF"],
+    ["#5C635A", "#F7F6F2"], ["#8B3028", "#F8ECE9"], ["#725321", "#FAF0D9"],
+    ["#252923", "#FFFFFF"], ["#5C635A", "#E9EAE4"]
   ]) {
     assert.ok(foreground && background);
     assert.ok(css.includes(foreground) && css.includes(background), "tested colors must exist in the stylesheet");
@@ -1126,7 +1129,7 @@ test("popup exposes only the needed daily actions without hiding failures or set
   const render = new Function(
     "status", "presentStatus", "presentWorldOverview", "formatDateTime", "attentionCard", "attentionTitle", "attentionDetail", "dashboardButton",
     "statusCard", "statusDot", "statusTitle", "statusDetail", "lastSync", "syncButton", "loginButton", "syncInFlight",
-    `let lastKnownSyncing = false; ${source.slice(start, end)}; return lastKnownSyncing;`
+    `let lastKnownSyncing = false; const requiredElement = () => ({}), UNREAD_UNCERTAIN_DETAIL = "unknown"; ${source.slice(start, end)}; return lastKnownSyncing;`
   );
   /** @param {Record<string, unknown>} status @param {boolean} [inFlight] */
   const receive = (status, inFlight = false) => render(normalizeStatusResponse(status), presentStatus, presentWorldOverview, formatDateTime,
@@ -1167,8 +1170,8 @@ test("popup keeps image progress available behind a native disclosure and matche
   const css = await readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8");
   assert.match(html, /<details class="record-status">[\s\S]*id="thumbnail-progress"/u);
   assert.match(html, /id="login-button"[^>]*hidden/u);
-  assert.match(css, /\.button-primary\s*\{[^}]*color: #10252a;[^}]*background: #8ae9dc;/u);
-  assert.match(css, /\.button-secondary\s*\{[^}]*color: #f6f6fb;[^}]*background: #344157;/u);
+  assert.match(css, /\.button-primary\s*\{[^}]*color: #FFFFFF;[^}]*background: #356447;/u);
+  assert.match(css, /\.button-secondary\s*\{[^}]*color: #252923;[^}]*background: #E7EEE7;/u);
   assert.match(css, /summary:focus-visible/u);
   assert.doesNotMatch(css, /min-height: 560px|animation: pulse/u);
 });
@@ -1189,6 +1192,7 @@ test("dashboard observes external sync completion without restarting sync or res
   let incoming = state.status;
   const refresh = new Function("state", "loadData", "renderConnection", "showNotice", `
     const pageClosed = false, restoring = false, purging = false;
+    const closeRecordDialogs = () => {}, invalidateRecordDialog = () => {};
     const renderPrimaryFocus = renderConnection, renderSummary = renderConnection, renderSettings = renderConnection;
     ${source.slice(start, end)}
     return refreshObservedStatus;
@@ -1210,9 +1214,12 @@ test("dashboard observes external sync completion without restarting sync or res
   assert.deepEqual(loads, [[null, true]], "new saved results retain the current pagination and filters");
   assert.equal(await refresh(incoming), false);
   assert.equal(loads.length, 1, "an unchanged successful observation does not reload cards");
+  incoming = {...incoming, generation: 2, presentationGeneration: 3};
+  assert.equal(await refresh(incoming), true, "record writes reload without any change to last sync time");
+  assert.equal(loads.length, 2);
   incoming = {...incoming, activeProfileId: "usr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"};
   assert.equal(await refresh(incoming), true);
-  assert.equal(loads.length, 2);
+  assert.equal(loads.length, 3);
   incoming = {...incoming, lastSuccessfulSyncAt: "2026-01-03T00:00:00Z"};
   rejectLoad = true;
   assert.equal(await refresh(incoming), true);
@@ -1233,7 +1240,8 @@ test("native dashboard routes handle hash changes, repeated same-link clicks and
   const end = source.indexOf("worldSearch.addEventListener", start);
   const create = new Function(`
     const VALID_TABS = new Set(["worlds", "events", "settings"]), PAGE_SIZE = 200;
-    let visibleWorldCount = 0, worldRenders = 0, historyReads = 0;
+    let visibleWorldCount = 0, worldRenders = 0, historyReads = 0, navigationEpoch = 0, recordInteractionEpoch = 0;
+    const closeRecordDialogs = () => {}, recordActionMessage = {};
     const focus = [], handlers = new Map();
     class HTMLAnchorElement {
       constructor(tab, href) { this.dataset = {tab}; this.attrs = new Map([["href", href]]); this.handlers = new Map(); this.classList = {toggle() {}}; }
@@ -1247,7 +1255,7 @@ test("native dashboard routes handle hash changes, repeated same-link clicks and
     const requiredElement = id => panels[id];
     const worldFilter = {value: ""}, eventFilter = {value: ""}, worldSearch = {value: ""}, groupFilter = {value: ""};
     const window = {location: {hash: "#all"}, addEventListener(type, action) {handlers.set(type, action);}};
-    const document = {querySelectorAll() {return tabButtons;}};
+    const document = {querySelectorAll() {return tabButtons;}, addEventListener() {}};
     const renderWorlds = () => {worldRenders += 1;}, renderEvents = () => {};
     let finishRead;
     const markHistoryAsRead = () => {historyReads += 1; return new Promise(resolve => {finishRead = resolve;});};
@@ -1290,7 +1298,7 @@ test("dashboard manual command stays busy through lagging status and clears only
   const start = source.indexOf("async function performSync()");
   const end = source.indexOf("\nsyncNowButton.addEventListener", start);
   const create = new Function("normalizeCommandResponse", "commandErrorMessage", `
-    let manualSyncInFlight = false, restoring = false, purging = false, commands = 0;
+    let recordMutationInFlight = false, manualSyncInFlight = false, restoring = false, purging = false, commands = 0;
     let finish, working = false, notice = "";
     const state = {status: {syncing: false}}, syncNowButton = {};
     const renderConnection = () => {working = state.status.syncing || manualSyncInFlight;};
@@ -1335,9 +1343,13 @@ test("dashboard publishes only one current snapshot after delayed reads and main
     const profiles = ["a", "b"].map(userId => ({userId, lastSuccessfulSyncAt: times[userId], firstSeenAt: times[userId]}));
     const database = {
       async listProfiles() {if (activeId === "a" && phase === "profile") await pause(); return profiles;},
-      async listWorlds(id) {if (id === "a" && phase === "worlds") await pause(); return Array.from({length: id === "a" ? 1 : 2}, (_, i) => ({userId: id, worldId: id + i}));},
-      async listEvents(id) {return [{userId: id, worldId: id + "0"}];},
-      async listFavoriteGroups(id) {return [{userId: id}];},
+      async getDisplaySnapshot(id) {
+        if (id === "a" && phase === "worlds") await pause();
+        return {profile: profiles.find(profile => profile.userId === id),
+          worlds: Array.from({length: id === "a" ? 1 : 2}, (_, i) => ({userId: id, worldId: id + i})),
+          events: [{userId: id, worldId: id + "0"}], favoriteGroups: [{userId: id}], worldDispositions: [],
+          generation: 1, presentationGeneration: 1, unreadSummary: {exact: true, uncertain: false, count: 0}};
+      },
       async listThumbnailMetadata(id) {return [{userId: id}];},
       async getSetting(key) {
         const id = activeId;
@@ -1358,6 +1370,7 @@ test("dashboard publishes only one current snapshot after delayed reads and main
     const readStorageEstimate = async () => ({usage: 10, quota: 100});
     const dateSetting = value => value;
     const summarizeHistory = worlds => ({attention: worlds.length, missing: worlds.length, unavailable: 0});
+    const closeRecordDialogs = () => {}, invalidateRecordDialog = () => {}, hiddenWorldIds = () => new Set();
     const state = {profile: null, worlds: [], events: [], favoriteGroups: [], thumbnailCount: 0, status: normalizeStatusResponse({}), statusAvailable: true, settings: {}, storageEstimate: {quota: 100}};
     const renders = [], purgeMessage = {}, PAGE_SIZE = 200;
     const renderAll = () => renders.push({profile: state.profile?.userId, worlds: state.worlds.map(world => world.userId)});
@@ -1418,4 +1431,358 @@ test("dashboard publishes only one current snapshot after delayed reads and main
   assert.equal(await obsoleteRead, false, "a rejected old read must not turn a newer successful view into an error");
   assert.equal(obsolete.state.profile.userId, "b");
   assert.equal(obsolete.state.statusAvailable, true);
+});
+
+test("hidden records are excluded from all ordinary filters but retain name, author, old-name and list search", () => {
+  const visible = world({worldId: WORLD_A, membershipState: "not_in_favorites"});
+  const hidden = world({worldId: WORLD_B, currentName: "非表示の庭", authorName: "特別な作者", favoriteTags: ["worlds1"], availabilityState: "unavailable"});
+  const dispositions = [{worldId: WORLD_B, state: /** @type {const} */ ("hidden")}];
+  const events = [historyEvent({eventId: "hidden-old", worldId: WORLD_B, kind: "name_changed", before: "古い庭", after: "非表示の庭"})];
+  for (const filter of /** @type {const} */ (["all", "attention", "unavailable", "favorite", "pending", "missing"])) {
+    assert.ok(filterWorlds([visible, hidden], events, "", filter, null, [], dispositions).every((record) => record.worldId !== WORLD_B), filter);
+  }
+  for (const query of ["非表示の庭", "特別な作者", "古い庭", WORLD_B, "大切な場所"]) {
+    assert.deepEqual(filterWorlds([visible, hidden], events, query, "hidden", "worlds1", [favoriteGroup()], dispositions), [hidden]);
+  }
+  assert.deepEqual(summarizeHistory([visible, hidden], events, dispositions), {attention: 1, total: 2, missing: 1, unavailable: 0, renamed: 1});
+  assert.deepEqual(filterWorlds([visible, hidden], events, "", "hidden", "worlds2", [], dispositions), []);
+});
+
+test("unread summary is authoritative and uncertain legacy totals never become an exact number", () => {
+  const exact = normalizeStatusResponse({unreadCount: 99, unreadSummary: {exact: true, uncertain: false, count: 3}, generation: 8, presentationGeneration: 5, hiddenCount: 2});
+  assert.equal(exact.unreadCount, 3);
+  assert.equal(exact.generation, 8);
+  assert.equal(exact.presentationGeneration, 5);
+  assert.equal(exact.hiddenCount, 2);
+  for (const summary of [{exact: false, uncertain: true, count: null}, {exact: true, uncertain: false, count: -1}, {count: 123}, null]) {
+    const status = normalizeStatusResponse({unreadCount: 99, unreadSummary: summary});
+    assert.deepEqual(status.unreadSummary, {exact: false, uncertain: true, count: null});
+    assert.equal(status.unreadCount, 0);
+  }
+  const hiddenOnly = normalizeStatusResponse({activeProfileId: USER_ID, worldCount: 2, hiddenCount: 2});
+  assert.match(presentWorldOverview(hiddenOnly).detail, /非表示の記録が2件あります/u);
+  assert.doesNotMatch(presentWorldOverview(hiddenOnly).title, /最初|記録なし/u);
+});
+
+/** @param {string} source @param {string} declaration */
+function dashboardFunction(source, declaration) {
+  const start = source.indexOf(declaration);
+  assert.ok(start >= 0, declaration);
+  return source.slice(start, source.indexOf("\n}\n", start) + 2);
+}
+
+async function createRecordActionHarness() {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const extract = /** @param {string} declaration */ (declaration) => dashboardFunction(source, declaration);
+  return new Function("worldMatchesFilter", `
+    let recordMutationInFlight = false, restoring = false, purging = false, pageClosed = false;
+    let recordInteractionEpoch = 0, navigationEpoch = 0, progressEpoch = 0, thumbnailRenderGeneration = 0, recordDialogEpoch = 0, recordDialogAction = null, recordDialogImageUrl = null;
+    const calls = [], focus = [], revoked = [], recordActionMessage = {textContent: ""};
+    const element = () => ({textContent: "", disabled: false, children: [],
+      append(...children) {this.children.push(...children);}, replaceChildren(...children) {this.children = children;},
+      querySelector() {return null;}, setAttribute() {}, removeAttribute() {}, isConnected: true, focus() {focus.push("trigger");}});
+    const recordDialogs = ["hide", "purge"].map(name => ({name,
+      dialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}},
+      target: element(), description: element(), feedback: element(), submit: element(),
+      cancel: {...element(), focus() {focus.push(name + "-cancel");}}
+    }));
+    const state = {profile: {userId: "user-a"}, status: {generation: 2, presentationGeneration: 3, syncing: false}};
+    const stored = {profile: {userId: "user-a", displayName: "テスト利用者"},
+      worlds: [{worldId: "world-a", currentName: "テストの庭", revision: 4, membershipState: "not_in_favorites", availabilityState: "unavailable"}],
+      events: [{worldId: "world-a"}], worldDispositions: [], generation: 2, presentationGeneration: 3};
+    let activeProfile = "user-a", readError = false, imageError = false, refreshError = false, reads = 0, pendingRead = null;
+    let response = {ok: true, recordSaved: true, thumbnailScheduleWarning: null}, deferred = null, pendingRefresh = null;
+    const database = {async getDisplaySnapshot() {reads += 1; if (pendingRead) await new Promise(resolve => {pendingRead.resolve = resolve;}); if (readError) throw Error("read"); return stored;},
+      async getSetting() {return activeProfile;}, async getThumbnails() {if (imageError) throw Error("image"); return [{blob: "fixture"}];}};
+    let repository = database;
+    const requireRepository = () => repository;
+    const isRecord = value => typeof value === "object" && value !== null;
+    const textElement = (tagName, className, text) => ({tagName, className, textContent: text});
+    const document = {handlers: new Map(), createElement() {return {addEventListener() {}, replaceWith() {}};},
+      addEventListener(type, run) {this.handlers.set(type, run);}};
+    const control = () => ({value: "", handlers: new Map(), addEventListener(type, run) {this.handlers.set(type, run);}});
+    const worldSearch = control(), worldFilter = control(), groupFilter = control(), eventFilter = control();
+    let visibleWorldCount = 200, visibleEventCount = 200;
+    const PAGE_SIZE = 200, renderWorlds = () => {}, renderEvents = () => {};
+    ${source.slice(source.indexOf("function observeRecordInteraction("), source.indexOf("async function openVrchat("))}
+    const URL = {createObjectURL() {return "blob:synthetic";}, revokeObjectURL(url) {revoked.push(url);}};
+    const worldList = {querySelectorAll: () => []};
+    const renderConnection = () => {}, renderSettings = () => {};
+    const restoreWorldFocus = () => {focus.push("neighbor");};
+    const loadData = async () => {if (pendingRefresh) await new Promise(resolve => {pendingRefresh.resolve = resolve; pendingRefresh.started();}); if (refreshError) throw Error("refresh"); return true;};
+    const sendMessage = async message => {calls.push(message); if (deferred) return await new Promise(resolve => {deferred.resolve = resolve;}); if (response === "throw") throw Error("lost response"); return response;};
+    ${extract("function closeRecordDialogs(")}
+    ${extract("function invalidateRecordDialog(")}
+    ${extract("async function openRecordDialog(")}
+    ${extract("function recordErrorMessage(")}
+    ${extract("async function performRecordAction(")}
+    const action = type => ({type, userId: "user-a", worldId: "world-a", expectedGeneration: 2, expectedPresentationGeneration: 3, expectedRevision: 4, trigger: element(), position: 0, navigation: 0});
+    return {state, stored, calls, focus, revoked, dialogs: recordDialogs, message: recordActionMessage,
+      action, open: openRecordDialog, run: performRecordAction, close: closeRecordDialogs, invalidate: invalidateRecordDialog,
+      reads: () => reads,
+      focusNewControl() {document.handlers.get("focusin")();},
+      editSearch(value) {worldSearch.value = value; worldSearch.handlers.get("input")();},
+      changeFilter(value) {worldFilter.value = value; worldFilter.handlers.get("change")();},
+      changeGroup(value) {groupFilter.value = value; groupFilter.handlers.get("change")();},
+      view: () => ({search: worldSearch.value, filter: worldFilter.value, group: groupFilter.value}),
+      delayRefresh() {pendingRefresh = {}; pendingRefresh.ready = new Promise(resolve => {pendingRefresh.started = resolve;});},
+      whenRefreshing() {return pendingRefresh.ready;}, finishRefresh() {pendingRefresh.resolve(); pendingRefresh = null;},
+      delayRead() {pendingRead = {};}, releaseRead() {pendingRead.resolve(); pendingRead = null;}, newLoad() {progressEpoch += 1;}, newRender() {thumbnailRenderGeneration += 1;},
+      response(value) {response = value;}, delay() {deferred = {};}, finish(value) {deferred.resolve(value);},
+      failRead() {readError = true;}, failImage() {imageError = true;}, failRefresh() {refreshError = true;},
+      changeAccount() {activeProfile = "user-b"; state.profile.userId = "user-b"; closeRecordDialogs(false);},
+      setActiveAccount(value) {activeProfile = value;}, navigate() {navigationEpoch += 1; closeRecordDialogs(false);},
+      closePage() {pageClosed = true; closeRecordDialogs(false);}, replaceRepository() {repository = {...database};}};
+  `)(worldMatchesFilter);
+}
+
+test("record dialogs show exact target and safety copy, default to cancel and revoke preview on cancel", async () => {
+  const ui = await createRecordActionHarness();
+  await ui.open(ui.action("HIDE_WORLD"));
+  assert.equal(ui.dialogs[0].dialog.open, true);
+  assert.deepEqual(ui.focus, ["hide-cancel"]);
+  assert.match(ui.dialogs[0].description.textContent, /名前・画像・変更履歴は残り/u);
+  assert.match(ui.dialogs[0].description.textContent, /同期と通知は続きます。VRChatのお気に入りは変更しません/u);
+  assert.match(JSON.stringify(ui.dialogs[0].target.children), /テスト利用者|world-a|変更履歴: 1件/u);
+  ui.close();
+  assert.equal(ui.calls.length, 0, "cancel never sends a write");
+  assert.equal(ui.dialogs[0].dialog.open, false);
+  assert.deepEqual(ui.revoked, ["blob:synthetic"]);
+  assert.equal(ui.focus.at(-1), "trigger");
+  ui.stored.worldDispositions = [{worldId: "world-a", state: "hidden"}];
+  ui.stored.worlds[0].membershipState = "favorited";
+  ui.stored.worlds[0].availabilityState = "accessible";
+  await ui.open(ui.action("PURGE_HIDDEN_WORLD"));
+  assert.equal(ui.dialogs[1].dialog.open, true);
+  assert.match(ui.dialogs[1].description.textContent, /この操作は取り消せません/u);
+  assert.match(ui.dialogs[1].description.textContent, /削除した画像はJSONから戻せません/u);
+  assert.match(ui.dialogs[1].description.textContent, /World IDだけを残します/u);
+  assert.match(ui.dialogs[1].description.textContent, /現在は利用可能なため/u);
+  assert.equal(ui.focus.at(-1), "purge-cancel");
+  ui.invalidate();
+  assert.equal(ui.dialogs[1].submit.disabled, true);
+  assert.match(ui.dialogs[1].feedback.textContent, /もう一度確認/u);
+  ui.close();
+  assert.equal(ui.focus.at(-1), "trigger", "stale dialog retains a safe cancel focus target");
+});
+
+test("confirmation reads fail closed for missing images, stale revisions and accounts", async () => {
+  for (const failure of ["failRead", "failImage"]) {
+    const ui = await createRecordActionHarness();
+    ui[failure]();
+    await ui.open(ui.action("HIDE_WORLD"));
+    assert.equal(ui.dialogs.some((/** @type {{dialog: {open: boolean}}} */ controls) => controls.dialog.open), false);
+    assert.match(ui.message.textContent, /削除は開始していません/u);
+    assert.equal(ui.calls.length, 0);
+  }
+  for (const change of ["revision", "generation", "presentation", "account", "eligible"]) {
+    const ui = await createRecordActionHarness();
+    if (change === "revision") ui.stored.worlds[0].revision += 1;
+    if (change === "generation") ui.stored.generation += 1;
+    if (change === "presentation") ui.stored.presentationGeneration += 1;
+    if (change === "account") ui.setActiveAccount("user-b");
+    if (change === "eligible") {ui.stored.worlds[0].membershipState = "favorited"; ui.stored.worlds[0].availabilityState = "accessible";}
+    await ui.open(ui.action("HIDE_WORLD"));
+    assert.equal(ui.dialogs[0].dialog.open, false, change);
+    assert.equal(ui.calls.length, 0, change);
+    assert.match(ui.message.textContent, /記録が更新されました/u);
+  }
+});
+
+test("record commands fix expected identities, block double clicks and reconcile lost responses without retry", async () => {
+  const ui = await createRecordActionHarness();
+  ui.delay();
+  const action = ui.action("RESTORE_HIDDEN_WORLD");
+  const first = ui.run(action);
+  await ui.run(action);
+  assert.equal(ui.calls.length, 1);
+  assert.deepEqual(ui.calls[0], {type: "RESTORE_HIDDEN_WORLD", userId: "user-a", worldId: "world-a", expectedGeneration: 2, expectedPresentationGeneration: 3, expectedRevision: 4});
+  ui.finish({ok: true, recordSaved: true, thumbnailScheduleWarning: null});
+  await first;
+  assert.equal(ui.message.textContent, "一覧に戻しました");
+  assert.equal(ui.focus.at(-1), "neighbor");
+  for (const type of ["HIDE_WORLD", "RESTORE_HIDDEN_WORLD", "PURGE_HIDDEN_WORLD"]) {
+    const lost = await createRecordActionHarness();
+    lost.response("throw");
+    if (type === "HIDE_WORLD") lost.stored.worldDispositions = [{worldId: "world-a", state: "hidden"}];
+    if (type === "PURGE_HIDDEN_WORLD") {lost.stored.worlds = []; lost.stored.worldDispositions = [{worldId: "world-a", state: "purged"}];}
+    await lost.run(lost.action(type));
+    assert.equal(lost.calls.length, 1, type);
+    assert.equal(lost.reads(), 1, `${type}: durable state is re-read exactly once, no retry`);
+    assert.match(lost.message.textContent, /非表示にしました|一覧に戻しました|完全に削除しました/u);
+  }
+  const uncertain = await createRecordActionHarness();
+  uncertain.response({ok: true});
+  await uncertain.run(uncertain.action("PURGE_HIDDEN_WORLD"));
+  assert.match(uncertain.message.textContent, /操作結果を確認できませんでした/u);
+  assert.equal(uncertain.calls.length, 1);
+  const unreadable = await createRecordActionHarness();
+  unreadable.response("throw"); unreadable.failRead();
+  await unreadable.run(unreadable.action("HIDE_WORLD"));
+  assert.match(unreadable.message.textContent, /自動では再実行しません/u);
+  assert.equal(unreadable.calls.length, 1);
+});
+
+test("committed record writes distinguish refresh and schedule failures from failed storage", async () => {
+  const refreshed = await createRecordActionHarness();
+  refreshed.failRefresh();
+  await refreshed.run(refreshed.action("PURGE_HIDDEN_WORLD"));
+  assert.equal(refreshed.message.textContent, "削除は完了しました。表示を再読み込みしてください");
+  const warning = await createRecordActionHarness();
+  warning.response({ok: true, recordSaved: true, thumbnailScheduleWarning: "THUMBNAIL_SCHEDULE_REPAIR_FAILED"});
+  await warning.run(warning.action("HIDE_WORLD"));
+  assert.match(warning.message.textContent, /非表示にしました.*画像予定の修復は保留/u);
+  for (const error of ["RECORD_CHANGED", "SYNC_IN_PROGRESS", "MAINTENANCE_IN_PROGRESS", "NO_ACTIVE_PROFILE", "RECORD_UPDATE_FAILED"]) {
+    const rejected = await createRecordActionHarness();
+    rejected.response({ok: false, error});
+    await rejected.run(rejected.action("HIDE_WORLD"));
+    assert.doesNotMatch(rejected.message.textContent, /非表示にしました|一覧に戻しました|削除は完了/u);
+    assert.equal(rejected.calls.length, 1);
+  }
+});
+
+test("late record completions never move focus into another account, route, closed page or repository", async () => {
+  for (const boundary of ["changeAccount", "navigate", "closePage", "replaceRepository"]) {
+    const ui = await createRecordActionHarness();
+    ui.delay();
+    const pending = ui.run(ui.action("RESTORE_HIDDEN_WORLD"));
+    ui[boundary]();
+    ui.finish({ok: true, recordSaved: true, thumbnailScheduleWarning: null});
+    await pending;
+    assert.equal(ui.calls.length, 1);
+    assert.equal(ui.focus.includes("neighbor"), false, boundary);
+    assert.doesNotMatch(ui.message.textContent, /一覧に戻しました/u, boundary);
+  }
+});
+
+test("dialog markup, responsive controls and backup restore disclosures preserve approved safety scope", async () => {
+  const [html, script, css, popup] = await Promise.all([
+    readFile(new URL("../extension/dashboard.html", import.meta.url), "utf8"),
+    readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8"),
+    readFile(new URL("../extension/styles/dashboard.css", import.meta.url), "utf8"),
+    readFile(new URL("../extension/popup.js", import.meta.url), "utf8")
+  ]);
+  assert.equal((html.match(/<dialog /gu) ?? []).length, 2);
+  for (const name of ["hide", "purge"]) {
+    assert.match(html, new RegExp(`<dialog id="${name}-record-dialog"[^>]*aria-labelledby="${name}-record-title"[^>]*aria-describedby="${name}-record-description"`, "u"));
+    assert.match(html, new RegExp(`id="${name}-record-cancel"[^>]*autofocus`, "u"));
+  }
+  assert.ok(html.indexOf('id="hidden-records-link"') < html.indexOf('id="world-filter-panel"'));
+  assert.match(script, /controls\.dialog\.showModal\(\)/u);
+  assert.match(script, /addEventListener\("cancel"[\s\S]*event\.preventDefault\(\)/u);
+  assert.match(script, /event\.key !== "Tab"/u);
+  assert.match(script, /表示\/非表示・削除済みIDの扱いもバックアップの状態へ戻ります/u);
+  assert.match(script, /preview\.sourceVersion < 3/u);
+  assert.match(script, /以前に削除した名前や履歴がファイルに含まれていれば、記録へ戻ります/u);
+  assert.match(script, /画像はこのJSONから復元できません。端末に残っている画像は引き続き利用します/u);
+  assert.match(css, /color-scheme: light/u);
+  assert.doesNotMatch(css, /brightness\(/u);
+  assert.match(css, /max-height: calc\(100dvh - 32px\)/u);
+  assert.match(css, /@media \(max-width: 420px\)/u);
+  assert.match(popup, /status\.unreadSummary\.uncertain/u);
+  assert.match(popup, /非表示の記録が/u);
+  assert.doesNotMatch(popup, /HIDE_WORLD|PURGE_HIDDEN_WORLD|RESTORE_HIDDEN_WORLD/u);
+});
+
+test("record action focus chooses next, previous, then the list heading without stealing unrelated focus", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  const create = new Function(`
+    const focus = [];
+    class HTMLElement {
+      constructor(worldId, name, action) {this.dataset = {worldId, recordAction: action}; this.name = name; this.tagName = name === "summary" ? "SUMMARY" : "BUTTON";}
+      focus() {focus.push(this.name);}
+      querySelectorAll() {return this.children;}
+    }
+    const cards = ["a", "b"].map(worldId => {
+      const card = new HTMLElement(worldId, worldId);
+      card.children = [new HTMLElement(undefined, "summary"), new HTMLElement(undefined, worldId + "-restore", "RESTORE_HIDDEN_WORLD")];
+      return card;
+    });
+    const worldList = {querySelectorAll: () => cards};
+    const primaryFocusTitle = {focus() {focus.push("heading");}};
+    ${dashboardFunction(source, "function restoreWorldFocus(")}
+    return {restore: restoreWorldFocus, cards, focus};
+  `);
+  const ui = create();
+  ui.restore({worldId: "removed", position: 0, action: "PURGE_HIDDEN_WORLD"});
+  assert.equal(ui.focus.at(-1), "a-restore", "next card's operation is preferred over its details disclosure");
+  ui.restore({worldId: "removed", position: 2, action: "PURGE_HIDDEN_WORLD"});
+  assert.equal(ui.focus.at(-1), "b-restore", "the previous card is used at the end of the list");
+  ui.restore({worldId: "b", position: 1, action: "summary"});
+  assert.equal(ui.focus.at(-1), "summary", "passive refresh retains the original disclosure control");
+  const focusCount = ui.focus.length;
+  ui.restore({worldId: "removed", position: 0, action: "RESTORE_HIDDEN_WORLD"}, false);
+  assert.equal(ui.focus.length, focusCount, "pending mutation redraw never falls back from its removed action");
+  ui.restore({worldId: "b", position: 1, action: "summary"}, false);
+  assert.equal(ui.focus.at(-1), "summary", "newer surviving summaries retain exact focus during mutation redraw");
+  ui.cards.length = 0;
+  ui.restore({worldId: "removed", position: 0, action: "PURGE_HIDDEN_WORLD"});
+  assert.equal(ui.focus.at(-1), "heading");
+});
+
+test("late confirmation reads cannot reopen a dismissed dialog or publish an obsolete image", async () => {
+  for (const boundary of ["close", "invalidate", "changeAccount", "navigate", "closePage", "replaceRepository", "newLoad", "newRender"]) {
+    const ui = await createRecordActionHarness();
+    ui.delayRead();
+    const pending = ui.open(ui.action("HIDE_WORLD"));
+    ui[boundary]();
+    ui.releaseRead();
+    await pending;
+    assert.equal(ui.dialogs.some((/** @type {{dialog: {open: boolean}}} */ controls) => controls.dialog.open), false, boundary);
+    assert.equal(ui.calls.length, 0, boundary);
+    assert.equal(ui.focus.length, 0, `${boundary}: stale completion cannot steal focus`);
+  }
+});
+
+test("backup export limits disclose the exact bounded reason without exposing arbitrary error text", async () => {
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  class BackupExportLimitError extends Error {
+    /** @param {string} code */
+    constructor(code) {super("private diagnostic must not be exposed"); this.code = code;}
+  }
+  const present = new Function("BackupExportLimitError", `${dashboardFunction(source, "function backupExportErrorMessage(")}; return backupExportErrorMessage;`)(BackupExportLimitError);
+  assert.match(present(new BackupExportLimitError("DISPOSITIONS_LIMIT"), false), /非表示・削除済みIDが10,000件の上限を超える/u);
+  assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), false), /25MiBの上限を超える/u);
+  assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), false), /記録を自動で省略せず/u);
+  assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), true), /ファイルの書き出しを開始しました/u);
+  assert.doesNotMatch(present(new Error("private diagnostic"), false), /private/u);
+  assert.match(source, /backupMessage\.textContent = backupExportErrorMessage\(error, downloadStarted\)/u);
+});
+
+test("delayed restore preserves newer search, filter and focus-only interactions", async () => {
+  for (const interaction of ["editSearch", "changeFilter", "changeGroup", "focusNewControl"]) {
+    const ui = await createRecordActionHarness();
+    ui.delay();
+    const pending = ui.run(ui.action("RESTORE_HIDDEN_WORLD"));
+    ui[interaction]("new choice");
+    const view = ui.view();
+    ui.finish({ok: true, recordSaved: true, thumbnailScheduleWarning: null});
+    await pending;
+    assert.equal(ui.message.textContent, "一覧に戻しました", `${interaction}: successful save still refreshes`);
+    assert.equal(ui.focus.includes("neighbor"), false, `${interaction}: completion cannot steal focus`);
+    assert.deepEqual(ui.view(), view, `${interaction}: new search/filter values survive completion`);
+    assert.equal(ui.calls.length, 1);
+  }
+  const uninterrupted = await createRecordActionHarness();
+  uninterrupted.delay();
+  const pending = uninterrupted.run(uninterrupted.action("RESTORE_HIDDEN_WORLD"));
+  uninterrupted.finish({ok: true, recordSaved: true, thumbnailScheduleWarning: null});
+  await pending;
+  assert.equal(uninterrupted.focus.at(-1), "neighbor", "normal next/previous focus still works");
+});
+
+test("restore refresh cannot steal focus when the user edits during the post-commit database read", async () => {
+  const ui = await createRecordActionHarness();
+  ui.delayRefresh();
+  const pending = ui.run(ui.action("RESTORE_HIDDEN_WORLD"));
+  await ui.whenRefreshing();
+  ui.focusNewControl();
+  ui.editSearch("a newer query");
+  ui.finishRefresh();
+  await pending;
+  assert.equal(ui.message.textContent, "一覧に戻しました");
+  assert.equal(ui.view().search, "a newer query");
+  assert.equal(ui.focus.includes("neighbor"), false);
+  const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
+  assert.match(source, /restoreWorldFocus\(focused, !recordMutationInFlight\)/u, "passive card redraw preserves exact surviving controls but leaves fallback to the guarded action owner");
 });

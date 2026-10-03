@@ -10,6 +10,25 @@ import {
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listWorlds"]>>[number]} WorldRecord */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listEvents"]>>[number]} HistoryEvent */
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
+/** @typedef {{worldId: string, state: "hidden" | "purged"}} WorldDisposition */
+/** @typedef {{exact: boolean, uncertain: boolean, count: number | null}} UnreadSummary */
+
+export const UNREAD_UNCERTAIN_DETAIL = "記録の削除前の未読内訳を確認できません。変更履歴を開くと通常の表示に戻ります";
+
+/** @param {unknown} value @param {unknown} [fallback] @returns {UnreadSummary} */
+export function normalizeUnreadSummary(value, fallback = 0) {
+  if (value === undefined) return {exact: true, uncertain: false, count: safeCount(fallback)};
+  if (isRecord(value) && value.exact === true && value.uncertain === false
+    && typeof value.count === "number" && Number.isSafeInteger(value.count) && value.count >= 0) {
+    return {exact: true, uncertain: false, count: value.count};
+  }
+  return {exact: false, uncertain: true, count: null};
+}
+
+/** @param {readonly WorldDisposition[]} dispositions @returns {Set<string>} */
+export function hiddenWorldIds(dispositions) {
+  return new Set(dispositions.filter((row) => row.state === "hidden").map((row) => row.worldId));
+}
 
 /**
  * Image metadata failure must not prevent loading the separate world history.
@@ -88,6 +107,10 @@ export function presentThumbnailProgress(progress, fallback = {}) {
  * @property {number} worldCount
  * @property {number} eventCount
  * @property {number} pendingProbeCount
+ * @property {number} generation
+ * @property {number} presentationGeneration
+ * @property {number} hiddenCount
+ * @property {UnreadSummary} unreadSummary
  * @property {number} unreadCount
  * @property {number} attentionWorldCount
  * @property {number} missingCount
@@ -160,6 +183,7 @@ export function normalizeStatusResponse(response) {
   const envelope = isRecord(response) ? response : {};
   const candidate = isRecord(envelope.status) ? envelope.status : envelope;
   const lastResult = typeof candidate.lastResult === "string" ? candidate.lastResult : null;
+  const unreadSummary = normalizeUnreadSummary(candidate.unreadSummary, candidate.unreadCount);
   return {
     thumbnailProgress: normalizeThumbnailProgress(candidate.thumbnailProgress),
     thumbnailSavedCount: typeof candidate.thumbnailSavedCount === "number" && Number.isSafeInteger(candidate.thumbnailSavedCount) && candidate.thumbnailSavedCount >= 0 ? candidate.thumbnailSavedCount : null,
@@ -175,7 +199,11 @@ export function normalizeStatusResponse(response) {
     worldCount: safeCount(candidate.worldCount),
     eventCount: safeCount(candidate.eventCount),
     pendingProbeCount: safeCount(candidate.pendingProbeCount),
-    unreadCount: safeCount(candidate.unreadCount),
+    generation: safeCount(candidate.generation ?? candidate.dataGeneration),
+    presentationGeneration: safeCount(candidate.presentationGeneration),
+    hiddenCount: safeCount(candidate.hiddenCount),
+    unreadSummary,
+    unreadCount: unreadSummary.count ?? 0,
     attentionWorldCount: safeCount(candidate.attentionWorldCount),
     missingCount: safeCount(candidate.missingCount),
     unavailableCount: safeCount(candidate.unavailableCount),
@@ -322,6 +350,9 @@ export function presentWorldOverview(status, context = {}) {
       detail: `最後に保存できた名前と画像です。${status.syncing ? "確認中も前回の記録を表示しています。" : ""}${pending > 0 ? `ほかに状態を確認中のワールドがあります。` : ""}`
     };
   }
+  if (status.hiddenCount > 0 && count === 0) {
+    return {title: "通常の一覧に要確認のワールドはありません", detail: `非表示の記録が${status.hiddenCount.toLocaleString("ja-JP")}件あります。記録画面で確認できます`};
+  }
   if (!hasBaseline) {
     return {
       title: status.syncing ? "最初の記録を保存しています" : "最初の記録を保存しましょう",
@@ -456,7 +487,7 @@ export function purgeErrorMessage(code, dataDeleted) {
 
 /**
  * @param {WorldRecord} world
- * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending" | "hidden"} filter
  * @returns {boolean}
  */
 export function worldMatchesFilter(world, filter) {
@@ -492,9 +523,10 @@ export function worldMatchesFilter(world, filter) {
  * @param {readonly WorldRecord[]} worlds
  * @param {readonly HistoryEvent[]} events
  * @param {string} query
- * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} filter
+ * @param {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending" | "hidden"} filter
  * @param {string | null} [groupTag]
  * @param {readonly FavoriteGroupRecord[]} [favoriteGroups]
+ * @param {readonly WorldDisposition[]} [dispositions]
  * @returns {WorldRecord[]}
  */
 export function filterWorlds(
@@ -503,7 +535,8 @@ export function filterWorlds(
   query,
   filter,
   groupTag = null,
-  favoriteGroups = []
+  favoriteGroups = [],
+  dispositions = []
 ) {
   const normalizedQuery = normalizeSearchText(query);
   /** @type {Map<string, string[]>} */
@@ -524,7 +557,10 @@ export function filterWorlds(
     }
   }
 
+  const hidden = hiddenWorldIds(dispositions);
+  const purged = new Set(dispositions.filter((row) => row.state === "purged").map((row) => row.worldId));
   const matching = worlds
+    .filter((world) => !purged.has(world.worldId) && (filter === "hidden" ? hidden.has(world.worldId) : !hidden.has(world.worldId)))
     .filter((world) => worldMatchesFilter(world, filter))
     .filter((world) => groupTag === null || groupTag.length === 0 || world.favoriteTags.includes(groupTag))
     .filter((world) => {
@@ -825,17 +861,20 @@ export function takeVisibleItems(items, visibleCount) {
 /**
  * @param {readonly WorldRecord[]} worlds
  * @param {readonly HistoryEvent[]} events
+ * @param {readonly WorldDisposition[]} [dispositions]
  * @returns {{ attention: number, total: number, unavailable: number, missing: number, renamed: number }}
  */
-export function summarizeHistory(worlds, events) {
+export function summarizeHistory(worlds, events, dispositions = []) {
+  const excluded = new Set(dispositions.map((row) => row.worldId));
+  const visible = worlds.filter((world) => !excluded.has(world.worldId));
   return {
-    attention: worlds.filter((world) => (
+    attention: visible.filter((world) => (
       world.membershipState === "not_in_favorites" ||
       world.availabilityState === "unavailable"
     )).length,
     total: worlds.length,
-    unavailable: worlds.filter((world) => world.availabilityState === "unavailable").length,
-    missing: worlds.filter((world) => world.membershipState === "not_in_favorites").length,
+    unavailable: visible.filter((world) => world.availabilityState === "unavailable").length,
+    missing: visible.filter((world) => world.membershipState === "not_in_favorites").length,
     renamed: events.filter((event) => event.kind === "name_changed").length
   };
 }

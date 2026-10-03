@@ -13,12 +13,23 @@ import {
 /** @typedef {Awaited<ReturnType<DatabaseRepository["listFavoriteGroups"]>>[number]} FavoriteGroupRecord */
 
 export const BACKUP_FORMAT = "vrc_favworld_check-backup";
-export const BACKUP_VERSION = 2;
+export const BACKUP_VERSION = 3;
 export const MAX_BACKUP_BYTES = 25 * 1024 * 1024;
 export const MAX_BACKUP_WORLDS = 10_000;
 export const MAX_BACKUP_EVENTS = 100_000;
 export const MAX_BACKUP_GROUPS = 100;
+export const MAX_BACKUP_DISPOSITIONS = 10_000;
 export const MAX_STRING_CODE_POINTS = 4_096;
+
+export class BackupExportLimitError extends Error {
+  /** @param {"DISPOSITIONS_LIMIT" | "SIZE_LIMIT"} code */
+  constructor(code) {
+    super("Backup export exceeds a supported limit");
+    this.name = "BackupExportLimitError";
+    this.code = code;
+  }
+}
+
 export const SAFE_PREFERENCE_KEYS = Object.freeze([
   "autoSyncEnabled",
   "notificationsEnabled"
@@ -72,6 +83,9 @@ const TOP_LEVEL_FIELDS_V1 = new Set([
   "preferences"
 ]);
 const TOP_LEVEL_FIELDS_V2 = new Set([...TOP_LEVEL_FIELDS_V1, "favoriteGroups"]);
+const TOP_LEVEL_FIELDS_V3 = new Set([...TOP_LEVEL_FIELDS_V2, "worldDispositions"]);
+const DISPOSITION_FIELDS = new Set(["userId", "worldId", "state"]);
+const DISPOSITION_STATES = new Set(["hidden", "purged"]);
 const PROFILE_FIELDS = new Set([
   "userId",
   "displayName",
@@ -136,13 +150,15 @@ const PREFERENCE_FIELDS = new Set(SAFE_PREFERENCE_KEYS);
 /**
  * @typedef {object} ValidatedBackup
  * @property {typeof BACKUP_FORMAT} format
- * @property {2} version
+ * @property {3} version
+ * @property {1 | 2 | 3} sourceVersion Non-enumerable input-version metadata, never exported
  * @property {string} exportedAt
  * @property {string} appVersion
  * @property {ProfileRecord} profile
  * @property {WorldRecord[]} worlds
  * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {HistoryEvent[]} events
+ * @property {import("./database.js").WorldDisposition[]} worldDispositions
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
  */
 
@@ -153,6 +169,9 @@ const PREFERENCE_FIELDS = new Set(SAFE_PREFERENCE_KEYS);
  * @property {number} worldCount
  * @property {number} eventCount
  * @property {number} groupCount
+ * @property {number} hiddenCount
+ * @property {number} purgedCount
+ * @property {1 | 2 | 3} sourceVersion
  * @property {string} exportedAt
  */
 
@@ -402,7 +421,7 @@ function compareText(left, right) {
 
 /**
  * @param {unknown} value
- * @param {1 | 2} sourceVersion
+ * @param {1 | 2 | 3} sourceVersion
  * @returns {ProfileRecord}
  */
 function profileRecord(value, sourceVersion) {
@@ -411,7 +430,7 @@ function profileRecord(value, sourceVersion) {
     record.createdBySchemaVersion,
     "$.profile.createdBySchemaVersion",
     1,
-    sourceVersion === 1 ? 1 : DATABASE_VERSION
+    sourceVersion === 1 ? 1 : sourceVersion === 2 ? 3 : DATABASE_VERSION
   );
   const profile = {
     userId: identifier(record.userId, "$.profile.userId", USER_ID_PATTERN),
@@ -653,7 +672,7 @@ function favoriteGroupChangeValue(value, path) {
  * @param {number} index
  * @param {string} userId
  * @param {Map<string, WorldRecord>} worlds
- * @param {1 | 2} sourceVersion
+ * @param {1 | 2 | 3} sourceVersion
  * @returns {HistoryEvent}
  */
 function eventRecord(value, index, userId, worlds, sourceVersion) {
@@ -852,14 +871,14 @@ export function validateBackup(input) {
   }
 
   inspectObjectGraph(parsed);
-  if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
+  if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3)) {
     invalid("version is not supported");
   }
-  const sourceVersion = /** @type {1 | 2} */ (parsed.version);
+  const sourceVersion = /** @type {1 | 2 | 3} */ (parsed.version);
   const top = exactRecord(
     parsed,
     "$",
-    sourceVersion === 1 ? TOP_LEVEL_FIELDS_V1 : TOP_LEVEL_FIELDS_V2
+    sourceVersion === 1 ? TOP_LEVEL_FIELDS_V1 : sourceVersion === 2 ? TOP_LEVEL_FIELDS_V2 : TOP_LEVEL_FIELDS_V3
   );
   if (top.format !== BACKUP_FORMAT) {
     invalid("format is not supported");
@@ -908,6 +927,32 @@ export function validateBackup(input) {
     invalid("$.events contains duplicate event IDs");
   }
 
+  const rawDispositions = sourceVersion < 3 ? [] : top.worldDispositions;
+  if (!Array.isArray(rawDispositions) || rawDispositions.length > MAX_BACKUP_DISPOSITIONS) {
+    invalid(`$.worldDispositions must contain at most ${MAX_BACKUP_DISPOSITIONS} entries`);
+  }
+  const worldDispositions = rawDispositions.map((value, index) => {
+    const path = `$.worldDispositions[${index}]`;
+    const record = exactRecord(value, path, DISPOSITION_FIELDS);
+    const userId = identifier(record.userId, `${path}.userId`, USER_ID_PATTERN);
+    if (userId !== profile.userId) invalid(`${path}.userId does not match the profile`);
+    const worldId = identifier(record.worldId, `${path}.worldId`, WORLD_ID_PATTERN);
+    const state = /** @type {"hidden" | "purged"} */ (
+      enumValue(record.state, `${path}.state`, DISPOSITION_STATES)
+    );
+    if (state === "hidden" && !worldsById.has(worldId)) {
+      invalid(`${path} hidden record must refer to a world in this backup`);
+    }
+    if (state === "purged" && worldsById.has(worldId)) {
+      invalid(`${path} purged record must not have a world or event in this backup`);
+    }
+    return { userId, worldId, state };
+  });
+  worldDispositions.sort((left, right) => compareText(left.worldId, right.worldId));
+  if (new Set(worldDispositions.map((record) => record.worldId)).size !== worldDispositions.length) {
+    invalid("$.worldDispositions contains duplicate world IDs");
+  }
+
   const validated = {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
@@ -917,9 +962,13 @@ export function validateBackup(input) {
     worlds,
     favoriteGroups,
     events,
+    worldDispositions,
     preferences: preferenceRecord(top.preferences)
   };
-  return /** @type {ValidatedBackup} */ (withoutPrototypes(validated));
+  const result = /** @type {ValidatedBackup} */ (withoutPrototypes(validated));
+  // Retain source semantics for the restore confirmation without extending JSON.
+  Object.defineProperty(result, "sourceVersion", { value: sourceVersion, enumerable: false });
+  return result;
 }
 
 /** Alias describing the parse-and-validate operation. */
@@ -936,6 +985,9 @@ export function backupSummary(backup) {
     worldCount: backup.worlds.length,
     eventCount: backup.events.length,
     groupCount: backup.favoriteGroups.length,
+    hiddenCount: backup.worldDispositions.filter((record) => record.state === "hidden").length,
+    purgedCount: backup.worldDispositions.filter((record) => record.state === "purged").length,
+    sourceVersion: backup.sourceVersion,
     exportedAt: backup.exportedAt
   };
 }
@@ -954,6 +1006,9 @@ export async function createBackup(repository, userId, options = {}) {
     throw new Error(`Profile not found: ${userId}`);
   }
 
+  if (snapshot.worldDispositions.length > MAX_BACKUP_DISPOSITIONS) {
+    throw new BackupExportLimitError("DISPOSITIONS_LIMIT");
+  }
   const candidate = {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
@@ -963,12 +1018,17 @@ export async function createBackup(repository, userId, options = {}) {
     worlds: snapshot.worlds,
     favoriteGroups: snapshot.favoriteGroups,
     events: snapshot.events,
+    worldDispositions: snapshot.worldDispositions,
     preferences: snapshot.preferences
   };
-  const validated = validateBackup(JSON.stringify(candidate));
+  const candidateText = JSON.stringify(candidate);
+  if (new TextEncoder().encode(candidateText).byteLength > MAX_BACKUP_BYTES) {
+    throw new BackupExportLimitError("SIZE_LIMIT");
+  }
+  const validated = validateBackup(candidateText);
   const text = `${JSON.stringify(validated, null, 2)}\n`;
   if (new TextEncoder().encode(text).byteLength > MAX_BACKUP_BYTES) {
-    invalid(`file exceeds ${MAX_BACKUP_BYTES} bytes`);
+    throw new BackupExportLimitError("SIZE_LIMIT");
   }
   return text;
 }
@@ -1000,6 +1060,7 @@ export async function restoreBackup(repository, input, options = {}) {
     profile: backup.profile,
     worlds: backup.worlds,
     favoriteGroups: backup.favoriteGroups,
+    worldDispositions: backup.worldDispositions,
     events,
     preferences: backup.preferences
   });

@@ -1900,7 +1900,7 @@ test("badge uses durable unread count and caps its display", async () => {
   const updateBadge = createBadgeUpdater({
     repository: {
       getSetting: getActiveProfileSetting,
-      getUnreadCount: async () => 123
+      getUnreadSummary: async () => ({exact: true, uncertain: false, count: 123})
     },
     setBadgeText: async (details) => {
       texts.push(details);
@@ -1912,7 +1912,7 @@ test("badge uses durable unread count and caps its display", async () => {
 
   await updateBadge();
   assert.deepEqual(texts, [{ text: "99+" }]);
-  assert.deepEqual(colors, [{ color: "#B4234D" }]);
+  assert.deepEqual(colors, [{ color: "#8B3028" }]);
 });
 
 test("purge clears user records before uninstall and never uninstalls after a purge failure", async () => {
@@ -2247,6 +2247,8 @@ test("durable settings and read markers stay successful when badge refresh rejec
         missingCount: 0,
         unavailableCount: 0,
         unreadCount: 0,
+        unreadSummary: {exact: true, uncertain: false, count: 0},
+        generation: 0, dataGeneration: 0, presentationGeneration: 0, hiddenCount: 0, recordMutating: false,
         favoriteGroupStatus: null,
         lastResult: null
       }),
@@ -2294,7 +2296,7 @@ test("durable settings and read markers stay successful when badge refresh rejec
  *
  * @param {DatabaseRepository} repository
  * @param {Partial<Pick<DatabaseRepository,
- *   "commitSync" | "claimEvents" | "getDataGeneration" | "setSettings">>} overrides
+ *   "commitSync" | "claimEvents" | "getDataGeneration" | "setSettings" | "hideWorld" | "getProfileStats" | "getUnreadCount">>} overrides
  * @returns {DatabaseRepository}
  */
 function bindRepositoryWithOverrides(repository, overrides) {
@@ -2312,6 +2314,9 @@ function bindRepositoryWithOverrides(repository, overrides) {
       if (property === "setSettings" && overrides.setSettings !== undefined) {
         return overrides.setSettings;
       }
+      if (property === "hideWorld" && overrides.hideWorld !== undefined) return overrides.hideWorld;
+      if (property === "getProfileStats" && overrides.getProfileStats !== undefined) return overrides.getProfileStats;
+      if (property === "getUnreadCount" && overrides.getUnreadCount !== undefined) return overrides.getUnreadCount;
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     }
@@ -2619,6 +2624,395 @@ test("image schedule repair and batches cannot overwrite each other's durable at
       await service.repairThumbnailScheduleBestEffort();
       assert.equal((await service.getStatus()).thumbnailProgress?.state, "partial");
       assert.equal(alarms.thumbnailAt, null);
+    });
+  }
+});
+
+/** @param {DatabaseRepository} repository */
+async function recordMutationInput(repository) {
+  const snapshot = await repository.getDisplaySnapshot(USER_ID);
+  const world = snapshot.worlds.find((item) => item.worldId === WORLD_ID);
+  assert.ok(world);
+  return { userId: USER_ID, worldId: WORLD_ID, expectedGeneration: snapshot.generation,
+    expectedPresentationGeneration: snapshot.presentationGeneration, expectedRevision: world.revision };
+}
+
+/** @param {DatabaseRepository} repository @param {FakeApi} api */
+async function seedMissingRecord(repository, api) {
+  const { service } = createService({ repository, api });
+  assert.equal((await service.start("alarm")).ok, true);
+  api.favoriteRelationsOverride = [];
+  api.favoriteWorldsOverride = [];
+  api.probeStatus = 404;
+  assert.equal((await service.start("alarm")).ok, true);
+  assert.equal((await service.start("alarm")).ok, true);
+  return service;
+}
+
+/** @param {SyncService} service @param {Partial<Parameters<typeof createMessageHandler>[0]>} [overrides] */
+function recordMessageHandler(service, overrides = {}) {
+  return createMessageHandler({
+    service,
+    startSync: createGatedSyncRunner({ ensureUserAgentRule: async () => {},
+      startSync: (trigger) => service.start(trigger), keepAlive: async (operation) => operation }),
+    openVrchat: async () => {}, openDashboard: async () => {}, refreshBadge: async () => {},
+    purgeAndUninstall: async () => ({ ok: true, dataDeleted: true }), ...overrides
+  });
+}
+
+test("closed record commands validate IDs, generations and allowlisted fields before writing", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const service = await seedMissingRecord(repository, api);
+  const handler = recordMessageHandler(service);
+  const input = await recordMutationInput(repository);
+  const valid = { type: MESSAGE_TYPES.hideWorld, ...input };
+  for (const message of [
+    { ...valid, userId: "usr_other" }, { ...valid, worldId: "wrld_other" },
+    { ...valid, expectedGeneration: "3" }, { ...valid, expectedRevision: -1 },
+    { ...valid, expectedPresentationGeneration: NaN }, { ...valid, store: "worlds" },
+    { type: MESSAGE_TYPES.hideWorld, userId: USER_ID, worldId: WORLD_ID }
+  ]) {
+    assert.deepEqual(await handler(message), { ok: false, error: "INVALID_REQUEST" });
+  }
+  assert.deepEqual(await repository.listWorldDispositions(USER_ID), []);
+  const result = await handler(valid);
+  assert.equal(result.ok, true);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "hidden");
+  assert.deepEqual(await handler(valid), { ok: false, error: "RECORD_CHANGED" });
+  const restored = await handler({ type: MESSAGE_TYPES.restoreHiddenWorld, ...await recordMutationInput(repository) });
+  assert.equal(restored.ok, true);
+  assert.deepEqual(await repository.listWorldDispositions(USER_ID), []);
+  assert.deepEqual(await handler({ type: MESSAGE_TYPES.purgeHiddenWorld, ...await recordMutationInput(repository) }),
+    { ok: false, error: "RECORD_CHANGED" });
+});
+
+test("record reservations reject overlapping sync, mutations and purge before asynchronous storage", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  await seedMissingRecord(repository, api);
+  let release = () => {};
+  const gate = new Promise((resolve) => { release = () => resolve(undefined); });
+  const wrapped = bindRepositoryWithOverrides(repository, {
+    hideWorld: async (input) => { await gate; return repository.hideWorld(input); }
+  });
+  const { service } = createService({ repository: wrapped, api });
+  const input = await recordMutationInput(repository);
+  const mutation = service.mutateRecord("hide", input);
+  assert.equal(service.recordMutating, true);
+  assert.deepEqual(await service.start("alarm"), { ok: false, error: "MAINTENANCE_IN_PROGRESS" });
+  assert.deepEqual(await service.mutateRecord("hide", input), { ok: false, error: "SYNC_IN_PROGRESS" });
+  let beganPurge = false;
+  const purge = createPurgeController({ service,
+    repository: { beginPurge: async () => { beganPurge = true; return true; },
+      recoverFromFailedPurge: async () => {}, purgeAllData: async () => {} },
+    clearAlarm: async () => true, cleanupAuthCookies: async () => {},
+    clearBadge: async () => {}, uninstallSelf: async () => {}
+  });
+  assert.deepEqual(await purge.purgeAndUninstall(), { ok: false, error: "SYNC_IN_PROGRESS", dataDeleted: false });
+  assert.equal(beganPurge, false);
+  release();
+  assert.equal((await mutation).ok, true);
+  assert.equal(service.recordMutating, false);
+  assert.deepEqual(await recordMessageHandler(service, { canMutateRecord: () => false })({
+    type: MESSAGE_TYPES.restoreHiddenWorld, ...await recordMutationInput(repository)
+  }), { ok: false, error: "MAINTENANCE_IN_PROGRESS" });
+});
+
+test("record mutation rejects active API and image batches and releases reservations after errors", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const service = await seedMissingRecord(repository, api);
+  const input = await recordMutationInput(repository);
+  let releaseUser = () => {};
+  let userEntered = false;
+  api.beforeUser = () => new Promise((resolve) => { userEntered = true; releaseUser = () => resolve(); });
+  const sync = service.start("alarm");
+  while (!userEntered) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await service.mutateRecord("hide", input), { ok: false, error: "SYNC_IN_PROGRESS" });
+  releaseUser();
+  await sync;
+  api.beforeUser = null;
+  const failed = createService({ repository: bindRepositoryWithOverrides(repository, {
+    hideWorld: async () => { throw new Error("synthetic write failure"); }
+  }), api }).service;
+  assert.deepEqual(await failed.mutateRecord("hide", await recordMutationInput(repository)),
+    { ok: false, error: "RECORD_UPDATE_FAILED" });
+  assert.equal(failed.recordMutating, false);
+  const sourceUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  const generation = await repository.getDataGeneration(USER_ID);
+  await repository.setSetting(SETTING_KEYS.thumbnailJob, {
+    version: 1, userId: USER_ID, generation, capturedAt: new Date(NOW).toISOString(),
+    items: [{id: WORLD_ID, thumbnailImageUrl: sourceUrl, attempts: 0}], nextAttemptAt: null, state: "waiting"
+  });
+  let releaseImage = () => {};
+  let encoding = false;
+  const imageService = createService({ repository, api, encodeThumbnail: async () => {
+    encoding = true;
+    await new Promise((resolve) => { releaseImage = () => resolve(undefined); });
+    return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+  }}).service;
+  const imageBatch = imageService.start("thumbnail");
+  while (!encoding) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await imageService.mutateRecord("hide", await recordMutationInput(repository)),
+    { ok: false, error: "SYNC_IN_PROGRESS" });
+  releaseImage();
+  await imageBatch;
+});
+
+test("hidden records keep sync history and notifications while atomic status excludes attention", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const service = await seedMissingRecord(repository, api);
+  const before = await repository.getUnreadSummary(USER_ID);
+  assert.equal((await service.mutateRecord("hide", await recordMutationInput(repository))).ok, true);
+  const hidden = await service.getStatus();
+  assert.equal(hidden.hiddenCount, 1);
+  assert.equal(hidden.worldCount, 1);
+  assert.equal(hidden.attentionWorldCount, 0);
+  assert.deepEqual(hidden.unreadSummary, before);
+  api.favoriteRelationsOverride = null;
+  api.favoriteWorldsOverride = null;
+  api.worldName = "非表示のまま新しい名前";
+  const { service: recoveredService, notifications } = createService({ repository, api });
+  assert.equal((await recoveredService.start("alarm")).ok, true);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "hidden");
+  assert.equal((await repository.listWorlds(USER_ID))[0]?.currentName, api.worldName);
+  assert.ok((await repository.listEvents(USER_ID)).some((event) => event.kind === "name_changed"));
+  assert.equal(notifications.created.length, 1);
+  // A separate legacy count read would mix different committed generations.
+  const atomicService = createService({ repository: bindRepositoryWithOverrides(repository, {
+    getUnreadCount: async () => { throw new Error("must not read count separately"); }
+  }), api }).service;
+  assert.deepEqual((await atomicService.getStatus()).unreadSummary, await repository.getUnreadSummary(USER_ID));
+});
+
+test("purged relation-only IDs are not probed and fresh favorite metadata creates a silent new baseline", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const service = await seedMissingRecord(repository, api);
+  await service.mutateRecord("hide", await recordMutationInput(repository));
+  assert.equal((await service.mutateRecord("purge", await recordMutationInput(repository))).ok, true);
+  api.calls = [];
+  api.favoriteRelationsOverride = null;
+  assert.equal((await service.start("alarm")).ok, true);
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
+  assert.deepEqual(await repository.listWorlds(USER_ID), []);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "purged");
+  api.favoriteWorldsOverride = null;
+  api.failureStep = "metadata";
+  api.failure = new NetworkError();
+  assert.equal((await service.start("alarm")).ok, false);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "purged");
+  api.failureStep = null;
+  api.worldName = "新規に保存した名前";
+  const { service: fresh, notifications } = createService({ repository, api, now: {value: NOW + 86_400_000} });
+  assert.deepEqual(await fresh.start("alarm"), { ok: true, changes: 0 });
+  const world = (await repository.listWorlds(USER_ID))[0];
+  assert.equal(world?.currentName, api.worldName);
+  assert.equal(world?.firstSeenAt, new Date(NOW + 86_400_000).toISOString());
+  assert.equal(world?.revision, 0);
+  assert.deepEqual(await repository.listWorldDispositions(USER_ID), []);
+  assert.deepEqual(await repository.listEvents(USER_ID), []);
+  assert.equal(notifications.created.length, 0);
+});
+
+test("sync replan excludes a concurrently purged ID from records, events and image jobs", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  await seedMissingRecord(repository, api);
+  const secondId = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const snapshot = await repository.getDisplaySnapshot(USER_ID);
+  const original = snapshot.worlds[0];
+  assert.ok(original);
+  await repository.replaceProfileData({ profile: /** @type {NonNullable<typeof snapshot.profile>} */ (snapshot.profile),
+    worlds: [original, {...original, worldId: secondId, membershipState: "favorited", membershipMissCount: 0,
+      availabilityState: "accessible", unavailableCount: 0}], events: snapshot.events, favoriteGroups: snapshot.favoriteGroups });
+  await repository.hideWorld(await recordMutationInput(repository));
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "古い取得結果", authorName: "作者", favoriteGroup: "worlds1",
+    releaseStatus: "public", thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"},
+  {id: secondId, name: "他の記録は更新する", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public"}];
+  api.favoriteRelationsOverride = [{favoriteId: WORLD_ID, tags: ["worlds1"], type: "world"},
+    {favoriteId: secondId, tags: ["worlds1"], type: "world"}];
+  let commits = 0;
+  let images = 0;
+  const wrapped = bindRepositoryWithOverrides(repository, {
+    commitSync: async (commit) => {
+      commits += 1;
+      if (commits === 1) await repository.purgeHiddenWorld(await recordMutationInput(repository));
+      return repository.commitSync(commit);
+    }
+  });
+  const { service } = createService({ repository: wrapped, api, encodeThumbnail: async (sourceUrl) => {
+    images += 1;
+    return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+  }});
+  assert.deepEqual(await service.start("alarm"), { ok: true, changes: 1 });
+  assert.equal(commits, 2);
+  assert.equal(images, 0);
+  assert.deepEqual((await repository.listWorlds(USER_ID)).map((world) => [world.worldId, world.currentName]),
+    [[secondId, "他の記録は更新する"]]);
+  assert.deepEqual((await repository.listEvents(USER_ID)).map((event) => [event.worldId, event.kind]),
+    [[secondId, "name_changed"]]);
+  assert.deepEqual((await repository.getSetting(SETTING_KEYS.thumbnailJob)).items, []);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "purged");
+});
+
+test("any generation replan disables suppression release even for initial purged IDs", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const initial = await seedMissingRecord(repository, api);
+  await initial.mutateRecord("hide", await recordMutationInput(repository));
+  await initial.mutateRecord("purge", await recordMutationInput(repository));
+  api.favoriteWorldsOverride = null;
+  api.favoriteRelationsOverride = null;
+  let commits = 0;
+  const wrapped = bindRepositoryWithOverrides(repository, {
+    commitSync: async (commit) => {
+      commits += 1;
+      if (commits === 1) await repository.saveProfile(commit.profile);
+      return repository.commitSync(commit);
+    }
+  });
+  assert.deepEqual(await createService({repository: wrapped, api}).service.start("alarm"), {ok: true, changes: 0});
+  assert.equal(commits, 2);
+  assert.deepEqual(await repository.listWorlds(USER_ID), []);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "purged");
+});
+
+test("badge shows uncertainty without inventing a count", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  await createService({repository, api}).service.start("alarm");
+  /** @type {string[]} */
+  const texts = [];
+  const update = createBadgeUpdater({ repository: {
+    getSetting: repository.getSetting.bind(repository),
+    getUnreadSummary: async () => ({exact: false, uncertain: true, count: null})
+  }, setBadgeText: async ({text}) => { texts.push(text); }, setBadgeBackgroundColor: async () => {} });
+  await update();
+  assert.deepEqual(texts, ["?"]);
+});
+
+test("waiting image jobs permit record purge and alarm failures remain committed success", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  await seedMissingRecord(repository, api);
+  const secondId = "wrld_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const snapshot = await repository.getDisplaySnapshot(USER_ID);
+  const original = snapshot.worlds[0];
+  assert.ok(original);
+  await repository.replaceProfileData({ profile: /** @type {NonNullable<typeof snapshot.profile>} */ (snapshot.profile),
+    worlds: [original, {...original, worldId: secondId}], events: snapshot.events,
+    favoriteGroups: snapshot.favoriteGroups });
+  await repository.hideWorld(await recordMutationInput(repository));
+  const generation = await repository.getDataGeneration(USER_ID);
+  const sourceUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  const nextAttemptAt = NOW + 3_600_000;
+  const secondItem = {id: secondId, thumbnailImageUrl: sourceUrl, attempts: 2};
+  await repository.setSetting(SETTING_KEYS.thumbnailJob, {version: 1, userId: USER_ID, generation,
+    capturedAt: new Date(NOW).toISOString(), items: [{id: WORLD_ID, thumbnailImageUrl: sourceUrl, attempts: 1}, secondItem],
+    nextAttemptAt, state: "waiting"});
+  const alarms = new FakeAlarms();
+  alarms.failThumbnailCreate = true;
+  const {service} = createService({repository, api, alarms});
+  const handler = recordMessageHandler(service, {refreshBadge: async () => { throw new Error("badge unavailable"); }});
+  const result = await handler({type: MESSAGE_TYPES.purgeHiddenWorld, ...await recordMutationInput(repository)});
+  assert.equal(result.ok, true);
+  assert.equal("recordSaved" in result && result.recordSaved, true);
+  assert.equal("thumbnailScheduleWarning" in result && result.thumbnailScheduleWarning, "THUMBNAIL_SCHEDULE_REPAIR_FAILED");
+  const job = await repository.getSetting(SETTING_KEYS.thumbnailJob);
+  assert.deepEqual(job.items, [secondItem]);
+  assert.equal(job.generation, generation + 1);
+  assert.equal(job.nextAttemptAt, nextAttemptAt);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "purged");
+  assert.equal(service.recordMutating, false);
+});
+
+test("record commands never silently retarget after an account change", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const service = await seedMissingRecord(repository, api);
+  const input = await recordMutationInput(repository);
+  await repository.setSetting(SETTING_KEYS.activeProfileId, "usr_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  assert.deepEqual(await service.mutateRecord("hide", input), {ok: false, error: "RECORD_CHANGED"});
+  assert.deepEqual(await repository.listWorldDispositions(USER_ID), []);
+  await repository.setSetting(SETTING_KEYS.activeProfileId, null);
+  assert.deepEqual(await service.mutateRecord("hide", input), {ok: false, error: "NO_ACTIVE_PROFILE"});
+  await repository.setSetting(SETTING_KEYS.activeProfileId, USER_ID);
+  await repository.beginPurge();
+  assert.deepEqual(await service.mutateRecord("hide", input), {ok: false, error: "MAINTENANCE_IN_PROGRESS"});
+  assert.equal(service.recordMutating, false);
+});
+
+test("a due automatic alarm consumed during record mutation is rearmed and syncs after the reservation", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  await seedMissingRecord(repository, api);
+  let release = () => {};
+  let hideEntered = false;
+  const gate = new Promise((resolve) => { release = () => resolve(undefined); });
+  const wrapped = bindRepositoryWithOverrides(repository, {
+    hideWorld: async (input) => { hideEntered = true; await gate; return repository.hideWorld(input); }
+  });
+  const alarms = new FakeAlarms();
+  const now = {value: NOW};
+  const {service} = createService({repository: wrapped, api, alarms, now});
+  await repository.setSettings({[SETTING_KEYS.nextSyncAt]: NOW, [SETTING_KEYS.watchdogUntil]: null});
+  api.calls = [];
+  let securityChecks = 0;
+  const runner = createGatedSyncRunner({
+    ensureUserAgentRule: async () => { securityChecks += 1; },
+    startSync: (trigger) => service.start(trigger), keepAlive: async (operation) => operation,
+    canStart: () => !service.recordMutating
+  });
+  const handleAlarm = createAlarmEventHandler({getService: async () => service, getRunner: async () => runner});
+  const mutation = service.mutateRecord("hide", await recordMutationInput(repository));
+  while (!hideEntered) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.recordMutating, true);
+  // Chrome removes a one-shot alarm before dispatching this event.
+  alarms.scheduledAt = null;
+  await handleAlarm({name: SYNC_ALARM_NAME, scheduledTime: NOW});
+  assert.equal(securityChecks, 0);
+  assert.deepEqual(api.calls, []);
+  assert.equal(alarms.scheduledAt, NOW + STARTUP_MIN_DELAY_MS);
+  assert.equal(await repository.getSetting(SETTING_KEYS.nextSyncAt), alarms.scheduledAt);
+  release();
+  assert.equal((await mutation).ok, true);
+  const rearmedAt = alarms.scheduledAt;
+  assert.ok(rearmedAt !== null);
+  now.value = rearmedAt;
+  alarms.scheduledAt = null;
+  await handleAlarm({name: SYNC_ALARM_NAME, scheduledTime: rearmedAt});
+  assert.equal(securityChecks, 1);
+  assert.deepEqual(api.calls, ["user", "groups", "relations", "metadata"]);
+  assert.equal((await repository.listWorldDispositions(USER_ID))[0]?.state, "hidden");
+  assert.ok(alarms.scheduledAt !== null && alarms.scheduledAt > now.value);
+});
+
+test("maintenance alarm recovery stays fail closed when autosync is disabled or purge begins", async (context) => {
+  for (const guard of ["disabled", "purge"]) {
+    await context.test(guard, async () => {
+      const repository = await createRepository();
+      const api = new FakeApi();
+      const alarms = new FakeAlarms();
+      const {service} = createService({repository, api, alarms});
+      await repository.setSettings({[SETTING_KEYS.nextSyncAt]: NOW, [SETTING_KEYS.watchdogUntil]: null});
+      const runner = createGatedSyncRunner({
+        ensureUserAgentRule: async () => {}, startSync: (trigger) => service.start(trigger),
+        keepAlive: async (operation) => operation,
+        canStart: async () => {
+          // The state changes after prepareAutomaticSync accepted this alarm.
+          if (guard === "disabled") await repository.setSetting(SETTING_KEYS.autoSyncEnabled, false);
+          else await repository.beginPurge();
+          return false;
+        }
+      });
+      await createAlarmEventHandler({getService: async () => service, getRunner: async () => runner})(
+        {name: SYNC_ALARM_NAME, scheduledTime: NOW});
+      assert.equal(alarms.scheduledAt, null);
+      assert.deepEqual(api.calls, []);
+      assert.equal(alarms.creates.length, 0);
     });
   }
 });

@@ -7,7 +7,7 @@ import {
 } from "./domain.js";
 
 export const DATABASE_NAME = "vrc-favworld-check";
-export const DATABASE_VERSION = 3;
+export const DATABASE_VERSION = 4;
 export const SYNC_RUN_RETENTION_PER_PROFILE = 100;
 export const SYNC_RUN_RETENTION_ANONYMOUS = 20;
 export const ANONYMOUS_RETENTION_OWNER = "__anonymous__";
@@ -16,6 +16,8 @@ export const THUMBNAIL_BATCH_LIMIT = 55;
 
 const DATA_GENERATION_PREFIX = "dataGeneration:";
 const UNREAD_COUNT_PREFIX = "unreadCount:";
+const UNREAD_TRACKING_PREFIX = "unreadTracking:";
+const PRESENTATION_GENERATION_PREFIX = "presentationGeneration:";
 const THUMBNAIL_IDENTIFIER_MAX_LENGTH = 256;
 const THUMBNAIL_SOURCE_URL_MAX_LENGTH = 8_192;
 const THUMBNAIL_MAX_DIMENSION = 320;
@@ -74,6 +76,13 @@ export class RevisionConflictError extends Error {
   }
 }
 
+export class RecordStateConflictError extends Error {
+  constructor() {
+    super("Record or active profile changed; refresh before trying again");
+    this.name = "RecordStateConflictError";
+  }
+}
+
 export class PurgePendingError extends Error {
   constructor() {
     super("Database writes are disabled while permanent data removal is pending");
@@ -85,6 +94,7 @@ export const STORES = Object.freeze({
   profiles: "profiles",
   worlds: "worlds",
   thumbnails: "thumbnails",
+  worldDispositions: "worldDispositions",
   favoriteGroups: "favoriteGroups",
   events: "events",
   syncRuns: "syncRuns",
@@ -141,6 +151,12 @@ const INDEXES = Object.freeze({
  * @property {number} revision
  * @property {string} updatedAt
  */
+
+/** @typedef {{userId: string, worldId: string, state: "hidden" | "purged"}} WorldDisposition */
+/** @typedef {{legacyCount: number, legacyWorldIds: string[], legacyUncertain: boolean, byWorld: Record<string, number>}} UnreadTracking */
+/** @typedef {{exact: boolean, uncertain: boolean, count: number | null}} UnreadSummary */
+/** @typedef {{userId: string, worldId: string, expectedGeneration: number, expectedPresentationGeneration: number, expectedRevision: number}} RecordMutation */
+/** @typedef {{version: 1, userId: string, generation: number, capturedAt: string, items: {id: string, thumbnailImageUrl: string, attempts: number}[], nextAttemptAt: number | null, state: string}} StoredThumbnailJob */
 
 /**
  * Locally retained WebP preview. Keeping this record separate from WorldRecord
@@ -242,6 +258,7 @@ const INDEXES = Object.freeze({
  * @property {readonly ExpectedWorldRevision[]} expectedWorldRevisions
  * @property {number} expectedGeneration
  * @property {SuccessSyncSettings} settings
+ * @property {readonly string[]} [releasedPurgedWorldIds]
  */
 
 /**
@@ -267,6 +284,7 @@ const INDEXES = Object.freeze({
  * @property {readonly FavoriteGroupRecord[]} favoriteGroups
  * @property {readonly HistoryEvent[]} events
  * @property {Readonly<Record<string, boolean>>} [preferences]
+ * @property {readonly WorldDisposition[]} [worldDispositions]
  */
 
 /** @typedef {{ key: string, value: unknown }} StoredValue */
@@ -277,6 +295,12 @@ const INDEXES = Object.freeze({
  * @property {WorldRecord[]} worlds
  * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {number} generation
+ * @property {number} presentationGeneration
+ * @property {WorldDisposition[]} worldDispositions
+ */
+
+/**
+ * @typedef {SyncSnapshot & {events: HistoryEvent[], unreadSummary: UnreadSummary}} DisplaySnapshot
  */
 
 /**
@@ -286,6 +310,7 @@ const INDEXES = Object.freeze({
  * @property {FavoriteGroupRecord[]} favoriteGroups
  * @property {HistoryEvent[]} events
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
+ * @property {WorldDisposition[]} worldDispositions
  */
 
 /**
@@ -411,6 +436,69 @@ function generationKey(userId) {
  */
 function unreadCountKey(userId) {
   return `${UNREAD_COUNT_PREFIX}${userId}`;
+}
+
+/** @param {string} userId */
+function presentationGenerationKey(userId) { return `${PRESENTATION_GENERATION_PREFIX}${userId}`; }
+/** @param {string} userId */
+function unreadTrackingKey(userId) { return `${UNREAD_TRACKING_PREFIX}${userId}`; }
+/** @returns {UnreadTracking} */
+function emptyUnreadTracking() { return { legacyCount: 0, legacyWorldIds: [], legacyUncertain: false, byWorld: {} }; }
+/** @param {unknown} stored @returns {UnreadTracking} */
+function unreadTrackingValue(stored) {
+  if (stored === undefined) return emptyUnreadTracking();
+  const value = /** @type {StoredValue} */ (stored).value;
+  if (typeof value !== "object" || value === null) throw new Error("Stored unread tracking is invalid");
+  const track = /** @type {UnreadTracking} */ (value);
+  if (!Number.isSafeInteger(track.legacyCount) || track.legacyCount < 0
+    || !Array.isArray(track.legacyWorldIds) || track.legacyWorldIds.some((id) => typeof id !== "string")
+    || typeof track.legacyUncertain !== "boolean" || typeof track.byWorld !== "object" || track.byWorld === null
+    || Array.isArray(track.byWorld) || Object.values(track.byWorld).some((count) => !Number.isSafeInteger(count) || count < 0)) {
+    throw new Error("Stored unread tracking is invalid");
+  }
+  return track;
+}
+/** @param {UnreadTracking} track */
+function trackedUnreadCount(track) {
+  const count = Object.values(track.byWorld).reduce((sum, value) => sum + value, track.legacyCount);
+  if (!Number.isSafeInteger(count)) throw new RangeError("Unread event count is exhausted");
+  return count;
+}
+/** @param {UnreadTracking} track @returns {UnreadSummary} */
+function unreadSummary(track) {
+  return { exact: !track.legacyUncertain, uncertain: track.legacyUncertain,
+    count: track.legacyUncertain ? null : trackedUnreadCount(track) };
+}
+/** @param {IDBObjectStore} meta @param {string} userId @param {UnreadTracking} track */
+function putUnreadTracking(meta, userId, track) {
+  meta.put({ key: unreadTrackingKey(userId), value: track });
+  // Kept for old callers, which must not use this number to claim exactness.
+  meta.put({ key: unreadCountKey(userId), value: trackedUnreadCount(track) });
+}
+/** @param {unknown} id @param {"usr" | "wrld"} prefix */
+function requireRecordIdentifier(id, prefix) {
+  if (typeof id !== "string" || !new RegExp(`^${prefix}_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).test(id)) {
+    throw new TypeError("Invalid record identifier");
+  }
+}
+/** @param {readonly WorldDisposition[]} dispositions @param {string} userId @param {readonly WorldRecord[]} worlds @param {readonly HistoryEvent[]} events */
+function validateDispositions(dispositions, userId, worlds, events) {
+  if (!Array.isArray(dispositions) || dispositions.length > 10_000) throw new Error("Invalid world dispositions");
+  const ids = new Set();
+  const worldIds = new Set(worlds.map((world) => world.worldId));
+  const eventIds = new Set(events.map((event) => event.worldId));
+  for (const row of dispositions) {
+    if (typeof row !== "object" || row === null || Object.keys(row).length !== 3
+      || Object.keys(row).some((key) => !["userId", "worldId", "state"].includes(key))
+      || row.userId !== userId || ids.has(row.worldId)
+      || (row.state !== "hidden" && row.state !== "purged")) throw new Error("Invalid world disposition");
+    requireRecordIdentifier(row.userId, "usr");
+    requireRecordIdentifier(row.worldId, "wrld");
+    if (row.state === "hidden" ? !worldIds.has(row.worldId) : worldIds.has(row.worldId) || eventIds.has(row.worldId)) {
+      throw new Error("World disposition contradicts stored records");
+    }
+    ids.add(row.worldId);
+  }
 }
 
 /**
@@ -907,6 +995,7 @@ function installSchema(database) {
   });
 
   installThumbnailStore(database);
+  installDispositionStore(database);
 
   const favoriteGroups = database.createObjectStore(STORES.favoriteGroups, {
     keyPath: ["userId", "groupId"]
@@ -1005,6 +1094,88 @@ function migrateV2ToV3(database) {
   installThumbnailStore(database);
 }
 
+/** @param {IDBDatabase} database */
+function installDispositionStore(database) {
+  const store = database.createObjectStore(STORES.worldDispositions, { keyPath: ["userId", "worldId"] });
+  store.createIndex("by-user", "userId", { unique: false });
+}
+/** @param {IDBDatabase} database @param {IDBTransaction} transaction */
+function migrateV3ToV4(database, transaction) {
+  installDispositionStore(database);
+  const meta = transaction.objectStore(STORES.meta);
+  const metaRequest = meta.getAll();
+  const eventsRequest = transaction.objectStore(STORES.events).getAll();
+  void Promise.all([requestResult(metaRequest), requestResult(eventsRequest)]).then(([rows, events]) => {
+    for (const row of /** @type {StoredValue[]} */ (rows)) {
+      if (!row.key.startsWith(UNREAD_COUNT_PREFIX)) continue;
+      const userId = row.key.slice(UNREAD_COUNT_PREFIX.length);
+      const legacyCount = unreadCountValue(row, userId);
+      const legacyWorldIds = [...new Set(/** @type {HistoryEvent[]} */ (events)
+        .filter((event) => event.userId === userId).map((event) => event.worldId))].sort();
+      meta.put({ key: unreadTrackingKey(userId), value: {legacyCount, legacyWorldIds, legacyUncertain: false, byWorld: {}} });
+    }
+  }).catch(() => { transaction.abort(); });
+}
+
+/** Read only an unambiguous ownership marker; never put corrupt raw values in errors.
+ * @param {unknown} value @returns {string | null} */
+function thumbnailSettingOwner(value) {
+  if (typeof value !== "object" || value === null || !("userId" in value)) return null;
+  try { requireRecordIdentifier(value.userId, "usr"); } catch { return null; }
+  return /** @type {string} */ (value.userId);
+}
+/** @param {unknown} stored @returns {unknown} */
+function settingValue(stored) { return stored === undefined ? undefined : /** @type {StoredValue} */ (stored).value; }
+/** Remove a target from the old, no-longer-produced cursor without retaining its ID or URL.
+ * @param {unknown} value @param {Set<string>} removed @returns {unknown} */
+function sanitizeThumbnailCursor(value, removed) {
+  if (typeof value === "string") return removed.has(value) ? undefined : value;
+  if (Array.isArray(value)) return value.map((item) => sanitizeThumbnailCursor(item, removed)).filter((item) => item !== undefined);
+  if (typeof value !== "object" || value === null) return value;
+  const record = /** @type {Record<string, unknown>} */ (value);
+  if ([record.id, record.worldId, record.thumbnailImageUrl, record.sourceUrl].some((item) => typeof item === "string" && removed.has(item))) return undefined;
+  return Object.fromEntries(Object.entries(record).filter(([key]) => !removed.has(key)).map(([key, item]) => [key, sanitizeThumbnailCursor(item, removed)]).filter(([, item]) => item !== undefined));
+}
+/** @param {IDBObjectStore} settings @param {unknown} rawJob @param {unknown} rawCursor
+ * @param {string} userId @param {string} worldId @param {number} currentGeneration @param {number} nextGeneration
+ * @param {ThumbnailRecord[]} thumbnails */
+function sanitizePurgedThumbnailSettings(settings, rawJob, rawCursor, userId, worldId, currentGeneration, nextGeneration, thumbnails) {
+  const removed = new Set([worldId]);
+  for (const thumbnail of thumbnails) if (thumbnail.worldId === worldId) removed.add(thumbnail.sourceUrl);
+  if (rawJob !== undefined && rawJob !== null) {
+    const owner = thumbnailSettingOwner(rawJob);
+    if (owner === null) throw new Error("Thumbnail job ownership is inconsistent");
+    if (owner === userId) {
+      let valid = true;
+      try { validateThumbnailJob(rawJob); } catch { valid = false; }
+      if (!valid) {
+        settings.delete("thumbnailJob");
+      } else {
+        const job = /** @type {StoredThumbnailJob} */ (rawJob);
+        for (const item of job.items) if (item.id === worldId) removed.add(item.thumbnailImageUrl);
+        job.items = job.items.filter((item) => item.id !== worldId);
+        if (job.generation === currentGeneration) {
+          job.generation = nextGeneration;
+          const stored = new Map(thumbnails.filter((item) => item.worldId !== worldId).map((item) => [item.worldId, item.sourceUrl]));
+          const pending = job.items.filter((item) => stored.get(item.id) !== item.thumbnailImageUrl);
+          const failed = pending.filter((item) => item.attempts >= 3).length;
+          if (pending.length === 0) { job.state = "complete"; job.nextAttemptAt = null; }
+          else if (pending.length === failed) { job.state = "partial"; job.nextAttemptAt = null; }
+          settings.put({key: "thumbnailJob", value: job});
+          settings.put({key: "thumbnailCaptureStatus", value: {userId, capturedAt: job.capturedAt,
+            saved: job.items.length - pending.length, skipped: 0, failed, deferred: pending.length - failed, retryAt: job.nextAttemptAt}});
+        } else if (job.items.length === 0) settings.delete("thumbnailJob");
+        else settings.put({key: "thumbnailJob", value: job});
+      }
+    }
+  }
+  if (rawCursor !== undefined && rawCursor !== null && thumbnailSettingOwner(rawCursor) === userId) {
+    const cursor = sanitizeThumbnailCursor(rawCursor, removed);
+    if (cursor === undefined) settings.delete("thumbnailCaptureCursor");
+    else settings.put({key: "thumbnailCaptureCursor", value: cursor});
+  }
+}
+
 /**
  * IndexedDB repository used by the extension service worker and UI.
  */
@@ -1053,6 +1224,7 @@ export class DatabaseRepository {
         if (oldVersion < 3) {
           migrateV2ToV3(request.result);
         }
+        if (oldVersion < 4) migrateV3ToV4(request.result, transaction);
       }
       transaction.objectStore(STORES.meta).put({
         key: "schemaVersion",
@@ -1060,7 +1232,7 @@ export class DatabaseRepository {
       });
       transaction.objectStore(STORES.meta).put({
         key: "backupFormatVersion",
-        value: 2
+        value: 3
       });
       transaction.objectStore(STORES.meta).put({
         key: "lastMigration",
@@ -1110,35 +1282,56 @@ export class DatabaseRepository {
    */
   async getSyncSnapshot(userId) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.profiles, STORES.worlds, STORES.favoriteGroups, STORES.meta],
-      "readonly"
-    );
-    const [profileValue, worldValues, favoriteGroupValues, generationRecord] = await completeRead(
-      transaction,
-      Promise.all([
-        getValue(transaction.objectStore(STORES.profiles), userId),
-        getAllValues(
-          transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
-          userId
-        ),
-        getAllValues(
-          transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
-          userId
-        ),
-        getValue(transaction.objectStore(STORES.meta), generationKey(userId))
-      ])
-    );
-    const worlds = /** @type {WorldRecord[]} */ (worldValues);
-    worlds.sort((left, right) => left.worldId.localeCompare(right.worldId));
-    const favoriteGroups = /** @type {FavoriteGroupRecord[]} */ (favoriteGroupValues);
-    favoriteGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
-    return {
-      profile:
-        profileValue === undefined ? null : /** @type {ProfileRecord} */ (profileValue),
-      worlds,
-      favoriteGroups,
-      generation: generationValue(generationRecord, userId)
-    };
+      [STORES.profiles, STORES.worlds, STORES.favoriteGroups, STORES.worldDispositions, STORES.meta], "readonly");
+    const [profile, worlds, favoriteGroups, dispositions, generation, presentation] = await completeRead(transaction, Promise.all([
+      getValue(transaction.objectStore(STORES.profiles), userId),
+      getAllValues(transaction.objectStore(STORES.worlds).index("by-user"), userId),
+      getAllValues(transaction.objectStore(STORES.favoriteGroups).index("by-user"), userId),
+      getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
+      getValue(transaction.objectStore(STORES.meta), generationKey(userId)),
+      getValue(transaction.objectStore(STORES.meta), presentationGenerationKey(userId))
+    ]));
+    return {profile: profile === undefined ? null : /** @type {ProfileRecord} */ (profile),
+      worlds: /** @type {WorldRecord[]} */ (worlds).sort((a, b) => a.worldId.localeCompare(b.worldId)),
+      favoriteGroups: /** @type {FavoriteGroupRecord[]} */ (favoriteGroups).sort((a, b) => a.groupId.localeCompare(b.groupId)),
+      worldDispositions: /** @type {WorldDisposition[]} */ (dispositions).sort((a, b) => a.worldId.localeCompare(b.worldId)),
+      generation: generationValue(generation, userId), presentationGeneration: generationValue(presentation, userId)};
+  }
+
+  /** @param {string} userId @returns {Promise<DisplaySnapshot>} */
+  async getDisplaySnapshot(userId) {
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.profiles, STORES.worlds, STORES.favoriteGroups, STORES.events, STORES.worldDispositions, STORES.meta], "readonly");
+    const [profile, worlds, favoriteGroups, events, dispositions, generation, presentation, unread] = await completeRead(transaction, Promise.all([
+      getValue(transaction.objectStore(STORES.profiles), userId),
+      getAllValues(transaction.objectStore(STORES.worlds).index("by-user"), userId),
+      getAllValues(transaction.objectStore(STORES.favoriteGroups).index("by-user"), userId),
+      getAllValues(transaction.objectStore(STORES.events).index("by-user"), userId),
+      getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
+      getValue(transaction.objectStore(STORES.meta), generationKey(userId)),
+      getValue(transaction.objectStore(STORES.meta), presentationGenerationKey(userId)),
+      getValue(transaction.objectStore(STORES.meta), unreadTrackingKey(userId))
+    ]));
+    return { profile: profile === undefined ? null : /** @type {ProfileRecord} */ (profile),
+      worlds: /** @type {WorldRecord[]} */ (worlds).sort((a, b) => a.worldId.localeCompare(b.worldId)),
+      favoriteGroups: /** @type {FavoriteGroupRecord[]} */ (favoriteGroups).sort((a, b) => a.groupId.localeCompare(b.groupId)),
+      events: /** @type {HistoryEvent[]} */ (events).sort((a, b) => b.observedAt.localeCompare(a.observedAt) || a.eventId.localeCompare(b.eventId)),
+      worldDispositions: /** @type {WorldDisposition[]} */ (dispositions).sort((a, b) => a.worldId.localeCompare(b.worldId)),
+      generation: generationValue(generation, userId), presentationGeneration: generationValue(presentation, userId),
+      unreadSummary: unreadSummary(unreadTrackingValue(unread)) };
+  }
+
+  /** @param {string} userId @returns {Promise<WorldDisposition[]>} */
+  async listWorldDispositions(userId) {
+    const transaction = this.#requireDatabase().transaction(STORES.worldDispositions, "readonly");
+    const rows = await completeRead(transaction, getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId));
+    return /** @type {WorldDisposition[]} */ (rows).sort((a, b) => a.worldId.localeCompare(b.worldId));
+  }
+
+  /** @param {string} userId @returns {Promise<number>} */
+  async getPresentationGeneration(userId) {
+    const transaction = this.#requireDatabase().transaction(STORES.meta, "readonly");
+    return generationValue(await completeRead(transaction, getValue(transaction.objectStore(STORES.meta), presentationGenerationKey(userId))), userId);
   }
 
   /**
@@ -1168,6 +1361,7 @@ export class DatabaseRepository {
         STORES.worlds,
         STORES.favoriteGroups,
         STORES.events,
+        STORES.worldDispositions,
         STORES.settings
       ],
       "readonly"
@@ -1177,6 +1371,7 @@ export class DatabaseRepository {
       worldValues,
       favoriteGroupValues,
       eventValues,
+      dispositionValues,
       autoSyncRecord,
       notificationRecord
     ] =
@@ -1196,6 +1391,7 @@ export class DatabaseRepository {
             transaction.objectStore(STORES.events).index(INDEXES.eventsByUser),
             userId
           ),
+          getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
           getValue(transaction.objectStore(STORES.settings), "autoSyncEnabled"),
           getValue(transaction.objectStore(STORES.settings), "notificationsEnabled")
         ])
@@ -1229,7 +1425,8 @@ export class DatabaseRepository {
       worlds,
       favoriteGroups,
       events,
-      preferences
+      preferences,
+      worldDispositions: /** @type {WorldDisposition[]} */ (dispositionValues).sort((a, b) => a.worldId.localeCompare(b.worldId))
     };
   }
 
@@ -1421,19 +1618,20 @@ export class DatabaseRepository {
       requireGeneration(expectedGeneration, "expectedGeneration");
     }
     const transaction = this.#requireDatabase().transaction(
-      [STORES.thumbnails, STORES.worlds, STORES.settings, STORES.meta],
+      [STORES.thumbnails, STORES.worlds, STORES.worldDispositions, STORES.settings, STORES.meta],
       "readwrite"
     );
     const finished = transactionFinished(transaction);
     try {
-      const [storedPurgePending, storedGeneration, storedWorld, activeProfile] = await Promise.all([
+      const [storedPurgePending, storedGeneration, storedWorld, activeProfile, disposition] = await Promise.all([
         getValue(transaction.objectStore(STORES.settings), "purgePending"),
         getValue(transaction.objectStore(STORES.meta), generationKey(storedRecord.userId)),
         getValue(
           transaction.objectStore(STORES.worlds),
           [storedRecord.userId, storedRecord.worldId]
         ),
-        getValue(transaction.objectStore(STORES.settings), "activeProfileId")
+        getValue(transaction.objectStore(STORES.settings), "activeProfileId"),
+        getValue(transaction.objectStore(STORES.worldDispositions), [storedRecord.userId, storedRecord.worldId])
       ]);
       requireWritesAllowed(storedPurgePending);
       const actualGeneration = generationValue(storedGeneration, storedRecord.userId);
@@ -1447,6 +1645,7 @@ export class DatabaseRepository {
       if (expectedActiveProfileId !== undefined && (activeProfile === undefined || /** @type {StoredValue} */ (activeProfile).value !== expectedActiveProfileId)) {
         throw new GenerationConflictError(storedRecord.userId, expectedGeneration ?? actualGeneration, actualGeneration);
       }
+      if (disposition !== undefined && /** @type {WorldDisposition} */ (disposition).state === "purged") throw new RecordStateConflictError();
       if (storedWorld === undefined) {
         throw new Error(`Thumbnail target world is not stored: ${storedRecord.worldId}`);
       }
@@ -1494,81 +1693,35 @@ export class DatabaseRepository {
     });
   }
 
-  /**
-   * Count profile data without materializing all records. Pending and confirmed
-   * attention states are counted once per world from the same readonly snapshot
-   * as both totals.
-   *
-   * @param {string} userId
-   * @returns {Promise<{
-   *   worldCount: number,
-   *   eventCount: number,
-   *   pendingProbeCount: number,
-   *   attentionWorldCount: number,
-   *   missingCount: number,
-   *   unavailableCount: number
-   * }>}
-   */
+  /** @param {string} userId */
   async getProfileStats(userId) {
     const transaction = this.#requireDatabase().transaction(
-      [STORES.worlds, STORES.events],
-      "readonly"
-    );
-    const worldIndex = transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser);
-    const eventIndex = transaction.objectStore(STORES.events).index(INDEXES.eventsByUser);
-    /** @type {Promise<{
-     *   pendingProbeCount: number,
-     *   attentionWorldCount: number,
-     *   missingCount: number,
-     *   unavailableCount: number
-     * }>} */
-    const worldStateCounts = new Promise((resolve, reject) => {
-      let pendingProbeCount = 0;
-      let attentionWorldCount = 0;
-      let missingCount = 0;
-      let unavailableCount = 0;
-      const request = worldIndex.openCursor(userId);
-      request.addEventListener("error", () => {
-        reject(request.error ?? new Error("IndexedDB profile stats cursor failed"));
-      }, { once: true });
-      request.addEventListener("success", () => {
-        const cursor = request.result;
-        if (cursor === null) {
-          resolve({
-            pendingProbeCount,
-            attentionWorldCount,
-            missingCount,
-            unavailableCount
-          });
-          return;
-        }
-        const world = /** @type {WorldRecord} */ (cursor.value);
-        if (world.probeState === "pending" || world.availabilityState === "unavailable_once") {
-          pendingProbeCount += 1;
-        }
-        const missing = world.membershipState === "not_in_favorites";
-        const unavailable = world.availabilityState === "unavailable";
-        if (missing) {
-          missingCount += 1;
-        }
-        if (unavailable) {
-          unavailableCount += 1;
-        }
-        if (missing || unavailable) {
-          attentionWorldCount += 1;
-        }
-        cursor.continue();
-      });
-    });
-    const [worldCount, eventCount, stateCounts] = await completeRead(
-      transaction,
-      Promise.all([
-        requestResult(worldIndex.count(userId)),
-        requestResult(eventIndex.count(userId)),
-        worldStateCounts
-      ])
-    );
-    return { worldCount, eventCount, ...stateCounts };
+      [STORES.worlds, STORES.events, STORES.worldDispositions, STORES.meta], "readonly");
+    const [worldValues, eventCount, dispositions, generation, presentation, unread] = await completeRead(transaction, Promise.all([
+      getAllValues(transaction.objectStore(STORES.worlds).index("by-user"), userId),
+      requestResult(transaction.objectStore(STORES.events).index("by-user").count(userId)),
+      getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
+      getValue(transaction.objectStore(STORES.meta), generationKey(userId)),
+      getValue(transaction.objectStore(STORES.meta), presentationGenerationKey(userId)),
+      getValue(transaction.objectStore(STORES.meta), unreadTrackingKey(userId))
+    ]));
+    const hidden = new Set(/** @type {WorldDisposition[]} */ (dispositions).filter((row) => row.state === "hidden").map((row) => row.worldId));
+    const worlds = /** @type {WorldRecord[]} */ (worldValues);
+    const visible = worlds.filter((world) => !hidden.has(world.worldId));
+    return { worldCount: worlds.length, eventCount, hiddenCount: hidden.size,
+      pendingProbeCount: visible.filter((world) => world.probeState === "pending" || world.availabilityState === "unavailable_once").length,
+      attentionWorldCount: visible.filter((world) => world.membershipState === "not_in_favorites" || world.availabilityState === "unavailable").length,
+      missingCount: visible.filter((world) => world.membershipState === "not_in_favorites").length,
+      unavailableCount: visible.filter((world) => world.availabilityState === "unavailable").length,
+      generation: generationValue(generation, userId), presentationGeneration: generationValue(presentation, userId),
+      unreadSummary: unreadSummary(unreadTrackingValue(unread)) };
+  }
+
+  /** @param {string} userId @returns {Promise<UnreadSummary>} */
+  async getUnreadSummary(userId) {
+    const transaction = this.#requireDatabase().transaction(STORES.meta, "readonly");
+    const stored = await completeRead(transaction, getValue(transaction.objectStore(STORES.meta), unreadTrackingKey(userId)));
+    return unreadSummary(unreadTrackingValue(stored));
   }
 
   /**
@@ -1600,7 +1753,7 @@ export class DatabaseRepository {
         "purgePending"
       );
       requireWritesAllowed(storedPurgePending);
-      transaction.objectStore(STORES.meta).put({ key: unreadCountKey(userId), value: 0 });
+      putUnreadTracking(transaction.objectStore(STORES.meta), userId, emptyUnreadTracking());
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -1659,7 +1812,7 @@ export class DatabaseRepository {
    */
   async setThumbnailSettings(userId, expectedGeneration, updates) {
     requireGeneration(expectedGeneration, "expectedGeneration");
-    const transaction = this.#requireDatabase().transaction([STORES.settings, STORES.meta], "readwrite");
+    const transaction = this.#requireDatabase().transaction([STORES.settings, STORES.meta, STORES.worldDispositions], "readwrite");
     const finished = transactionFinished(transaction);
     try {
       const settings = transaction.objectStore(STORES.settings);
@@ -1672,6 +1825,15 @@ export class DatabaseRepository {
       const actual = generationValue(generation, userId);
       if (actual !== expectedGeneration || active === undefined || /** @type {StoredValue} */ (active).value !== userId) {
         throw new GenerationConflictError(userId, expectedGeneration, actual);
+      }
+      const job = updates.thumbnailJob;
+      if (job !== undefined && job !== null) {
+        validateThumbnailJob(job);
+        const checkedJob = /** @type {StoredThumbnailJob} */ (job);
+        if (checkedJob.userId !== userId || checkedJob.generation !== expectedGeneration) throw new RecordStateConflictError();
+        const dispositions = await getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId);
+        const purged = new Set(/** @type {WorldDisposition[]} */ (dispositions).filter((row) => row.state === "purged").map((row) => row.worldId));
+        if (checkedJob.items.some((item) => purged.has(item.id))) throw new RecordStateConflictError();
       }
       putSettings(settings, updates);
     } catch (error) {
@@ -1735,6 +1897,75 @@ export class DatabaseRepository {
       return abortAndThrow(transaction, error, finished);
     }
     await finished;
+  }
+
+  /** @param {RecordMutation} input */
+  hideWorld(input) { return this.#mutateRecord(input, "hide"); }
+  /** @param {RecordMutation} input */
+  restoreHiddenWorld(input) { return this.#mutateRecord(input, "restore"); }
+  /** @param {RecordMutation} input */
+  purgeHiddenWorld(input) { return this.#mutateRecord(input, "purge"); }
+
+  /** @param {RecordMutation} input @param {"hide" | "restore" | "purge"} action
+   * @returns {Promise<{generation: number, presentationGeneration: number}>} */
+  async #mutateRecord(input, action) {
+    const {userId, worldId, expectedGeneration, expectedPresentationGeneration, expectedRevision} = input;
+    requireRecordIdentifier(userId, "usr");
+    requireRecordIdentifier(worldId, "wrld");
+    requireGeneration(expectedGeneration, "expectedGeneration");
+    requireGeneration(expectedPresentationGeneration, "expectedPresentationGeneration");
+    requireGeneration(expectedRevision, "expectedRevision");
+    const transaction = this.#requireDatabase().transaction(
+      [STORES.profiles, STORES.worlds, STORES.thumbnails, STORES.events, STORES.worldDispositions, STORES.settings, STORES.meta], "readwrite");
+    const finished = transactionFinished(transaction);
+    /** @type {number} */
+    let generation;
+    /** @type {number} */
+    let presentationGeneration;
+    try {
+      const settings = transaction.objectStore(STORES.settings);
+      const meta = transaction.objectStore(STORES.meta);
+      const dispositions = transaction.objectStore(STORES.worldDispositions);
+      const [purge, active, profile, storedWorld, disposition, storedGeneration, presentation, unread, job, cursor, thumbnails, events] = await Promise.all([
+        getValue(settings, "purgePending"), getValue(settings, "activeProfileId"),
+        getValue(transaction.objectStore(STORES.profiles), userId),
+        getValue(transaction.objectStore(STORES.worlds), [userId, worldId]),
+        getValue(dispositions, [userId, worldId]),
+        getValue(meta, generationKey(userId)), getValue(meta, presentationGenerationKey(userId)),
+        getValue(meta, unreadTrackingKey(userId)), getValue(settings, "thumbnailJob"), getValue(settings, "thumbnailCaptureCursor"),
+        action === "purge" ? getAllValues(transaction.objectStore(STORES.thumbnails).index("by-user"), userId) : Promise.resolve([]),
+        action === "purge" ? getAllValues(transaction.objectStore(STORES.events).index("by-user"), userId) : Promise.resolve([])
+      ]);
+      requireWritesAllowed(purge);
+      generation = generationValue(storedGeneration, userId);
+      if (generation !== expectedGeneration) throw new GenerationConflictError(userId, expectedGeneration, generation);
+      if (generationValue(presentation, userId) !== expectedPresentationGeneration || settingValue(active) !== userId || profile === undefined || storedWorld === undefined) throw new RecordStateConflictError();
+      const world = /** @type {WorldRecord} */ (storedWorld);
+      if (world.revision !== expectedRevision) throw new RevisionConflictError(worldId);
+      if (action === "hide") {
+        if (disposition !== undefined || (world.membershipState !== "not_in_favorites" && world.availabilityState !== "unavailable")) throw new RecordStateConflictError();
+      } else if (disposition === undefined || /** @type {WorldDisposition} */ (disposition).state !== "hidden") throw new RecordStateConflictError();
+      presentationGeneration = incrementGeneration(expectedPresentationGeneration, userId);
+      if (action === "restore") dispositions.delete([userId, worldId]);
+      else dispositions.put({userId, worldId, state: action === "hide" ? "hidden" : "purged"});
+      if (action === "purge") {
+        generation = incrementGeneration(generation, userId);
+        sanitizePurgedThumbnailSettings(settings, settingValue(job), settingValue(cursor), userId, worldId, expectedGeneration, generation, /** @type {ThumbnailRecord[]} */ (thumbnails));
+        transaction.objectStore(STORES.worlds).delete([userId, worldId]);
+        transaction.objectStore(STORES.thumbnails).delete([userId, worldId]);
+        for (const event of /** @type {HistoryEvent[]} */ (events)) if (event.worldId === worldId) transaction.objectStore(STORES.events).delete(event.eventId);
+        const tracking = unreadTrackingValue(unread);
+        delete tracking.byWorld[worldId];
+        if (tracking.legacyCount > 0 && tracking.legacyWorldIds.includes(worldId)) tracking.legacyUncertain = true;
+        tracking.legacyWorldIds = tracking.legacyWorldIds.filter((id) => id !== worldId);
+        if (tracking.legacyWorldIds.length === 0) { tracking.legacyCount = 0; tracking.legacyUncertain = false; }
+        putUnreadTracking(meta, userId, tracking);
+        meta.put({key: generationKey(userId), value: generation});
+      }
+      meta.put({key: presentationGenerationKey(userId), value: presentationGeneration});
+    } catch (error) { return abortAndThrow(transaction, error, finished); }
+    await finished;
+    return {generation, presentationGeneration};
   }
 
   /**
@@ -1807,10 +2038,19 @@ export class DatabaseRepository {
       committedEventIds.add(event.eventId);
     }
 
+    const released = new Set(commit.releasedPurgedWorldIds ?? []);
+    if (released.size !== (commit.releasedPurgedWorldIds ?? []).length) throw new Error("Duplicate purge release");
+    for (const id of released) {
+      requireRecordIdentifier(id, "wrld");
+      const world = commit.worlds.find((world) => world.worldId === id);
+      if (world === undefined || world.membershipState !== "favorited" || world.availabilityState !== "accessible"
+        || typeof world.currentName !== "string" || world.currentName.trim() === "" || commit.events.some((event) => event.worldId === id)) throw new RecordStateConflictError();
+    }
     const transaction = this.#requireDatabase().transaction(
       [
         STORES.profiles,
         STORES.worlds,
+        STORES.worldDispositions,
         STORES.favoriteGroups,
         STORES.events,
         STORES.syncRuns,
@@ -1831,13 +2071,15 @@ export class DatabaseRepository {
       const [
         storedPurgePending,
         storedGeneration,
-        storedUnreadCount,
+        storedUnreadTracking,
+        currentDispositions,
         currentWorlds,
         currentEvents
       ] = await Promise.all([
         getValue(settingsStore, "purgePending"),
         getValue(metaStore, generationKey(commit.profile.userId)),
-        getValue(metaStore, unreadCountKey(commit.profile.userId)),
+        getValue(metaStore, unreadTrackingKey(commit.profile.userId)),
+        getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), commit.profile.userId),
         Promise.all(
           commit.worlds.map((world) => getValue(worldStore, [world.userId, world.worldId]))
         ),
@@ -1853,6 +2095,9 @@ export class DatabaseRepository {
         );
       }
       nextGeneration = incrementGeneration(actualGeneration, commit.profile.userId);
+      const purged = new Set(/** @type {WorldDisposition[]} */ (currentDispositions).filter((row) => row.state === "purged").map((row) => row.worldId));
+      for (const id of released) if (!purged.has(id)) throw new RecordStateConflictError();
+      for (const world of commit.worlds) if (purged.has(world.worldId) && !released.has(world.worldId)) throw new RecordStateConflictError();
 
       for (let index = 0; index < commit.worlds.length; index += 1) {
         const next = commit.worlds[index];
@@ -1867,6 +2112,7 @@ export class DatabaseRepository {
           throw new Error(`Missing expected world revision: ${next.worldId}`);
         }
         const expectedRevision = expectedRevisions.get(expectedKey);
+        if (released.has(next.worldId) && (currentRevision !== null || expectedRevision !== null)) throw new RecordStateConflictError();
         const conflictsWithSnapshot = currentRevision !== expectedRevision;
         const plannedRevisionMovesBackwards =
           expectedRevision !== undefined &&
@@ -1880,10 +2126,8 @@ export class DatabaseRepository {
         }
       }
 
-      const currentUnreadCount = unreadCountValue(
-        storedUnreadCount,
-        commit.profile.userId
-      );
+      const tracking = unreadTrackingValue(storedUnreadTracking);
+      const currentUnreadCount = trackedUnreadCount(tracking);
       let newEventCount = 0;
       for (let index = 0; index < commit.events.length; index += 1) {
         const plannedEvent = commit.events[index];
@@ -1893,6 +2137,7 @@ export class DatabaseRepository {
         }
         if (currentEvent === undefined) {
           newEventCount += 1;
+          tracking.byWorld[plannedEvent.worldId] = (tracking.byWorld[plannedEvent.worldId] ?? 0) + 1;
         } else if (!sameEventPayload(/** @type {HistoryEvent} */ (currentEvent), plannedEvent)) {
           throw new Error(`Event ID collision: ${plannedEvent.eventId}`);
         }
@@ -1901,6 +2146,7 @@ export class DatabaseRepository {
         throw new RangeError(`Unread event count is exhausted: ${commit.profile.userId}`);
       }
 
+      for (const id of released) transaction.objectStore(STORES.worldDispositions).delete([commit.profile.userId, id]);
       transaction.objectStore(STORES.profiles).put(commit.profile);
       for (const world of commit.worlds) {
         worldStore.put(world);
@@ -1931,10 +2177,7 @@ export class DatabaseRepository {
         key: generationKey(commit.profile.userId),
         value: nextGeneration
       });
-      metaStore.put({
-        key: unreadCountKey(commit.profile.userId),
-        value: currentUnreadCount + newEventCount
-      });
+      putUnreadTracking(metaStore, commit.profile.userId, tracking);
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -2133,14 +2376,14 @@ export class DatabaseRepository {
   /**
    * Atomically replace profile/world/event data for exactly one user and merge
    * explicitly supplied boolean preferences. Other users are untouched.
-   * Metadata-only backups do not contain image Blobs, so thumbnails are
-   * intentionally outside this replacement transaction and remain unchanged.
+   * Metadata-only backups preserve cached images, except IDs explicitly
+   * marked purged in the replacement, which are erased in this transaction.
    *
    * @param {ProfileReplacement} replacement
    * @returns {Promise<number>} the replacement data generation
    */
   async replaceProfileData(replacement) {
-    const { profile, worlds, favoriteGroups, events, preferences = {} } = replacement;
+    const { profile, worlds, favoriteGroups, events, preferences = {}, worldDispositions = [] } = replacement;
     if (worlds.some((world) => world.userId !== profile.userId)) {
       throw new Error("Replacement contains a world owned by another profile");
     }
@@ -2149,6 +2392,7 @@ export class DatabaseRepository {
     }
     validateFavoriteGroupPlan(favoriteGroups, profile.userId);
     validateEventPlan(events);
+    validateDispositions(worldDispositions, profile.userId, worlds, events);
     for (const key of Object.keys(preferences)) {
       if (!BACKUP_PREFERENCE_KEYS.includes(key)) {
         throw new Error(`Replacement contains an unsafe preference: ${key}`);
@@ -2162,6 +2406,8 @@ export class DatabaseRepository {
       [
         STORES.profiles,
         STORES.worlds,
+        STORES.worldDispositions,
+        STORES.thumbnails,
         STORES.favoriteGroups,
         STORES.events,
         STORES.settings,
@@ -2175,9 +2421,13 @@ export class DatabaseRepository {
 
     try {
       const metaStore = transaction.objectStore(STORES.meta);
-      const [storedPurgePending, storedGeneration] = await Promise.all([
+      const [storedPurgePending, storedGeneration, presentation, job, cursor, captureStatus] = await Promise.all([
         getValue(transaction.objectStore(STORES.settings), "purgePending"),
-        getValue(metaStore, generationKey(profile.userId))
+        getValue(metaStore, generationKey(profile.userId)),
+        getValue(metaStore, presentationGenerationKey(profile.userId)),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailJob"),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailCaptureCursor"),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailCaptureStatus")
       ]);
       requireWritesAllowed(storedPurgePending);
       nextGeneration = incrementGeneration(
@@ -2185,6 +2435,7 @@ export class DatabaseRepository {
         profile.userId
       );
       await Promise.all([
+        deleteByIndex(transaction.objectStore(STORES.worldDispositions).index("by-user"), profile.userId),
         deleteByIndex(
           transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
           profile.userId
@@ -2212,12 +2463,23 @@ export class DatabaseRepository {
       for (const event of events) {
         eventStore.put(event);
       }
+      const dispositionStore = transaction.objectStore(STORES.worldDispositions);
+      for (const row of worldDispositions) {
+        dispositionStore.put(row);
+        if (row.state === "purged") transaction.objectStore(STORES.thumbnails).delete([profile.userId, row.worldId]);
+      }
       const settingStore = transaction.objectStore(STORES.settings);
+      for (const [key, stored] of [["thumbnailJob", job], ["thumbnailCaptureCursor", cursor], ["thumbnailCaptureStatus", captureStatus]]) {
+        const value = settingValue(stored);
+        if (value !== undefined && value !== null && thumbnailSettingOwner(value) === profile.userId) settingStore.delete(/** @type {string} */ (key));
+        else if (key === "thumbnailJob" && value !== undefined && value !== null && thumbnailSettingOwner(value) === null) throw new Error("Thumbnail job ownership is inconsistent");
+      }
       for (const key of Object.keys(preferences)) {
         settingStore.put({ key, value: preferences[key] });
       }
       metaStore.put({ key: generationKey(profile.userId), value: nextGeneration });
-      metaStore.put({ key: unreadCountKey(profile.userId), value: 0 });
+      metaStore.put({key: presentationGenerationKey(profile.userId), value: incrementGeneration(generationValue(presentation, profile.userId), profile.userId)});
+      putUnreadTracking(metaStore, profile.userId, emptyUnreadTracking());
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -2247,6 +2509,7 @@ export class DatabaseRepository {
       [
         STORES.profiles,
         STORES.worlds,
+        STORES.worldDispositions,
         STORES.thumbnails,
         STORES.favoriteGroups,
         STORES.events,
@@ -2261,14 +2524,19 @@ export class DatabaseRepository {
     let nextGeneration;
     try {
       const metaStore = transaction.objectStore(STORES.meta);
-      const [storedPurgePending, storedGeneration] = await Promise.all([
+      const [storedPurgePending, storedGeneration, presentation, job, cursor, captureStatus] = await Promise.all([
         getValue(transaction.objectStore(STORES.settings), "purgePending"),
-        getValue(metaStore, generationKey(userId))
+        getValue(metaStore, generationKey(userId)),
+        getValue(metaStore, presentationGenerationKey(userId)),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailJob"),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailCaptureCursor"),
+        getValue(transaction.objectStore(STORES.settings), "thumbnailCaptureStatus")
       ]);
       requireWritesAllowed(storedPurgePending);
       nextGeneration = incrementGeneration(generationValue(storedGeneration, userId), userId);
       transaction.objectStore(STORES.profiles).delete(userId);
       await Promise.all([
+        deleteByIndex(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
         deleteByIndex(
           transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
           userId
@@ -2292,6 +2560,11 @@ export class DatabaseRepository {
       ]);
       metaStore.put({ key: generationKey(userId), value: nextGeneration });
       metaStore.delete(unreadCountKey(userId));
+      metaStore.delete(unreadTrackingKey(userId));
+      metaStore.put({key: presentationGenerationKey(userId), value: incrementGeneration(generationValue(presentation, userId), userId)});
+      for (const [key, stored] of [["thumbnailJob", job], ["thumbnailCaptureCursor", cursor], ["thumbnailCaptureStatus", captureStatus]]) {
+        if (thumbnailSettingOwner(settingValue(stored)) === userId) transaction.objectStore(STORES.settings).delete(/** @type {string} */ (key));
+      }
     } catch (error) {
       return abortAndThrow(transaction, error, finished);
     }
@@ -2319,7 +2592,7 @@ export class DatabaseRepository {
       transaction.objectStore(STORES.settings).put({ key: "purgePending", value: true });
       const metaStore = transaction.objectStore(STORES.meta);
       metaStore.put({ key: "schemaVersion", value: DATABASE_VERSION });
-      metaStore.put({ key: "backupFormatVersion", value: 2 });
+      metaStore.put({ key: "backupFormatVersion", value: 3 });
       metaStore.put({ key: "lastMigration", value: DATABASE_VERSION });
     } catch (error) {
       return abortAndThrow(transaction, error, finished);

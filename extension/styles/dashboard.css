@@ -1,13 +1,13 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   font-family: "Noto Sans JP", "Yu Gothic UI", system-ui, sans-serif;
   font-synthesis: none;
-  color: #f6f6fb;
-  background: #131925;
-  --muted: #b5bfd0;
-  --surface: #1d2635;
-  --border: #41516a;
-  --accent: #8ae9dc;
+  color: #252923;
+  background: #F7F6F2;
+  --muted: #5C635A;
+  --surface: #FFFFFF;
+  --border: #D4D8CF;
+  --accent: #356447;
 }
 
 * {
@@ -33,7 +33,7 @@ button, summary, a, input, select {
 }
 button:focus-visible, a:focus-visible, summary:focus-visible,
 input:focus-visible, select:focus-visible, .file-button:focus-within {
-  outline: 3px solid #ffd48a;
+  outline: 3px solid #356447;
   outline-offset: 4px;
 }
 .tab-panel:focus {
@@ -96,32 +96,34 @@ main {
   cursor: pointer;
 }
 .button:hover:not(:disabled) {
-  filter: brightness(1.1);
+  border-color: #356447;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .button:disabled {
   cursor: wait;
-  color: #c4cede;
-  background: #344157;
-  border-color: #53637c;
+  color: #5C635A;
+  background: #E9EAE4;
+  border-color: #7B8178;
 }
 .button-primary {
-  color: #10252a;
-  background: #8ae9dc;
+  color: #FFFFFF;
+  background: #356447;
 }
 .button-secondary {
-  color: #f6f6fb;
-  background: #344157;
-  border-color: #60708a;
+  color: #252923;
+  background: #E7EEE7;
+  border-color: #7B8178;
 }
 .button-ghost {
-  color: #e0e7f1;
-  background: #1d2635;
-  border-color: #60708a;
+  color: #252923;
+  background: #FFFFFF;
+  border-color: #7B8178;
 }
 .button-danger {
-  color: #ffe0d9;
-  background: #582e32;
-  border-color: #b57573;
+  color: #8B3028;
+  background: #F8ECE9;
+  border-color: #8B3028;
 }
 .primary-focus {
   margin-bottom: 22px;
@@ -136,7 +138,7 @@ main {
   font-size: 14px;
 }
 .primary-focus.is-alert h2 {
-  color: #ffcfb8;
+  color: #725321;
 }
 .primary-focus .meaning-note {
   font-size: 12px;
@@ -148,10 +150,10 @@ main {
   gap: 20px;
   margin-bottom: 24px;
   padding: 16px 18px;
-  border: 1px solid #a37b4d;
+  border: 1px solid #725321;
   border-radius: 10px;
-  color: #ffe5bd;
-  background: #342c29;
+  color: #725321;
+  background: #FAF0D9;
 }
 .notice-panel p {
   margin: 6px 0 0;
@@ -184,7 +186,7 @@ main {
 }
 .filter-panel > summary, .record-status > summary {
   padding: 14px 0;
-  color: #d9e4f2;
+  color: #252923;
   font-size: 13px;
   cursor: pointer;
 }
@@ -211,29 +213,29 @@ main {
   width: 100%;
   min-height: 44px;
   padding: 8px 12px;
-  border: 1px solid #79899f;
+  border: 1px solid #7B8178;
   border-radius: 7px;
 }
 .search-field input {
-  color: #f6f6fb;
-  background: #1d2635;
+  color: #252923;
+  background: #FFFFFF;
 }
 input::placeholder {
-  color: #b5bfd0;
+  color: #5C635A;
 }
 select {
   color-scheme: light;
 }
 select option {
-  color: #15142a;
+  color: #252923;
   background-color: #fff;
 }
 select option:checked {
-  color: #15142a;
-  background-color: #9bc7f5;
+  color: #252923;
+  background-color: #E7EEE7;
 }
 .select-field select {
-  color: #15142a;
+  color: #252923;
   background: #fff;
 }
 .result-count {
@@ -263,7 +265,7 @@ select option:checked {
   align-items: start;
 }
 .world-card.is-unavailable {
-  border-color: #a57365;
+  border-color: #8B3028;
 }
 .world-thumbnail {
   grid-row: span 2;
@@ -273,8 +275,8 @@ select option:checked {
   aspect-ratio: 16 / 9;
   overflow: hidden;
   border-radius: 8px;
-  color: #c4cede;
-  background: #2a374a;
+  color: #5C635A;
+  background: #E9EAE4;
   font-size: 12px;
   text-align: center;
 }
@@ -302,7 +304,7 @@ select option:checked {
   line-height: 1.7;
 }
 .world-group-meta {
-  color: #c4cede;
+  color: #5C635A;
 }
 .world-details {
   margin-top: 8px;
@@ -322,23 +324,23 @@ select option:checked {
 .state-tag {
   padding: 5px 10px;
   border-radius: 6px;
-  color: #dae5f5;
-  background: #344157;
+  color: #356447;
+  background: #E7EEE7;
   font-size: 12px;
   font-weight: 650;
 }
 .state-tag.is-warning {
-  color: #ffdacb;
-  background: #53372f;
+  color: #8B3028;
+  background: #F8ECE9;
 }
 .state-tag.is-pending {
-  color: #ffe2a8;
-  background: #493d25;
+  color: #725321;
+  background: #FAF0D9;
 }
 .empty-state {
   padding: 48px 16px;
   text-align: center;
-  color: #e0e7f1;
+  color: #252923;
 }
 .empty-state p {
   color: var(--muted);
@@ -356,13 +358,13 @@ select option:checked {
   font-size: 13px;
 }
 .badge.is-error {
-  color: #ffbeac;
+  color: #8B3028;
 }
 .badge.is-ready {
   color: var(--accent);
 }
 .badge.is-attention {
-  color: #ffe2a8;
+  color: #725321;
 }
 .page-navigation {
   display: flex;
@@ -376,15 +378,15 @@ select option:checked {
   font-size: 13px;
 }
 .page-navigation .is-active {
-  color: #f6f6fb;
+  color: #252923;
   font-weight: 750;
 }
 .tab-count {
   display: inline-block;
   padding: 1px 6px;
   border-radius: 5px;
-  color: #15202e;
-  background: #ffcfb8;
+  color: #FFFFFF;
+  background: #725321;
   font-size: 11px;
 }
 .section-heading {
@@ -459,7 +461,7 @@ select option:checked {
   width: 24px;
   height: 24px;
   flex-shrink: 0;
-  accent-color: #8ae9dc;
+  accent-color: #356447;
 }
 .sync-details {
   display: grid;
@@ -475,7 +477,7 @@ select option:checked {
 }
 .sync-details dd {
   margin: 0;
-  color: #e0e7f1;
+  color: #252923;
   text-align: right;
 }
 .stacked-actions {
@@ -494,15 +496,15 @@ select option:checked {
   cursor: pointer;
 }
 .form-message {
-  color: #ffd0bf !important;
+  color: #8B3028 !important;
   font-size: 13px;
 }
 .storage-warning {
-  color: #ffe2a8 !important;
+  color: #725321 !important;
 }
 .danger-card {
   grid-column: 1 / -1;
-  border-color: #a57365;
+  border-color: #8B3028;
 }
 .privacy-card ul {
   padding-left: 20px;
@@ -566,4 +568,64 @@ select option:checked {
   .page-navigation .is-active {
     text-decoration-thickness: 3px;
   }
+}
+
+.button-primary:hover:not(:disabled) { background: #294F38; color: #FFFFFF; }
+.button-secondary:hover:not(:disabled), .button-ghost:hover:not(:disabled) { background: #E7EEE7; }
+
+.button-danger-quiet {
+  color: #8B3028;
+  background: #FFFFFF;
+  border-color: #7B8178;
+}
+.button-danger-quiet:hover:not(:disabled), .button-danger:hover:not(:disabled) {
+  color: #8B3028;
+  background: #F8ECE9;
+  border-color: #8B3028;
+}
+.world-actions {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.world-thumbnail { grid-row: span 3; }
+.hidden-records-link { margin: 0 0 8px; font-size: 13px; }
+.hidden-records-link a { display: inline-flex; align-items: center; min-height: 44px; }
+.history-hidden-label { display: inline-block; margin-left: 8px; vertical-align: middle; }
+.state-tag.is-hidden { color: #5C635A; background: #E9EAE4; }
+.section-label { color: var(--muted); letter-spacing: .04em; }
+.page-navigation a { display: inline-flex; align-items: center; gap: 4px; min-height: 44px; }
+.world-details summary, .event-card summary { min-height: 44px; padding-block: 12px; }
+.thumbnail-retry { min-height: 44px; color: #356447; background: #FFFFFF; border: 1px solid #7B8178; border-radius: 6px; cursor: pointer; }
+.record-dialog {
+  width: min(560px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 24px;
+  overflow-y: auto;
+  color: #252923;
+  background: #FFFFFF;
+  border: 1px solid #7B8178;
+  border-radius: 12px;
+}
+.record-dialog::backdrop { background: rgb(37 41 35 / 48%); }
+.record-dialog h2 { font-size: 22px; }
+.record-dialog p { font-size: 14px; white-space: pre-line; }
+.record-dialog-target { overflow-wrap: anywhere; }
+.record-dialog-target img { display: block; width: 192px; max-width: 100%; aspect-ratio: 16 / 9; object-fit: cover; margin-top: 12px; border-radius: 8px; }
+.dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 20px; }
+.sync-details dt, .sync-details dd { overflow-wrap: anywhere; min-width: 0; }
+@media (max-width: 680px) { .world-actions { grid-column: 1 / -1; } }
+@media (max-width: 420px) {
+  .world-card { grid-template-columns: minmax(0, 1fr); }
+  .world-thumbnail { width: min(192px, 100%); grid-row: auto; }
+  .world-actions { grid-column: 1; }
+  .settings-card { padding: 18px; }
+  .record-dialog { padding: 18px; }
+  .dialog-actions { display: grid; grid-template-columns: 1fr; }
+}
+@media (forced-colors: active) {
+  .record-dialog { border-color: CanvasText; }
+  .record-dialog::backdrop { background: Canvas; opacity: .6; }
+  .button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible { outline-color: Highlight; }
 }

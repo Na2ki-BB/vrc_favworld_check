@@ -341,7 +341,7 @@ API adapter の外側で `any` を使用しない。境界入力は `unknown` �
 
 ## 8. IndexedDB データモデル
 
-DB 名は `vrc-favworld-check`、schema version 3 とする。version 1からversion 2では新しいstore・indexと同期記録の保持キーをmigration transaction内で追加し、既存eventには当時存在した全kindが通知対象だったことを表す`notificationEligible: true`だけを同じtransactionで補完する。version 3では既存recordを書き換えず`thumbnails` storeを追加する。全 user-owned record は VRChat user ID で分離する。
+DB 名は `vrc-favworld-check`、schema version 4 とする。version 1からversion 2では新しいstore・indexと同期記録の保持キーをmigration transaction内で追加し、既存eventには当時存在した全kindが通知対象だったことを表す`notificationEligible: true`だけを同じtransactionで補完する。version 3では既存recordを書き換えず`thumbnails` storeを追加する。version 4では`worldDispositions` storeと旧未読の互換追跡を追加し、既存画像・状態・通知claimを保持する。全 user-owned record は VRChat user ID で分離する。
 
 ### 8.1 `profiles`
 
@@ -453,7 +453,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 ### 8.7 `settings` と `meta`
 
 - `settings`: 定期同期、通知、直近手動同期時刻、`nextSyncAt`、主要API用`backoffUntil`、画像専用`thumbnailBackoffUntil`、画像取得集計`thumbnailCaptureStatus`、飽和カウンター、最後に選択した profile、グループ情報の鮮度、最後のバックアップ日時、全消去中の fail-closed gate。
-- `meta`: schema version、最終 migration、バックアップ形式 version、profile ごとの単調増加 `dataGeneration` と未読件数。generation と未読件数は端末内の制御用でバックアップへ含めない。
+- `meta`: schema version、最終 migration、バックアップ形式 version、profile ごとの単調増加 `dataGeneration`、表示専用の `presentationGeneration`、未読件数と互換追跡。世代と未読追跡は端末内の制御用でバックアップへ含めない。
 
 同期 lock は Service Worker の単一 flight promise で管理する。イベントが重なった場合は既存 promise を共有する。Service Worker 終了で lock も消えるため、永続データの commit は短い 1 transaction に限定し、未完了 fetch は状態を変えない。
 
@@ -484,24 +484,25 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 ```json
 {
   "format": "vrc_favworld_check-backup",
-  "version": 2,
+  "version": 3,
   "exportedAt": "2026-08-17T00:00:00.000Z",
   "appVersion": "<current-version>",
   "profile": {},
   "worlds": [],
   "favoriteGroups": [],
+  "worldDispositions": [],
   "events": [],
   "preferences": {}
 }
 ```
 
-- 1 ファイルは `profile` 1 件と、その `userId` に属する `worlds`、`favoriteGroups`、`events` だけを含む。複数 profile を含めない。
+- 1 ファイルは `profile` 1 件と、その `userId` に属する `worlds`、`favoriteGroups`、`events`、`worldDispositions` を含む。複数 profile を含めない。
 - version 1 は `favoriteGroups: []` を補完して取り込む。version 2 のグループ ID、内部名の一意性、owner、type、表示名履歴を厳格検証し、未知の将来 version は拒否する。
-- `thumbnails`、`syncRuns`、lock、backoff、認証応答は含めない。画像なしのJSON復元は対象profileにすでにあるthumbnailを保持し、現在アクセスできるワールドの不足画像は後続同期で再取得する。event作成時に固定した`notificationEligible`と、`notificationClaimedAt`、`notifiedAt`、`notificationError`はat-most-once状態を保つためeventとともに含める。通知対象かつ未claimのimport eventだけ、復元時に`notificationClaimedAt = max(restoredAt, observedAt)`とし、時計ずれで日時順序を壊さず、復元を過去通知の起点にしない。通知対象外eventはdelivery stateを持たない。
+- `thumbnails`、`syncRuns`、lock、backoff、認証応答は含めない。画像なしのJSON復元はversion 3でpurgedのIDを除き対象profileにすでにあるthumbnailを保持し、現在アクセスできるワールドの不足画像は後続同期で再取得する。event作成時に固定した`notificationEligible`と、`notificationClaimedAt`、`notifiedAt`、`notificationError`はat-most-once状態を保つためeventとともに含める。通知対象かつ未claimのimport eventだけ、復元時に`notificationClaimedAt = max(restoredAt, observedAt)`とし、時計ずれで日時順序を壊さず、復元を過去通知の起点にしない。通知対象外eventはdelivery stateを持たない。
 - `preferences` は定期同期と通知の有効・無効など明示した安全な利用者設定だけを含め、端末固有時刻、選択 profile、`backoffUntil`、`consecutiveRateLimits` は除外する。
-- エクスポートは profile、worlds、events、安全な preferences を同一 read-only transaction で snapshot として読み、安定した key 順、world ID / event ID 順に並べる。
+- エクスポートは profile、worlds、favoriteGroups、events、worldDispositions、安全な preferences を同一 read-only transaction で snapshot として読み、安定した key 順、world ID / event ID 順に並べる。
 - 復元は JSON parse 後に prototype を持たない値へ正規化し、件数、文字列長、ID、日時、enum、参照を検証する。受理したUTC日時は必ず小数秒3桁の`toISOString()`形式へ変換してから、時刻の最大値や前後関係を文字列比較する。
-- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds`、`favoriteGroups`、`events` key rangeだけを削除・再作成し、profile世代番号を増やす。既存`thumbnails`と他userのrecordを触らず、同じtransactionでallowlist済みglobal preferencesだけを既存settingsへmergeする。失敗時は全profile、世代、settingsの処理前状態を維持する。
+- 対応 schema だけを新しい object graph として作る。1 read-write transaction 内で対象 `userId` の `profiles` 1 件、`worlds`、`favoriteGroups`、`events`、`worldDispositions` key rangeを削除・再作成し、profileのデータ世代と表示世代を増やす。purged対象の`thumbnails`も同じtransactionで消去する。それ以外の画像と他userのrecordを触らず、同じtransactionでallowlist済みglobal preferencesだけを既存settingsへmergeする。失敗時は全profile、世代、settingsの処理前状態を維持する。
 
 ## 11. UI 状態設計
 
@@ -520,7 +521,7 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 ### 11.2 履歴カード
 
 - 記録画面は「要確認」を初期表示し、名前と画像を見せるための追加ボタンを挟まない。通常のお気に入りは「すべての記録・検索」で保存画像とともに確認できる。「要確認」では確定した一覧欠落またはアクセス不可を論理和で抽出する。同じワールドが両状態でもカードと主件数は1件とし、アクセス不可を先頭に、同じ分類では関連する最新確定イベント時刻の降順に並べる。
-- ポップアップと記録画面は同じ重複なし要確認件数を使用する。記録画面は集計buttonを置かず、結果見出しとカードに集約する。通信エラー時も保存済みカードを残し、初回・判定待ち・最新状態不明を0件と区別する。主ボタンは明るい背景と濃い文字、補助リンクは暗い背景と明るい文字にする。
+- ポップアップと記録画面は同じ重複なし要確認件数を使用する。記録画面は集計buttonを置かず、結果見出しとカードに集約する。通信エラー時も保存済みカードを残し、初回・判定待ち・最新状態不明を0件と区別する。画面は温白背景・濃い本文、主要ボタンは濃緑と白文字、補助リンクは濃緑、危険操作は危険色とする。
 - 左側: 保存済み縮小サムネイル。読込み中・未保存・DB読出し失敗・画像表示失敗を区別し、再確認または画像の再読込みを案内する。外部URLを直接読み込まない。読出し完了と画像errorイベントでは描画世代とprofileを再確認し、古い要求を別profileや新しい描画へ反映しない。`thumbnailCaptureStatus`は直近batch診断に残す。利用者向けには`GET_STATUS.thumbnailProgress`の全体進捗を使い、表示対象profileと一致するときだけ可視中に更新する。画像未保存枠は自動取得待ちと案内し、手動同期の反復を求めない。
 - 最上段: 保存済みの最新名称。取得不能でも空にしない。
 - 補助: 過去名、作者、world ID、最終確認時刻。
@@ -532,8 +533,8 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 
 ### 11.3 保存量・未読・全消去
 
-- 拡張アイコンは未読イベント数を `1`〜`99+` で表示し、履歴画面を開いたときだけ DB の未読件数を0へする。
-- ポップアップは固定の`dashboard.html#attention`を開き、要確認の保存済み名称と画像を表示する。明示した`#all`は引き続き全記録を表示する。一覧欠落・アクセス不可を含む通知は固定の`dashboard.html#attention`、通常の変更通知は固定の`dashboard.html#events`を開く。外部入力をURLへ混ぜず、dashboardはhashをallowlistで解釈し、イベントrouteではDB読込み後に履歴タブを選択して既読化する。
+- 拡張アイコンは正確な未読イベント数を `1`〜`99+`、旧内訳が不明な間は `?` で表示し、履歴画面を開いたときだけ DB の未読件数を0へする。
+- ポップアップは固定の`dashboard.html#attention`を開き、要確認の保存済み名称と画像を表示する。明示した`#all`は非表示を除く全記録、`#hidden`は非表示記録を表示する。一覧欠落・アクセス不可を含む通知は固定の`dashboard.html#attention`、通常の変更通知は固定の`dashboard.html#events`を開く。外部入力をURLへ混ぜず、dashboardはhashをallowlistで解釈し、イベントrouteではDB読込み後に履歴タブを選択して既読化する。
 - 最終正常同期から36時間、8,000ワールド、80,000イベント、または概算250MiBを超えた場合だけ行動案内を表示する。800件×48KiBでも画像は約38MiBのため、通常利用でメンテナンスを要求しない。
 - 全消去は UI の不可逆確認後、冪等な`beginPurge`で`purgePending`を先に保存して同期を閉じ、alarm停止とAuth Cookie Bridge対象Cookieの不在確認後、全storeを1 read-write transactionでclearする。同じtransactionで`purgePending`とschema情報だけを再作成し、利用者recordが0になった場合だけ`uninstallSelf`を呼ぶ。取消不能な`deleteDatabase` requestは使わない。全repository書込みは同じtransaction内で`purgePending`を検査するため、別のダッシュボードタブから復元や設定変更を同時に始めても、guard前に完了した書込みは後続clearで消え、guard後の書込みは拒否される。自己アンインストールの取消やブラウザ終了後に再試行した場合は既存guardを解除せず、cleanup、clear、`uninstallSelf`を再実行する。新しくguardを有効化した操作がclear前に失敗した場合だけ専用recoveryで通常状態へ戻す。書き出し済みJSON、Downloadsのインストーラー、Windowsの固定配置ファイルは拡張側の削除対象外と明示し、続けてWindows側のアンインストールを案内する。
 
@@ -581,3 +582,18 @@ URL、ヘッダー、Cookie、応答本文、stack trace は保存しない。�
 
 - 別画面・自動確認の完了は既存のGET_STATUSから観測し、同期ボタン、案内、既存の保存済み結果へ反映する。再読込みでも検索/絞り込み、表示件数、選択中の画面を維持する。同じ成功時刻でカードを繰り返し再生成しない。status由来の件数でローカル表示中の要確認件数を上書きしない。
 - hash変更・同じメニューの再クリック・戻る/進む・履歴の既読化中の画面移動を回帰テストする。手動確認の応答待ちはstatusの遅れによって二重実行可能にならないよう保持する。
+
+
+## 13. 記録の表示状態と完全削除
+
+詳細な操作文言・受入条件は[記録管理仕様](RECORD_MANAGEMENT.md)を正とする。
+
+- schema 4の`worldDispositions`は`[userId, worldId]`主キー、`by-user` indexを持つ。行なしは通常表示、`hidden`は記録保持、`purged`はIDだけの抑止。API由来のworld状態に表示状態を混ぜない。
+- `getDisplaySnapshot`と`getProfileStats`は対象profile、集計、データ世代、表示世代をそれぞれ単一readonly transactionで読み、別世代の表示が混ざらないようにする。`GET_STATUS`は保存総数と通常一覧の要確認数・hidden件数を分ける。
+- `HIDE_WORLD` / `RESTORE_HIDDEN_WORLD` / `PURGE_HIDDEN_WORLD`だけを記録操作commandとして公開する。Service Workerで先に操作予約し、同期・画像batch・全消去と競合しないようにする。DBはactive profile、データ世代、表示世代、revision、対象状態、purge guardを再検査する。
+- hide/戻すは表示世代だけを増やす。完全削除は対象world、画像、全event、未読追跡、画像job/cursorの対象ID・URL除去とpurged行作成、両世代更新を1つのtransactionで行う。現世代jobの残りだけを新世代へ移し、古いjobの対象は除くが残りを昇格させない。所有profile不明の壊れたjobは削除をabortする。
+- purged IDはrelationだけで作成せずprobeへも追加しない。取得前snapshotから存在したpurged行について、新たな正常なfavorite metadataがあり、元世代で初回commitできた場合だけworld作成と行削除を同時に行う。generation conflict後のreplanでは全抑止を維持する。再登録は新規baselineで旧event・Blobを復活させない。
+- `unreadTracking:userId`は`legacyCount`、`legacyWorldIds`、`legacyUncertain`、`byWorld`を持つ。新規eventだけworld別に加算し、完全削除は対象分だけを除去する。旧分が特定不能なら数字を表示しない。既読化・backup復元は追跡全体を既読へ戻す。通知claimは既読判定へ流用しない。
+- JSON 3はhidden/purgedを含み、1・2は空の表示状態へ正規化する。dispositionsは上限10,000件、全JSONは25MiB上限。unknown field、重複、所有者不一致、hidden world欠落、purged world/event併存を拒否する。世代・job・未読追跡は出力しない。
+- 復元は対象profileの旧画像jobを廃棄し、purged画像だけ削除する。他の保存画像は保持する。復元だけでAPI取得・通知再送を開始しない。
+- dashboardは既存可視時pollで両世代を比較する。確認中に対象が更新されたらsubmitを無効化し、アカウント/route変更ならdialogを閉じる。不明な応答は再読して確認し、自動再送しない。native dialogのcancel focusと閉鎖後の移動先を管理する。

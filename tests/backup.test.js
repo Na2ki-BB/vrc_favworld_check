@@ -7,8 +7,10 @@ import { IDBFactory } from "fake-indexeddb";
 
 import {
   BACKUP_VERSION,
+  BackupExportLimitError,
   MAX_BACKUP_BYTES,
   MAX_BACKUP_GROUPS,
+  MAX_BACKUP_DISPOSITIONS,
   MAX_BACKUP_WORLDS,
   backupSummary,
   createBackup,
@@ -206,6 +208,9 @@ test("one-profile backup round-trips without replacing another profile", async (
     worldCount: 1,
     eventCount: 1,
     groupCount: 1,
+    hiddenCount: 0,
+    purgedCount: 0,
+    sourceVersion: 3,
     exportedAt: AT_2
   });
   assert.equal(Object.getPrototypeOf(parsed), null);
@@ -408,7 +413,7 @@ test("oversized backups and secret-bearing database records are refused", async 
   await assert.rejects(createBackup(database, USER_A, { exportedAt: AT_2 }), /secret-bearing field/);
 });
 
-test("v1 backups import as canonical v2 data without favorite groups", async (context) => {
+test("v1 backups import as canonical v3 data without favorite groups", async (context) => {
   const source = await repository(`backup-v1-source-${context.name}`);
   const target = await repository(`backup-v1-target-${context.name}`);
   context.after(() => {
@@ -423,6 +428,7 @@ test("v1 backups import as canonical v2 data without favorite groups", async (co
   );
   raw.version = 1;
   delete raw.favoriteGroups;
+  delete raw.worldDispositions;
   for (const rawEvent of /** @type {Record<string, unknown>[]} */ (raw.events)) {
     delete rawEvent.notificationEligible;
   }
@@ -448,12 +454,12 @@ test("createdBySchemaVersion is validated against the source and database versio
   await seed(database, USER_A, WORLD_A, "Alice", "Schema version");
   const valid = JSON.parse(await createBackup(database, USER_A, { exportedAt: AT_2 }));
 
-  for (const schemaVersion of [1, 2, 3]) {
+  for (const schemaVersion of [1, 2, 3, 4]) {
     const candidate = structuredClone(valid);
     candidate.profile.createdBySchemaVersion = schemaVersion;
     assert.equal(validateBackup(JSON.stringify(candidate)).profile.createdBySchemaVersion, schemaVersion);
   }
-  for (const schemaVersion of [0, 4]) {
+  for (const schemaVersion of [0, 5]) {
     const candidate = structuredClone(valid);
     candidate.profile.createdBySchemaVersion = schemaVersion;
     assert.throws(() => validateBackup(JSON.stringify(candidate)), /createdBySchemaVersion/);
@@ -462,6 +468,7 @@ test("createdBySchemaVersion is validated against the source and database versio
   const v1WithFutureSchema = structuredClone(valid);
   v1WithFutureSchema.version = 1;
   delete v1WithFutureSchema.favoriteGroups;
+  delete v1WithFutureSchema.worldDispositions;
   v1WithFutureSchema.profile.createdBySchemaVersion = 2;
   assert.throws(() => validateBackup(JSON.stringify(v1WithFutureSchema)), /createdBySchemaVersion/);
 });
@@ -592,6 +599,7 @@ test("favorite_group_changed events use bounded unique canonical JSON arrays", a
   const v1WithGroupEvent = JSON.parse(JSON.stringify({ ...valid, events: [groupEvent] }));
   v1WithGroupEvent.version = 1;
   delete v1WithGroupEvent.favoriteGroups;
+  delete v1WithGroupEvent.worldDispositions;
   delete v1WithGroupEvent.events[0].notificationEligible;
   assert.throws(() => validateBackup(JSON.stringify(v1WithGroupEvent)), /unsupported value/);
 
@@ -603,7 +611,7 @@ test("favorite_group_changed events use bounded unique canonical JSON arrays", a
   assert.equal((await database.listEvents(USER_A))[0]?.notificationClaimedAt, null);
 });
 
-test("v2 backup deterministically round-trips 800 worlds and 8 favorite groups", async (context) => {
+test("v3 backup deterministically round-trips 800 worlds and 8 favorite groups", async (context) => {
   const source = await repository(`backup-capacity-source-${context.name}`);
   const target = await repository(`backup-capacity-target-${context.name}`);
   context.after(() => {
@@ -702,6 +710,9 @@ test("v2 backup deterministically round-trips 800 worlds and 8 favorite groups",
     worldCount: 800,
     eventCount: 1,
     groupCount: 8,
+    hiddenCount: 0,
+    purgedCount: 0,
+    sourceVersion: 3,
     exportedAt: AT_2
   });
 
@@ -710,4 +721,117 @@ test("v2 backup deterministically round-trips 800 worlds and 8 favorite groups",
   assert.equal((await target.listFavoriteGroups(USER_A)).length, 8);
   assert.equal((await target.listEvents(USER_A))[0]?.kind, "favorite_group_changed");
   assert.equal(await target.getUnreadCount(USER_A), 0);
+});
+
+test("v3 dispositions round-trip and purged restore removes only matching saved images", async (context) => {
+  const source = await repository(`backup-dispositions-source-${context.name}`);
+  const target = await repository(`backup-dispositions-target-${context.name}`);
+  context.after(() => { source.close(); target.close(); });
+  const hidden = world(USER_A, WORLD_A, "非表示の記録");
+  await source.replaceProfileData({
+    profile: profile(USER_A, "Alice"), worlds: [hidden], events: [event(USER_A, WORLD_A)],
+    favoriteGroups: [], preferences: {}, worldDispositions: [
+      { userId: USER_A, worldId: WORLD_A, state: "hidden" },
+      { userId: USER_A, worldId: WORLD_B, state: "purged" }
+    ]
+  });
+  await target.replaceProfileData({
+    profile: profile(USER_A, "Before"), worlds: [hidden, world(USER_A, WORLD_B, "削除対象の旧名")],
+    events: [], favoriteGroups: [], preferences: {}
+  });
+  await target.setSetting("activeProfileId", USER_A);
+  const generation = await target.getDataGeneration(USER_A);
+  for (const worldId of [WORLD_A, WORLD_B]) {
+    const blob = new Blob(["synthetic-webp"], { type: "image/webp" });
+    await target.putThumbnail({ userId: USER_A, worldId, blob, byteLength: blob.size,
+      width: 320, height: 180, capturedAt: AT_2,
+      sourceUrl: `https://api.vrchat.cloud/api/1/file/${worldId.replace("wrld_", "file_")}/1/file`
+    }, generation, USER_A);
+  }
+  await target.setSetting("thumbnailJob", { version: 1, userId: USER_A, generation,
+    capturedAt: AT_2, items: [{ id: WORLD_B, attempts: 0,
+      thumbnailImageUrl: `https://api.vrchat.cloud/api/1/file/${WORLD_B.replace("wrld_", "file_")}/1/file`
+    }], nextAttemptAt: Date.parse(RESTORED_AT), state: "waiting" });
+  const exported = await createBackup(source, USER_A, { exportedAt: AT_2 });
+  const raw = JSON.parse(exported);
+  assert.equal(raw.version, 3);
+  assert.deepEqual(Object.keys(raw.worldDispositions[1]).sort(), ["state", "userId", "worldId"]);
+  for (const forbidden of ["sourceVersion", "generation", "unread", "thumbnailJob", "削除対象の旧名"]) {
+    assert.equal(exported.includes(forbidden), false);
+  }
+  const parsed = validateBackup(exported);
+  assert.equal(parsed.sourceVersion, 3);
+  assert.equal(backupSummary(parsed).hiddenCount, 1);
+  assert.equal(backupSummary(parsed).purgedCount, 1);
+  await restoreBackup(target, exported, { restoredAt: RESTORED_AT });
+  assert.deepEqual((await target.listWorldDispositions(USER_A)).map((record) => record.state), ["hidden", "purged"]);
+  assert.deepEqual((await target.listThumbnailMetadata(USER_A)).map((record) => record.worldId), [WORLD_A]);
+  assert.equal(await target.getSetting("thumbnailJob"), undefined);
+  assert.equal(await target.getDataGeneration(USER_A), generation + 1);
+  assert.equal((await target.getUnreadSummary(USER_A)).count, 0);
+});
+
+test("legacy v2 restores clear dispositions while identifying the original format", async (context) => {
+  const database = await repository(`backup-v2-legacy-${context.name}`);
+  context.after(() => database.close());
+  await seed(database, USER_A, WORLD_A, "Alice", "Legacy");
+  const raw = JSON.parse(await createBackup(database, USER_A, { exportedAt: AT_2 }));
+  raw.version = 2;
+  delete raw.worldDispositions;
+  const text = JSON.stringify(raw);
+  const parsed = validateBackup(text);
+  assert.equal(parsed.sourceVersion, 2);
+  assert.equal(parsed.version, 3);
+  assert.deepEqual(parsed.worldDispositions, []);
+  assert.equal(backupSummary(parsed).sourceVersion, 2);
+  assert.equal(JSON.stringify(parsed).includes("sourceVersion"), false);
+  await database.replaceProfileData({
+    profile: parsed.profile, worlds: parsed.worlds, events: parsed.events,
+    favoriteGroups: [], preferences: {},
+    worldDispositions: [{ userId: USER_A, worldId: WORLD_A, state: "hidden" }]
+  });
+  await restoreBackup(database, text, { restoredAt: RESTORED_AT });
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+});
+
+test("v3 disposition validation rejects unsafe and inconsistent records before mutation", async (context) => {
+  const database = await repository(`backup-invalid-disposition-${context.name}`);
+  context.after(() => database.close());
+  await seed(database, USER_A, WORLD_A, "Alice", "Protected");
+  const raw = JSON.parse(await createBackup(database, USER_A, { exportedAt: AT_2 }));
+  const hidden = { userId: USER_A, worldId: WORLD_A, state: "hidden" };
+  const candidates = [
+    undefined, null, [hidden, hidden],
+    [{ ...hidden, userId: USER_B }], [{ ...hidden, worldId: "wrld_invalid" }],
+    [{ ...hidden, state: "visible" }], [{ ...hidden, worldId: WORLD_B }],
+    [{ ...hidden, state: "purged" }], [{ ...hidden, state: "purged", currentName: "旧名" }],
+    [{ userId: USER_A, worldId: WORLD_B, state: "purged", sourceUrl: "https://example.invalid/old.webp" }],
+    Array.from({ length: MAX_BACKUP_DISPOSITIONS + 1 }, () => hidden)
+  ];
+  const generation = await database.getDataGeneration(USER_A);
+  for (const dispositions of candidates) {
+    const candidate = JSON.stringify({ ...raw, worldDispositions: dispositions });
+    assert.throws(() => validateBackup(candidate), /Invalid backup/);
+    await assert.rejects(restoreBackup(database, candidate), /Invalid backup/);
+  }
+  assert.equal(await database.getDataGeneration(USER_A), generation);
+  assert.equal((await database.listWorlds(USER_A))[0]?.currentName, "Protected");
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+});
+
+
+test("export never drops excess disposition IDs and reports a fixed safe limit code", async (context) => {
+  const database = await repository(`backup-export-limit-${context.name}`);
+  context.after(() => database.close());
+  await seed(database, USER_A, WORLD_A, "Alice", "Limit");
+  const snapshot = await database.getBackupSnapshot(USER_A);
+  database.getBackupSnapshot = async () => ({ ...snapshot, worldDispositions:
+    Array.from({ length: MAX_BACKUP_DISPOSITIONS + 1 }, () => ({ userId: USER_A, worldId: WORLD_B, state: /** @type {const} */ ("purged") }))
+  });
+  await assert.rejects(createBackup(database, USER_A), (error) =>
+    error instanceof BackupExportLimitError && error.code === "DISPOSITIONS_LIMIT");
+  database.getBackupSnapshot = async () => ({ ...snapshot, profile: { ...profile(USER_A, "x".repeat(MAX_BACKUP_BYTES)), firstSeenAt: AT_1 } });
+  await assert.rejects(createBackup(database, USER_A), (error) =>
+    error instanceof BackupExportLimitError && error.code === "SIZE_LIMIT");
+  assert.equal(await database.getDataGeneration(USER_A), 1);
 });

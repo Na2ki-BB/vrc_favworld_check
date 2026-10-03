@@ -1,8 +1,8 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   font-family: "Noto Sans JP", "Yu Gothic UI", system-ui, sans-serif;
-  color: #f6f6fb;
-  background: #131925;
+  color: #252923;
+  background: #F7F6F2;
 }
 * {
   box-sizing: border-box;
@@ -12,6 +12,7 @@
 }
 body {
   width: 370px;
+  max-width: 100vw;
   margin: 0;
 }
 button {
@@ -31,6 +32,7 @@ button {
   border-radius: 8px;
 }
 h1 {
+  overflow-wrap: anywhere;
   margin: 0;
   font-size: 16px;
 }
@@ -47,11 +49,11 @@ p {
   margin-top: 10px;
 }
 .attention-card.is-alert h2 {
-  color: #ffcfb8;
+  color: #725321;
 }
 .attention-card > p {
   margin: 0 0 16px;
-  color: #b5bfd0;
+  color: #5C635A;
   font-size: 13px;
 }
 .button {
@@ -65,33 +67,35 @@ p {
   cursor: pointer;
 }
 .button-primary {
-  color: #10252a;
-  background: #8ae9dc;
+  color: #FFFFFF;
+  background: #356447;
 }
 .button-secondary {
-  color: #f6f6fb;
-  background: #344157;
-  border-color: #60708a;
+  color: #252923;
+  background: #E7EEE7;
+  border-color: #7B8178;
 }
 .button:hover:not(:disabled) {
-  filter: brightness(1.1);
+  border-color: #356447;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .button:disabled {
-  color: #c4cede;
-  background: #344157;
-  border-color: #53637c;
+  color: #5C635A;
+  background: #E9EAE4;
+  border-color: #7B8178;
   cursor: wait;
 }
 .button:focus-visible, summary:focus-visible {
-  outline: 3px solid #ffd48a;
+  outline: 3px solid #356447;
   outline-offset: 3px;
 }
 .status-card {
   padding: 12px;
-  border: 1px solid #a37b4d;
+  border: 1px solid #725321;
   border-radius: 9px;
-  color: #ffe5bd;
-  background: #342c29;
+  color: #725321;
+  background: #FAF0D9;
 }
 .status-line {
   display: flex;
@@ -112,28 +116,29 @@ p {
 }
 .muted {
   margin: 0;
-  color: #b5bfd0;
+  color: #5C635A;
   font-size: 12px;
 }
 .action-message {
   margin: 0;
-  color: #ffd0bf;
+  color: #8B3028;
   font-size: 12px;
 }
 .action-message:empty {
   display: none;
 }
 .record-status {
-  border-top: 1px solid #41516a;
+  border-top: 1px solid #D4D8CF;
 }
 .record-status summary {
   padding: 12px 0;
-  color: #d9e4f2;
+  min-height: 44px;
+  color: #252923;
   font-size: 12px;
   cursor: pointer;
 }
 footer {
-  color: #b5bfd0;
+  color: #5C635A;
   font-size: 11px;
 }
 @media (forced-colors: active) {
@@ -141,3 +146,6 @@ footer {
     border: 1px solid ButtonText;
   }
 }
+
+.button-primary:hover:not(:disabled) { background: #294F38; color: #FFFFFF; }
+.button-secondary:hover:not(:disabled), .button-ghost:hover:not(:disabled) { background: #E7EEE7; }
