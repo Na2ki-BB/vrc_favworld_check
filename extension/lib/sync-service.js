@@ -23,7 +23,8 @@ import {
 import {
   DATABASE_VERSION,
   GenerationConflictError,
-  RevisionConflictError
+  RevisionConflictError,
+  RecordStateConflictError
 } from "./database.js";
 import {
   ThumbnailError,
@@ -54,6 +55,7 @@ export const SYNC_WATCHDOG_DELAY_MS = 10 * 60 * 1_000;
 export const NOTIFICATION_ID_PREFIX = "vrc-favworld-check-change-";
 export const ATTENTION_NOTIFICATION_ID_PREFIX = "vrc-favworld-check-attention-";
 export const SETTINGS_SCHEDULE_WARNING = "SCHEDULE_REPAIR_FAILED";
+export const THUMBNAIL_SCHEDULE_WARNING = "THUMBNAIL_SCHEDULE_REPAIR_FAILED";
 export const NOTIFICATION_EVENT_KINDS = SCHEMA_V2_NOTIFICATION_ELIGIBLE_EVENT_KINDS;
 export const THUMBNAIL_CAPTURE_INTERVAL_MS = 250;
 export const THUMBNAIL_CAPTURE_TIME_BUDGET_MS = 30_000;
@@ -98,7 +100,8 @@ export const SETTING_KEYS = Object.freeze({
  *   "getProfile" | "listProfiles" | "getProfileStats" |
  *   "getSyncSnapshot" | "getDataGeneration" | "getSetting" | "setSetting" |
  *   "setSettings" | "setThumbnailSettings" | "commitSync" | "recordSyncRun" | "claimEvents" |
- *   "updateNotificationResult" | "getUnreadCount" | "markEventsRead"> &
+ *   "updateNotificationResult" | "getUnreadCount" | "markEventsRead" |
+ *   "hideWorld" | "restoreHiddenWorld" | "purgeHiddenWorld"> &
  *   Partial<Pick<import("./database.js").DatabaseRepository,
  *   "listThumbnailMetadata" | "putThumbnail">>} Repository
  */
@@ -484,6 +487,7 @@ export class SyncService {
   #thumbnailWait;
   /** @type {Promise<PublicSyncResult> | null} */
   #activeSync = null;
+  #recordMutationReserved = false;
 
   /**
    * @param {{
@@ -516,6 +520,63 @@ export class SyncService {
     return this.#activeSync !== null;
   }
 
+  get recordMutating() {
+    return this.#recordMutationReserved;
+  }
+
+  /**
+   * Reserve before the first await, then share the existing thumbnail mutation
+   * lock. Waiting image jobs are safe; executing sync/image batches are not.
+   * Database guards remain authoritative across other pages and worker restarts.
+   * @param {"hide" | "restore" | "purge"} action
+   * @param {Parameters<import("./database.js").DatabaseRepository["hideWorld"]>[0]} input
+   */
+  async mutateRecord(action, input) {
+    if (this.syncing || this.#recordMutationReserved) {
+      return /** @type {const} */ ({ ok: false, error: "SYNC_IN_PROGRESS" });
+    }
+    this.#recordMutationReserved = true;
+    try {
+      return await this.#withThumbnailMutationLock(async () => {
+        if (await this.#repository.getSetting(SETTING_KEYS.purgePending) === true) {
+          return /** @type {const} */ ({ ok: false, error: "MAINTENANCE_IN_PROGRESS" });
+        }
+        const activeProfile = await this.#repository.getSetting(SETTING_KEYS.activeProfileId);
+        if (typeof activeProfile !== "string") {
+          return /** @type {const} */ ({ ok: false, error: "NO_ACTIVE_PROFILE" });
+        }
+        if (activeProfile !== input.userId) {
+          return /** @type {const} */ ({ ok: false, error: "RECORD_CHANGED" });
+        }
+        const result = action === "hide" ? await this.#repository.hideWorld(input)
+          : action === "restore" ? await this.#repository.restoreHiddenWorld(input)
+            : action === "purge" ? await this.#repository.purgeHiddenWorld(input) : null;
+        if (result === null) {
+          return /** @type {const} */ ({ ok: false, error: "INVALID_REQUEST" });
+        }
+        /** @type {typeof THUMBNAIL_SCHEDULE_WARNING | null} */
+        let thumbnailScheduleWarning = null;
+        try {
+          await this.#repairThumbnailSchedule();
+        } catch {
+          // The record transaction committed. Never turn a derived alarm
+          // failure into an ambiguous delete failure or invite an auto-retry.
+          thumbnailScheduleWarning = THUMBNAIL_SCHEDULE_WARNING;
+        }
+        return { ok: /** @type {const} */ (true), recordSaved: /** @type {const} */ (true),
+          ...result, thumbnailScheduleWarning };
+      });
+    } catch (error) {
+      if (error instanceof GenerationConflictError || error instanceof RevisionConflictError
+        || error instanceof RecordStateConflictError) {
+        return /** @type {const} */ ({ ok: false, error: "RECORD_CHANGED" });
+      }
+      return /** @type {const} */ ({ ok: false, error: "RECORD_UPDATE_FAILED" });
+    } finally {
+      this.#recordMutationReserved = false;
+    }
+  }
+
   /**
    * A concurrent caller shares the already-running promise and cannot start
    * another API sequence.
@@ -526,6 +587,9 @@ export class SyncService {
   start(trigger) {
     if (trigger !== "manual" && trigger !== "alarm" && trigger !== "resume" && trigger !== "thumbnail") {
       return Promise.resolve({ ok: false, error: "SYNC_FAILED" });
+    }
+    if (this.#recordMutationReserved) {
+      return Promise.resolve({ ok: false, error: "MAINTENANCE_IN_PROGRESS" });
     }
     if (this.#activeSync !== null) {
       if (this.#activeTrigger === "thumbnail" && trigger !== "thumbnail") {
@@ -563,6 +627,12 @@ export class SyncService {
    *   missingCount: number,
    *   unavailableCount: number,
    *   unreadCount: number,
+   *   unreadSummary: {exact: boolean, uncertain: boolean, count: number | null},
+   *   generation: number,
+   *   dataGeneration: number,
+   *   presentationGeneration: number,
+   *   hiddenCount: number,
+   *   recordMutating: boolean,
    *   favoriteGroupStatus: "success" | "stale" | null,
    *   lastResult: string | null,
    *   thumbnailProgress: ThumbnailProgress | null,
@@ -587,12 +657,17 @@ export class SyncService {
           pendingProbeCount: 0,
           attentionWorldCount: 0,
           missingCount: 0,
-          unavailableCount: 0
+          unavailableCount: 0,
+          hiddenCount: 0,
+          generation: 0,
+          presentationGeneration: 0,
+          unreadSummary: { exact: true, uncertain: false, count: 0 }
         }
       : await this.#repository.getProfileStats(profileId);
-    const unreadCount = profileId === null
-      ? 0
-      : await this.#repository.getUnreadCount(profileId);
+    // Counts, dispositions, generations and unread certainty are one DB view.
+    // Never pair a fresh generation with a separate, stale unread/count read.
+    const unreadSummary = stats.unreadSummary;
+    const unreadCount = unreadSummary.count ?? 0;
     // Saved images survive upgrades independently of the current capture job.
     // A missing/unreadable job must not erase the independently known count.
     const thumbnailSavedCount = profileId === null ? 0
@@ -604,6 +679,7 @@ export class SyncService {
       thumbnailSavedCount,
       thumbnailProgress: await this.#thumbnailProgress().catch(() => null),
       syncing: this.syncing,
+      recordMutating: this.recordMutating,
       authRequired: lastResult === "auth_required",
       lastSuccessfulSyncAt: profile?.lastSuccessfulSyncAt ?? null,
       nextSyncAt: isFiniteTimestamp(nextSyncAt)
@@ -617,6 +693,11 @@ export class SyncService {
       missingCount: stats.missingCount,
       unavailableCount: stats.unavailableCount,
       unreadCount,
+      unreadSummary,
+      generation: stats.generation,
+      dataGeneration: stats.generation,
+      presentationGeneration: stats.presentationGeneration,
+      hiddenCount: stats.hiddenCount,
       favoriteGroupStatus:
         favoriteGroupStatus === "success" || favoriteGroupStatus === "stale"
           ? favoriteGroupStatus
@@ -1111,8 +1192,11 @@ export class SyncService {
         previousWorlds: initialSnapshot.worlds,
         favoriteRelations,
         metadata,
-        limit: MAX_PROBE_CANDIDATES
+        limit: MAX_PROBE_CANDIDATES,
+        worldDispositions: initialSnapshot.worldDispositions
       });
+      const initiallyPurgedIds = new Set(initialSnapshot.worldDispositions
+        .filter((row) => row.state === "purged").map((row) => row.worldId));
       // Older releases did not save images. Use spare probe slots for recorded
       // accessible worlds outside the current favorites, until their image is saved.
       if (this.#repository.listThumbnailMetadata !== undefined && candidates.length < MAX_PROBE_CANDIDATES) {
@@ -1124,6 +1208,7 @@ export class SyncService {
         const selectedIds = new Set(candidates);
         const imageProbeCandidates = initialSnapshot.worlds.filter((world) => (
           storedImages !== null && world.availabilityState === "accessible"
+          && !initiallyPurgedIds.has(world.worldId)
           && !knownMetadataIds.has(world.worldId)
           && !imageWorldIds.has(world.worldId)
           && !selectedIds.has(world.worldId)
@@ -1185,7 +1270,9 @@ export class SyncService {
       await this.#deliverNotifications(user.id, syncId, committedPlan.generation);
       return {
         userId: user.id,
-        metadata: [...thumbnailMetadata.values()].map((world) => ({ ...world })),
+        metadata: [...thumbnailMetadata.values()]
+          .filter((world) => committedPlan.worldIds.has(world.id))
+          .map((world) => ({ ...world })),
         generation: committedPlan.generation,
         capturedAt: observedAt
       };
@@ -1280,7 +1367,11 @@ export class SyncService {
         probes: input.probes,
         observedAt: input.observedAt,
         syncId: input.syncId,
-        isBaseline: snapshot.profile === null
+        isBaseline: snapshot.profile === null,
+        worldDispositions: snapshot.worldDispositions,
+        // Fetched evidence may only release a pre-existing suppression on the
+        // original commit. Replans never release even previously purged IDs.
+        allowPurgedReintroduction: attempt === 0
       });
       let favoriteGroups = snapshot.favoriteGroups;
       /** @type {"success" | "stale"} */
@@ -1326,6 +1417,7 @@ export class SyncService {
             revision: previousRevisions.get(world.worldId) ?? null
           })),
           expectedGeneration: snapshot.generation,
+          releasedPurgedWorldIds: plan.releasedPurgedWorldIds,
           settings: {
             activeProfileId: input.user.id,
             backoffUntil: null,
@@ -1347,7 +1439,8 @@ export class SyncService {
             retryAt: null
           }
         });
-        return { changeCount: plan.events.length, generation };
+        return { changeCount: plan.events.length, generation,
+          worldIds: new Set(plan.worlds.map((world) => world.worldId)) };
       } catch (error) {
         if (!(error instanceof GenerationConflictError) || attempt === 1) {
           throw error;

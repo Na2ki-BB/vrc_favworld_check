@@ -33,7 +33,7 @@
 
         <section id="worlds-panel" class="tab-panel" aria-labelledby="primary-focus-title">
           <section id="primary-focus" class="primary-focus" aria-live="polite">
-            <h2 id="primary-focus-title">保存済みの記録を読み込んでいます</h2>
+            <h2 id="primary-focus-title" tabindex="-1">保存済みの記録を読み込んでいます</h2>
             <p id="primary-focus-detail">しばらくお待ちください。</p>
             <p id="last-sync" class="muted">最終確認: まだありません</p>
             <p class="meaning-note">削除・非公開・自分でお気に入りから外した場合の区別はできません。</p>
@@ -45,6 +45,9 @@
             <p class="muted">記録を始める前に消えたワールドは復元できません。</p>
           </section>
 
+          <p class="hidden-records-link"><a id="hidden-records-link" href="#hidden">非表示の記録（0件）</a></p>
+          <p id="hidden-records-description" class="muted" hidden>一覧から非表示にした記録です。名前・画像・履歴は残っており、同期と通知は続きます</p>
+          <p id="record-action-message" class="form-message" role="status"></p>
           <details id="world-filter-panel" class="filter-panel">
             <summary id="world-filter-summary">すべての記録・検索</summary>
             <div class="toolbar">
@@ -56,7 +59,8 @@
                 <span>表示するワールド</span>
                 <select id="world-filter">
                   <option value="attention" selected>消えた可能性のあるワールド</option>
-                  <option value="all">すべての記録</option>
+                  <option value="all">すべての記録（非表示を除く）</option>
+                  <option value="hidden">非表示の記録</option>
                   <option value="unavailable">現在アクセス不可</option>
                   <option value="missing">お気に入り一覧にない</option>
                   <option value="favorite">お気に入り中</option>
@@ -72,7 +76,7 @@
             </div>
           </details>
           <p id="world-result-count" class="result-count" role="status"></p>
-          <div id="world-list" class="world-list" aria-live="polite"></div>
+          <div id="world-list" class="world-list"></div>
           <div id="world-empty" class="empty-state" hidden>
             <strong id="world-empty-title">保存済みの記録を読み込んでいます</strong>
             <p id="world-empty-detail">しばらくお待ちください。</p>
@@ -135,12 +139,13 @@
                 <div><dt>未読の変更</dt><dd id="settings-unread-events">0件</dd></div>
                 <div><dt>保存先</dt><dd>このブラウザのIndexedDB</dd></div>
               </dl>
+              <p id="settings-unread-detail" hidden></p>
             </article>
 
             <article class="settings-card">
               <p class="section-label">BACKUP</p>
               <h2>記録をバックアップ</h2>
-              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。サムネイル画像は現在のJSONには含まれません。</p>
+              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。サムネイル画像は現在のJSONには含まれません。表示/非表示・削除済みIDも保存します。この形式を復元するには対応する最新版が必要です。</p>
               <div class="stacked-actions">
                 <button id="export-button" class="button button-secondary" type="button">バックアップを書き出す</button>
                 <label class="button button-ghost file-button">
@@ -191,6 +196,26 @@
       </main>
 
     </div>
+    <dialog id="hide-record-dialog" class="record-dialog" aria-labelledby="hide-record-title" aria-describedby="hide-record-description">
+      <h2 id="hide-record-title">この記録を一覧から削除しますか？</h2>
+      <div id="hide-record-target" class="record-dialog-target"></div>
+      <p id="hide-record-description"></p>
+      <p id="hide-record-feedback" class="form-message" role="status"></p>
+      <div class="dialog-actions">
+        <button id="hide-record-cancel" class="button button-secondary" type="button" autofocus>キャンセル</button>
+        <button id="hide-record-submit" class="button button-danger" type="button">一覧から削除</button>
+      </div>
+    </dialog>
+    <dialog id="purge-record-dialog" class="record-dialog" aria-labelledby="purge-record-title" aria-describedby="purge-record-description">
+      <h2 id="purge-record-title">このワールドの記録を完全に削除しますか？</h2>
+      <div id="purge-record-target" class="record-dialog-target"></div>
+      <p id="purge-record-description"></p>
+      <p id="purge-record-feedback" class="form-message" role="status"></p>
+      <div class="dialog-actions">
+        <button id="purge-record-cancel" class="button button-secondary" type="button" autofocus>キャンセル</button>
+        <button id="purge-record-submit" class="button button-danger" type="button">完全に削除</button>
+      </div>
+    </dialog>
     <script type="module" src="dashboard.js"></script>
   </body>
 </html>

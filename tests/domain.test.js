@@ -751,3 +751,55 @@ test("rejects a missing or non-VRChat user ID at the domain boundary", () => {
     isBaseline: true,
   }), /usr_ UUID/u);
 });
+
+test("purged IDs require fresh available favorite evidence and start new records", () => {
+  const worldId = "wrld_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  /** @type {Parameters<typeof reconcileWorlds>[0]} */
+  const input = {
+    userId: USER_ID,
+    previousWorlds: [makeWorld({ worldId, revision: 42 })],
+    worldDispositions: [{ userId: USER_ID, worldId, state: "purged" }],
+    favoriteRelations: [{ worldId, tags: ["worlds1"] }],
+    metadata: [], probes: [], observedAt: T3, syncId: "sync-new", isBaseline: false,
+    allowPurgedReintroduction: true
+  };
+  for (const probes of [[], [{ worldId, status: /** @type {const} */ (404) }],
+    [{ worldId, status: /** @type {const} */ (200) }]]) {
+    assert.deepEqual(reconcileWorlds({ ...input, probes }).worlds, []);
+  }
+  const metadata = { worldId, name: "新しい記録", authorName: "作者", favoriteTags: ["worlds1"] };
+  assert.deepEqual(reconcileWorlds({ ...input, metadata: [{ ...metadata, name: "  " }] }).worlds, []);
+  const fresh = reconcileWorlds({ ...input, metadata: [metadata] });
+  assert.deepEqual(fresh.releasedPurgedWorldIds, [worldId]);
+  assert.equal(fresh.worlds[0]?.currentName, "新しい記録");
+  assert.equal(fresh.worlds[0]?.firstSeenAt, T3);
+  assert.equal(fresh.worlds[0]?.revision, 0);
+  assert.deepEqual(fresh.events, []);
+  const detail = { worldId, status: /** @type {const} */ (200), metadata };
+  assert.equal(reconcileWorlds({ ...input, probes: [detail] }).worlds.length, 1);
+  assert.deepEqual(reconcileWorlds({ ...input, favoriteRelations: [], probes: [detail] }).worlds, []);
+  assert.deepEqual(reconcileWorlds({ ...input, metadata: [metadata], allowPurgedReintroduction: false }).worlds, []);
+});
+
+test("hidden worlds retain reconciliation and purged worlds never consume probe slots", () => {
+  const hidden = makeWorld({ worldId: "wrld_hidden" });
+  const purged = makeWorld({ worldId: "wrld_purged", probeState: "pending" });
+  /** @type {import("../extension/lib/domain.js").WorldDisposition[]} */
+  const worldDispositions = [
+    { userId: USER_ID, worldId: hidden.worldId, state: "hidden" },
+    { userId: USER_ID, worldId: purged.worldId, state: "purged" }
+  ];
+  assert.deepEqual(selectProbeCandidates({
+    previousWorlds: [hidden, purged], worldDispositions,
+    favoriteRelations: [{ worldId: purged.worldId, tags: [] }], metadata: []
+  }), [hidden.worldId]);
+  const plan = reconcileWorlds({
+    userId: USER_ID, previousWorlds: [hidden, purged], worldDispositions,
+    favoriteRelations: [{ worldId: hidden.worldId, tags: ["worlds1"] }],
+    metadata: [{ worldId: hidden.worldId, name: "新しい名前", authorName: "作者", favoriteTags: ["worlds1"] }],
+    probes: [], observedAt: T1, syncId: "hidden-sync", isBaseline: false
+  });
+  assert.deepEqual(plan.worlds.map((world) => world.worldId), [hidden.worldId]);
+  assert.equal(plan.events[0]?.kind, "name_changed");
+  assert.equal(plan.events[0]?.notificationEligible, true);
+});

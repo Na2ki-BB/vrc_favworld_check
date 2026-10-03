@@ -1,6 +1,6 @@
 // @ts-check
 
-import { MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
+import { BackupExportLimitError, MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
 import { openDatabase } from "./lib/database.js";
 import { createFavoriteGroupOptions } from "./lib/favorite-groups.js";
 import {
@@ -11,6 +11,8 @@ import {
   filterWorlds,
   formatDateTime,
   isRecord,
+  hiddenWorldIds,
+  UNREAD_UNCERTAIN_DETAIL,
   normalizeCommandResponse,
   normalizePurgeResponse,
   normalizeStatusResponse,
@@ -45,7 +47,7 @@ const SETTINGS_UPDATE_OUTCOMES = Object.freeze({
   unconfirmed: "unconfirmed"
 });
 const VALID_TABS = new Set(["worlds", "events", "settings"]);
-const VALID_FILTERS = new Set(["attention", "all", "favorite", "missing", "unavailable", "pending"]);
+const VALID_FILTERS = new Set(["attention", "all", "favorite", "missing", "unavailable", "pending", "hidden"]);
 const VALID_EVENT_FILTERS = new Set(["attention", "all", "renamed", "group", "missing", "unavailable", "restored"]);
 
 const connectionBadge = requiredElement("connection-badge");
@@ -66,6 +68,10 @@ const worldFilter = /** @type {HTMLSelectElement} */ (requiredElement("world-fil
 const groupFilter = /** @type {HTMLSelectElement} */ (requiredElement("group-filter"));
 const worldResultCount = requiredElement("world-result-count");
 const worldList = requiredElement("world-list");
+const hiddenRecordsLink = requiredElement("hidden-records-link");
+const hiddenRecordsDescription = requiredElement("hidden-records-description");
+const recordActionMessage = requiredElement("record-action-message");
+const settingsUnreadDetail = requiredElement("settings-unread-detail");
 const worldEmpty = requiredElement("world-empty");
 const worldEmptyTitle = requiredElement("world-empty-title");
 const worldEmptyDetail = requiredElement("world-empty-detail");
@@ -109,6 +115,25 @@ let thumbnailRenderGeneration = 0;
 let progressEpoch = 0;
 let pageClosed = false;
 let progressPolling = false;
+let recordMutationInFlight = false;
+let recordDialogEpoch = 0;
+let navigationEpoch = 0;
+let recordInteractionEpoch = 0;
+/** @typedef {"HIDE_WORLD" | "RESTORE_HIDDEN_WORLD" | "PURGE_HIDDEN_WORLD"} RecordCommand */
+/** @typedef {{type: RecordCommand, userId: string, worldId: string, expectedGeneration: number, expectedPresentationGeneration: number, expectedRevision: number, trigger: HTMLElement, position: number, navigation: number}} RecordAction */
+/** @type {RecordAction | null} */
+let recordDialogAction = null;
+/** @type {string | null} */
+let recordDialogImageUrl = null;
+const recordDialogs = ["hide", "purge"].map((name) => ({
+  name,
+  dialog: /** @type {HTMLDialogElement} */ (requiredElement(`${name}-record-dialog`)),
+  target: requiredElement(`${name}-record-target`),
+  description: requiredElement(`${name}-record-description`),
+  feedback: requiredElement(`${name}-record-feedback`),
+  cancel: /** @type {HTMLButtonElement} */ (requiredElement(`${name}-record-cancel`)),
+  submit: /** @type {HTMLButtonElement} */ (requiredElement(`${name}-record-submit`))
+}));
 /** @type {Set<string>} */
 const activeThumbnailObjectUrls = new Set();
 
@@ -121,6 +146,8 @@ const state = {
   events: [],
   /** @type {FavoriteGroupRecord[]} */
   favoriteGroups: [],
+  /** @type {import("./lib/ui.js").WorldDisposition[]} */
+  worldDispositions: [],
   thumbnailCount: /** @type {number | null} */ (0),
   /** @type {UiStatus} */
   status: normalizeStatusResponse({}),
@@ -270,7 +297,7 @@ async function loadData(preferredUserId = null, preserveView = false) {
     }
     if (!current()) return false;
 
-    const profile = await selectProfile(preferredUserId ?? runtimeStatus.activeProfileId, database);
+    let profile = await selectProfile(preferredUserId ?? runtimeStatus.activeProfileId, database);
     if (!current()) return false;
     /** @type {WorldRecord[]} */
     let worlds = [];
@@ -280,13 +307,18 @@ async function loadData(preferredUserId = null, preserveView = false) {
     let favoriteGroups = [];
     /** @type {number | null} */
     let thumbnailCount = 0;
+    /** @type {import("./lib/ui.js").WorldDisposition[]} */
+    let worldDispositions = [];
+    let generation = 0;
+    let presentationGeneration = 0;
+    let unreadSummary = normalizeStatusResponse({}).unreadSummary;
     if (profile !== null) {
-      [worlds, events, favoriteGroups, thumbnailCount] = await Promise.all([
-        database.listWorlds(profile.userId),
-        database.listEvents(profile.userId),
-        database.listFavoriteGroups(profile.userId),
+      const [snapshot, savedThumbnailCount] = await Promise.all([
+        database.getDisplaySnapshot(profile.userId),
         readThumbnailCount(database, profile.userId)
       ]);
+      ({profile, worlds, events, favoriteGroups, worldDispositions, generation, presentationGeneration, unreadSummary} = snapshot);
+      thumbnailCount = savedThumbnailCount;
     }
     if (!current()) return false;
 
@@ -298,9 +330,11 @@ async function loadData(preferredUserId = null, preserveView = false) {
       readStorageEstimate()
     ]);
     if (!current()) return false;
-    const localSummary = summarizeHistory(worlds, events);
+    const localSummary = summarizeHistory(worlds, events, worldDispositions);
+    if (state.profile?.userId !== profile?.userId) closeRecordDialogs(false);
+    else if (state.status.generation !== generation || state.status.presentationGeneration !== presentationGeneration) invalidateRecordDialog();
     Object.assign(state, {
-      profile, worlds, events, favoriteGroups, thumbnailCount, statusAvailable, storageEstimate,
+      profile, worlds, events, favoriteGroups, worldDispositions, thumbnailCount, statusAvailable, storageEstimate,
       settings: {
         autoSyncEnabled: autoSyncEnabled !== false,
         notificationsEnabled: notificationsEnabled !== false,
@@ -312,6 +346,9 @@ async function loadData(preferredUserId = null, preserveView = false) {
         activeProfileId: profile?.userId ?? runtimeStatus.activeProfileId,
         lastSuccessfulSyncAt: profile?.lastSuccessfulSyncAt ?? runtimeStatus.lastSuccessfulSyncAt,
         nextSyncAt: runtimeStatus.nextSyncAt ?? dateSetting(storedNextSyncAt),
+        generation, presentationGeneration, unreadSummary,
+        unreadCount: unreadSummary.count ?? 0,
+        hiddenCount: hiddenWorldIds(worldDispositions).size,
         worldCount: worlds.length,
         eventCount: events.length,
         attentionWorldCount: localSummary.attention,
@@ -423,10 +460,18 @@ function renderAll() {
 }
 
 function renderPrimaryFocus() {
+  if (worldFilter.value === "hidden") {
+    primaryFocus.classList.remove("is-alert");
+    primaryFocusTitle.textContent = "非表示の記録";
+    primaryFocusDetail.textContent = "戻すと通常の一覧で再び確認できます。完全に削除する操作は取り消せません。";
+    lastSync.textContent = state.status.lastSuccessfulSyncAt === null ? "最終確認: まだありません" : `最終確認: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
+    return;
+  }
+  const hidden = hiddenWorldIds(state.worldDispositions);
   const overview = presentWorldOverview({...state.status, syncing: state.status.syncing || manualSyncInFlight}, {
     hasProfile: state.profile !== null,
     statusAvailable: state.statusAvailable,
-    pendingWorldCount: state.worlds.filter((world) => worldMatchesFilter(world, "pending")).length
+    pendingWorldCount: state.worlds.filter((world) => !hidden.has(world.worldId) && worldMatchesFilter(world, "pending")).length
   });
   primaryFocus.classList.toggle("is-alert", state.status.attentionWorldCount > 0);
   primaryFocusTitle.textContent = overview.title;
@@ -447,7 +492,7 @@ function renderConnection() {
     connectionBadge.classList.add("is-error");
   }
   connectionBadge.textContent = state.statusAvailable ? presentation.title : "状態を読み込めませんでした";
-  syncNowButton.disabled = state.status.syncing || restoring || purging || manualSyncInFlight;
+  syncNowButton.disabled = state.status.syncing || restoring || purging || manualSyncInFlight || recordMutationInFlight;
   syncNowButton.textContent = purging
     ? "削除しています…"
     : restoring
@@ -490,8 +535,9 @@ function renderConnection() {
 }
 
 function renderSummary() {
-  historyUnreadBadge.hidden = state.status.unreadCount === 0;
-  historyUnreadBadge.textContent = state.status.unreadCount > 99
+  historyUnreadBadge.setAttribute("aria-label", state.status.unreadSummary.uncertain ? "未読件数は未確定" : `未読の変更${state.status.unreadCount.toLocaleString("ja-JP")}件`);
+  historyUnreadBadge.hidden = !state.status.unreadSummary.uncertain && state.status.unreadCount === 0;
+  historyUnreadBadge.textContent = state.status.unreadSummary.uncertain ? "?" : state.status.unreadCount > 99
     ? "99+"
     : state.status.unreadCount.toLocaleString("ja-JP");
 }
@@ -544,11 +590,17 @@ function renderGroupFilter() {
 }
 
 function renderWorlds() {
+  const hidden = hiddenWorldIds(state.worldDispositions);
+  const focused = captureWorldFocus();
+  const expanded = new Set(Array.from(worldList.querySelectorAll(".world-card")).filter((card) => card.querySelector("details")?.open).map((card) => /** @type {HTMLElement} */ (card).dataset.worldId));
+  hiddenRecordsLink.textContent = `非表示の記録（${state.status.hiddenCount.toLocaleString("ja-JP")}件）`;
+  hiddenRecordsDescription.hidden = worldFilter.value !== "hidden";
+  renderPrimaryFocus();
   clearThumbnailObjectUrls();
   const renderGeneration = ++thumbnailRenderGeneration;
   const requestedFilter = worldFilter.value;
   const filter = VALID_FILTERS.has(requestedFilter)
-    ? /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending"} */ (requestedFilter)
+    ? /** @type {"attention" | "all" | "favorite" | "missing" | "unavailable" | "pending" | "hidden"} */ (requestedFilter)
     : "attention";
   const matching = filterWorlds(
     state.worlds,
@@ -556,7 +608,8 @@ function renderWorlds() {
     worldSearch.value,
     filter,
     groupFilter.value,
-    state.favoriteGroups
+    state.favoriteGroups,
+    state.worldDispositions
   );
   const visible = takeVisibleItems(matching, visibleWorldCount);
   /** @type {Map<string, Set<string>>} */
@@ -575,7 +628,8 @@ function renderWorlds() {
       createWorldCard(
         world,
         [...(previousNamesByWorld.get(world.worldId) ?? [])],
-        favoriteGroupLabels(world.favoriteTags, state.favoriteGroups)
+        favoriteGroupLabels(world.favoriteTags, state.favoriteGroups),
+        hidden.has(world.worldId)
       )
     );
   }
@@ -605,7 +659,7 @@ function renderWorlds() {
     const overview = presentWorldOverview(state.status, {
       hasProfile: state.profile !== null,
       statusAvailable: state.statusAvailable,
-      pendingWorldCount: state.worlds.filter((world) => worldMatchesFilter(world, "pending")).length
+      pendingWorldCount: state.worlds.filter((world) => !hidden.has(world.worldId) && worldMatchesFilter(world, "pending")).length
     });
     worldEmptyTitle.textContent = overview.title;
     worldEmptyDetail.textContent = overview.detail;
@@ -615,6 +669,15 @@ function renderWorlds() {
     worldEmptyTitle.textContent = "この条件に該当するワールドはありません";
     worldEmptyDetail.textContent = "「表示を変更・検索」から検索語や絞り込みを変えてください。";
   }
+  for (const card of worldList.querySelectorAll(".world-card")) {
+    const details = card.querySelector("details");
+    if (details !== null && expanded.has(/** @type {HTMLElement} */ (card).dataset.worldId)) details.open = true;
+  }
+  if (focused !== null && !recordDialogs.some(({dialog}) => dialog.open)) {
+    // Preserve a newer surviving control, but leave missing-card fallback to
+    // the action that still owns focus after its asynchronous refresh.
+    restoreWorldFocus(focused, !recordMutationInFlight);
+  }
   void hydrateWorldThumbnails(visible, renderGeneration);
 }
 
@@ -622,9 +685,10 @@ function renderWorlds() {
  * @param {WorldRecord} world
  * @param {readonly string[]} recordedPreviousNames
  * @param {readonly string[]} favoriteGroupNames
+ * @param {boolean} hidden
  * @returns {HTMLElement}
  */
-function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
+function createWorldCard(world, recordedPreviousNames, favoriteGroupNames, hidden) {
   const card = textElement("article", "world-card", "");
   card.dataset.worldId = world.worldId;
   card.classList.toggle("is-unavailable", world.availabilityState === "unavailable");
@@ -678,8 +742,270 @@ function createWorldCard(world, recordedPreviousNames, favoriteGroupNames) {
     }
     tags.append(tag);
   }
+  if (hidden) tags.append(textElement("span", "state-tag is-hidden", "非表示"));
+  const actions = textElement("div", "world-actions", "");
+  if (hidden) {
+    actions.append(createRecordButton("戻す", "RESTORE_HIDDEN_WORLD", world), createRecordButton("完全に削除", "PURGE_HIDDEN_WORLD", world));
+  } else if (worldMatchesFilter(world, "attention")) {
+    actions.append(createRecordButton("削除", "HIDE_WORLD", world));
+  }
   card.append(thumbnail, content, tags);
+  if (actions.childElementCount > 0) card.append(actions);
   return card;
+}
+
+/** @returns {{worldId: string, action: string, position: number} | null} */
+function captureWorldFocus() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !worldList.contains(active)) return null;
+  const card = active.closest(".world-card");
+  if (!(card instanceof HTMLElement) || card.dataset.worldId === undefined) return null;
+  return {worldId: card.dataset.worldId, action: active.dataset.recordAction ?? (active.tagName === "SUMMARY" ? "summary" : ""), position: Array.from(worldList.children).indexOf(card)};
+}
+
+/**
+ * @param {{worldId: string, action: string, position: number}} previous
+ * @param {boolean} [allowFallback]
+ */
+function restoreWorldFocus(previous, allowFallback = true) {
+  const cards = Array.from(worldList.querySelectorAll(".world-card"));
+  const same = cards.find((card) => card instanceof HTMLElement && card.dataset.worldId === previous.worldId);
+  const target = same ?? (allowFallback ? cards[previous.position] ?? cards[previous.position - 1] : undefined);
+  const buttons = target === undefined ? [] : Array.from(target.querySelectorAll("button, summary"));
+  const action = buttons.find((button) => button instanceof HTMLElement && (previous.action === "summary" ? button.tagName === "SUMMARY" : button.dataset.recordAction === previous.action))
+    ?? (allowFallback ? buttons.find((button) => button instanceof HTMLElement && button.dataset.recordAction !== undefined) ?? buttons[0] : undefined);
+  if (action instanceof HTMLElement) action.focus();
+  else if (allowFallback) primaryFocusTitle.focus();
+}
+
+/** @param {string} label @param {RecordCommand} type @param {WorldRecord} world */
+function createRecordButton(label, type, world) {
+  const button = /** @type {HTMLButtonElement} */ (textElement("button", `button ${type === "RESTORE_HIDDEN_WORLD" ? "button-secondary" : "button-danger-quiet"}`, label));
+  button.type = "button";
+  button.dataset.recordAction = type;
+  button.disabled = recordMutationInFlight || restoring || purging || state.status.syncing;
+  button.addEventListener("click", () => {
+    if (recordMutationInFlight || restoring || purging || state.profile === null) return;
+    const action = {
+      type, userId: state.profile.userId, worldId: world.worldId,
+      expectedGeneration: state.status.generation,
+      expectedPresentationGeneration: state.status.presentationGeneration,
+      expectedRevision: world.revision,
+      trigger: button,
+      position: Array.from(worldList.children).findIndex((card) => card instanceof HTMLElement && card.dataset.worldId === world.worldId),
+      navigation: navigationEpoch
+    };
+    if (type === "RESTORE_HIDDEN_WORLD") void performRecordAction(action);
+    else void openRecordDialog(action);
+  });
+  return button;
+}
+
+/** @param {boolean} [restoreFocus] */
+function closeRecordDialogs(restoreFocus = true) {
+  recordDialogEpoch += 1;
+  const previous = recordDialogAction;
+  recordDialogAction = null;
+  for (const controls of recordDialogs) {
+    if (controls.dialog.open) controls.dialog.close();
+    controls.target.replaceChildren();
+  }
+  if (recordDialogImageUrl !== null) URL.revokeObjectURL(recordDialogImageUrl);
+  recordDialogImageUrl = null;
+  if (restoreFocus && previous !== null && !pageClosed && previous.navigation === navigationEpoch) {
+    if (previous.trigger.isConnected) previous.trigger.focus();
+    else restoreWorldFocus({worldId: previous.worldId, action: previous.type, position: previous.position});
+  }
+}
+
+function invalidateRecordDialog() {
+  recordDialogEpoch += 1;
+  if (recordDialogImageUrl !== null) URL.revokeObjectURL(recordDialogImageUrl);
+  recordDialogImageUrl = null;
+  for (const controls of recordDialogs) {
+    if (!controls.dialog.open) continue;
+    controls.submit.disabled = true;
+    controls.target.querySelector("img")?.remove();
+    controls.feedback.textContent = "記録が更新されました。もう一度確認してください";
+  }
+}
+
+/** @param {RecordAction} action */
+async function openRecordDialog(action) {
+  closeRecordDialogs(false);
+  const epoch = recordDialogEpoch;
+  const viewEpoch = progressEpoch;
+  const renderGeneration = thumbnailRenderGeneration;
+  const database = requireRepository();
+  const current = () => !pageClosed && repository === database && epoch === recordDialogEpoch
+    && viewEpoch === progressEpoch && renderGeneration === thumbnailRenderGeneration
+    && action.navigation === navigationEpoch && state.profile?.userId === action.userId;
+  action.trigger.setAttribute("aria-busy", "true");
+  try {
+    // All confirmation content comes from a fresh atomic display snapshot.
+    // A separate Blob read is never published after a newer view or account.
+    const [snapshot, thumbnails, activeProfileId] = await Promise.all([
+      database.getDisplaySnapshot(action.userId),
+      database.getThumbnails(action.userId, [action.worldId]),
+      database.getSetting("activeProfileId")
+    ]);
+    if (!current()) return;
+    const world = snapshot.worlds.find((candidate) => candidate.worldId === action.worldId);
+    const disposition = snapshot.worldDispositions.find((row) => row.worldId === action.worldId);
+    if (activeProfileId !== action.userId || snapshot.profile === null || world === undefined
+      || snapshot.generation !== action.expectedGeneration || snapshot.presentationGeneration !== action.expectedPresentationGeneration
+      || world.revision !== action.expectedRevision
+      || (action.type === "HIDE_WORLD" ? disposition !== undefined || !worldMatchesFilter(world, "attention") : disposition?.state !== "hidden")) {
+      recordActionMessage.textContent = "記録が更新されました。もう一度確認してください";
+      await loadData(null, true);
+      return;
+    }
+    const controls = recordDialogs.find(({name}) => name === (action.type === "HIDE_WORLD" ? "hide" : "purge"));
+    if (controls === undefined) return;
+    const name = world.currentName ?? "名前を確認できないワールド";
+    controls.target.append(
+      textElement("p", "world-meta", `アカウント: ${snapshot.profile.displayName}（${action.userId}）`),
+      textElement("strong", "", name),
+      textElement("p", "world-meta", `World ID: ${action.worldId}`),
+      textElement("p", "world-meta", `保存画像: ${thumbnails.length > 0 ? "あり" : "なし"} / 変更履歴: ${snapshot.events.filter((event) => event.worldId === action.worldId).length.toLocaleString("ja-JP")}件`)
+    );
+    const thumbnail = thumbnails[0];
+    if (thumbnail !== undefined) {
+      const image = document.createElement("img");
+      recordDialogImageUrl = URL.createObjectURL(thumbnail.blob);
+      image.src = recordDialogImageUrl;
+      image.alt = `「${name}」の保存画像`;
+      image.addEventListener("error", () => {
+        if (current()) image.replaceWith(textElement("p", "world-meta", "保存画像を表示できませんでした"));
+      }, {once: true});
+      controls.target.append(image);
+    }
+    controls.description.textContent = action.type === "HIDE_WORLD"
+      ? `『${name}』を通常の一覧から隠します。名前・画像・変更履歴は残り、『非表示の記録』から戻せます。同期と通知は続きます。VRChatのお気に入りは変更しません`
+      : `『${name}』の保存名・画像・変更履歴を、このブラウザから完全に削除します。この操作は取り消せません。\n現在のJSONバックアップには画像が含まれないため、削除した画像はJSONから戻せません。\n同じ記録の再表示を防ぐためWorld IDだけを残します。今後、VRChatのお気に入りで利用可能と確認できた場合は、新しい記録として保存します。\nVRChatのお気に入りや、ほかのワールドの記録は変更しません${world.membershipState === "favorited" && world.availabilityState === "accessible" ? "\n現在は利用可能なため、次回の確認で新しい記録として保存される可能性があります" : ""}`;
+    controls.feedback.textContent = "";
+    controls.cancel.textContent = "キャンセル";
+    controls.submit.disabled = false;
+    recordDialogAction = action;
+    controls.dialog.showModal();
+    controls.cancel.focus();
+  } catch {
+    if (current()) recordActionMessage.textContent = "確認用の記録を読み込めませんでした。削除は開始していません。画面を再読み込みして、もう一度お試しください。";
+  } finally {
+    action.trigger.removeAttribute("aria-busy");
+  }
+}
+
+/** @param {string} code */
+function recordErrorMessage(code) {
+  if (code === "RECORD_CHANGED" || code === "NO_ACTIVE_PROFILE") return "記録が更新されました。もう一度確認してください";
+  if (code === "SYNC_IN_PROGRESS" || code === "MAINTENANCE_IN_PROGRESS") return "同期・画像保存・ほかの記録操作が進行中のため開始しませんでした。終了後にもう一度お試しください。";
+  return "記録を変更できませんでした。保存状態を確認してから、もう一度お試しください。";
+}
+
+/** @param {RecordAction} action */
+async function performRecordAction(action) {
+  if (recordMutationInFlight || restoring || purging || pageClosed || state.profile?.userId !== action.userId
+    || action.navigation !== navigationEpoch) return;
+  if (action.expectedGeneration !== state.status.generation || action.expectedPresentationGeneration !== state.status.presentationGeneration) {
+    invalidateRecordDialog();
+    recordActionMessage.textContent = "記録が更新されました。もう一度確認してください";
+    return;
+  }
+  recordMutationInFlight = true;
+  const database = requireRepository();
+  const current = () => !pageClosed && repository === database && action.navigation === navigationEpoch && state.profile?.userId === action.userId;
+  for (const controls of recordDialogs) {
+    controls.submit.disabled = true;
+    if (controls.dialog.open) {
+      controls.cancel.textContent = "閉じる";
+      controls.feedback.textContent = "記録を更新しています。閉じても処理は続きます。結果は保存状態を確認して表示します。";
+    }
+  }
+  for (const button of worldList.querySelectorAll("button")) button.disabled = true;
+  renderConnection();
+  renderSettings();
+  recordActionMessage.textContent = "記録を更新しています…";
+  let saved = false;
+  let scheduleWarning;
+  let failure = "";
+  let moveFocus = action.type === "RESTORE_HIDDEN_WORLD";
+  let focusEpoch = recordInteractionEpoch;
+  try {
+    let raw;
+    try {
+      raw = await sendMessage({type: action.type, userId: action.userId, worldId: action.worldId,
+        expectedGeneration: action.expectedGeneration, expectedPresentationGeneration: action.expectedPresentationGeneration,
+        expectedRevision: action.expectedRevision});
+    } catch {
+      raw = null;
+    }
+    saved = isRecord(raw) && raw.ok === true && raw.recordSaved === true;
+    scheduleWarning = saved && isRecord(raw) && raw.thumbnailScheduleWarning !== null;
+    if (!saved) {
+      if (isRecord(raw) && raw.ok === false && typeof raw.error === "string") {
+        failure = recordErrorMessage(raw.error);
+      } else {
+        // A lost response never authorizes another mutation. Check durable state.
+        const snapshot = await database.getDisplaySnapshot(action.userId);
+        const disposition = snapshot.worldDispositions.find((row) => row.worldId === action.worldId);
+        const exists = snapshot.worlds.some((world) => world.worldId === action.worldId);
+        saved = action.type === "HIDE_WORLD" ? exists && disposition?.state === "hidden"
+          : action.type === "RESTORE_HIDDEN_WORLD" ? exists && disposition === undefined
+          : !exists && disposition?.state === "purged";
+        failure = "操作結果を確認できませんでした。端末内の保存内容を読み直しました。内容を確認して、必要ならもう一度お試しください。";
+      }
+    }
+    if (!current()) return;
+    moveFocus = (moveFocus || recordDialogAction === action) && focusEpoch === recordInteractionEpoch;
+    closeRecordDialogs(false);
+    // Closing our own native modal may restore its trigger focus synchronously.
+    focusEpoch = recordInteractionEpoch;
+    let refreshed = false;
+    try { refreshed = await loadData(null, true); } catch { /* A committed write remains committed. */ }
+    if (!current()) return;
+    if (saved) {
+      recordActionMessage.textContent = !refreshed
+        ? action.type === "PURGE_HIDDEN_WORLD" ? "削除は完了しました。表示を再読み込みしてください" : "記録の変更は完了しました。表示を再読み込みしてください"
+        : action.type === "HIDE_WORLD" ? "一覧から非表示にしました" : action.type === "RESTORE_HIDDEN_WORLD" ? "一覧に戻しました" : "記録を完全に削除しました";
+      if (scheduleWarning) recordActionMessage.textContent += "。データ保存は成功しました。画像予定の修復は保留されています。ブラウザを開き直すと修復を試みます。";
+    } else recordActionMessage.textContent = failure;
+  } catch {
+    if (current()) {
+      moveFocus = moveFocus && focusEpoch === recordInteractionEpoch;
+      closeRecordDialogs(false);
+      focusEpoch = recordInteractionEpoch;
+      recordActionMessage.textContent = saved ? "記録の変更は完了しました。表示を再読み込みしてください" : "操作結果を確認できませんでした。自動では再実行しません。画面を開き直して保存状態を確認してください。";
+    }
+  } finally {
+    recordMutationInFlight = false;
+    if (!pageClosed) {
+      renderConnection();
+      renderSettings();
+      for (const button of worldList.querySelectorAll("button")) button.disabled = state.status.syncing || restoring || purging;
+    }
+    if (current() && moveFocus && focusEpoch === recordInteractionEpoch) restoreWorldFocus({worldId: action.worldId, action: action.type, position: action.position});
+  }
+}
+
+for (const controls of recordDialogs) {
+  controls.cancel.addEventListener("click", () => closeRecordDialogs());
+  controls.dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeRecordDialogs();
+  });
+  controls.submit.addEventListener("click", () => {
+    if (controls.submit.disabled || recordDialogAction === null) return;
+    void performRecordAction(recordDialogAction);
+  });
+  // showModal supplies focus containment and inert background natively. Keep
+  // explicit keyboard wrapping for the two action buttons, including stale UI.
+  controls.dialog.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    const last = controls.submit.disabled ? controls.cancel : controls.submit;
+    if (event.shiftKey && document.activeElement === controls.cancel) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); controls.cancel.focus(); }
+  });
 }
 
 function clearThumbnailObjectUrls() {
@@ -702,6 +1028,7 @@ async function hydrateWorldThumbnails(worlds, renderGeneration) {
     return;
   }
   const profileId = state.profile.userId;
+  const database = repository;
   const worldIds = worlds.map((world) => world.worldId);
   /** @type {string[][]} */
   const batches = [];
@@ -709,12 +1036,12 @@ async function hydrateWorldThumbnails(worlds, renderGeneration) {
     batches.push(worldIds.slice(index, index + 50));
   }
   const isCurrent = () => renderGeneration === thumbnailRenderGeneration
-    && state.profile?.userId === profileId && repository !== null;
+    && !pageClosed && state.profile?.userId === profileId && repository === database;
   /** @type {Awaited<ReturnType<DatabaseRepository["getThumbnails"]>>} */
   let records;
   try {
     records = (await Promise.all(
-      batches.map((batch) => requireRepository().getThumbnails(profileId, batch))
+      batches.map((batch) => database.getThumbnails(profileId, batch))
     )).flat();
   } catch {
     if (isCurrent()) {
@@ -776,6 +1103,11 @@ async function hydrateWorldThumbnails(worlds, renderGeneration) {
 }
 
 function renderEvents() {
+  const hidden = hiddenWorldIds(state.worldDispositions);
+  const expanded = new Set(Array.from(eventList.querySelectorAll(".event-card")).filter((card) => card.querySelector("details")?.open).map((card) => /** @type {HTMLElement} */ (card).dataset.eventId));
+  const active = document.activeElement;
+  const focusedEvent = active instanceof HTMLElement && eventList.contains(active) ? active.closest(".event-card") : null;
+  const focusedId = focusedEvent instanceof HTMLElement ? focusedEvent.dataset.eventId : null;
   const requestedFilter = eventFilter.value;
   const filter = VALID_EVENT_FILTERS.has(requestedFilter)
     ? /** @type {"attention" | "all" | "renamed" | "group" | "missing" | "unavailable" | "restored"} */ (requestedFilter)
@@ -792,7 +1124,7 @@ function renderEvents() {
   }
   eventList.replaceChildren();
   for (const event of visible) {
-    eventList.append(createEventCard(event, worlds.get(event.worldId), histories.get(event.worldId) ?? []));
+    eventList.append(createEventCard(event, worlds.get(event.worldId), histories.get(event.worldId) ?? [], hidden.has(event.worldId)));
   }
   if (visible.length < matching.length) {
     const moreButton = /** @type {HTMLButtonElement} */ (
@@ -811,6 +1143,12 @@ function renderEvents() {
   }
   eventResultCount.textContent = `${matching.length.toLocaleString("ja-JP")}件中 ${visible.length.toLocaleString("ja-JP")}件を表示`;
   eventEmpty.hidden = matching.length !== 0;
+  for (const card of eventList.querySelectorAll(".event-card")) {
+    const details = card.querySelector("details");
+    const id = /** @type {HTMLElement} */ (card).dataset.eventId;
+    if (details !== null && expanded.has(id)) details.open = true;
+    if (id === focusedId && !recordDialogs.some(({dialog}) => dialog.open)) card.querySelector("summary")?.focus();
+  }
 }
 
 /**
@@ -835,11 +1173,13 @@ function showThumbnailMessage(container, message, actionLabel, action) {
  * @param {HistoryEvent} event
  * @param {WorldRecord | undefined} world
  * @param {readonly HistoryEvent[]} history
+ * @param {boolean} hidden
  * @returns {HTMLElement}
  */
-function createEventCard(event, world, history) {
+function createEventCard(event, world, history, hidden) {
   const presentation = presentEventKind(event.kind);
   const card = textElement("article", "event-card", "");
+  card.dataset.eventId = event.eventId;
   const content = document.createElement("div");
   const worldName =
     world?.currentName ?? (event.kind === "name_changed" ? event.after : event.worldId);
@@ -848,6 +1188,9 @@ function createEventCard(event, world, history) {
     textElement("p", "event-detail", eventDetail(event, world, state.favoriteGroups)),
     textElement("p", "event-detail", `${formatDateTime(event.observedAt)} · ${event.worldId}`)
   );
+  if (hidden) {
+    content.querySelector("h3")?.append(textElement("span", "state-tag is-hidden history-hidden-label", "非表示"));
+  }
   const details = document.createElement("details");
   details.className = "event-detail";
   const summary = document.createElement("summary");
@@ -980,8 +1323,10 @@ function renderSettings() {
     ? formatDateTime(state.status.nextSyncAt)
     : "自動確認はオフです";
   settingsPendingProbes.textContent = `${state.status.pendingProbeCount.toLocaleString("ja-JP")}件`;
-  settingsUnreadEvents.textContent = `${state.status.unreadCount.toLocaleString("ja-JP")}件`;
-  settingsWorldCount.textContent = `${state.worlds.length.toLocaleString("ja-JP")}件`;
+  settingsUnreadEvents.textContent = state.status.unreadSummary.uncertain ? "未読件数は未確定" : `${state.status.unreadCount.toLocaleString("ja-JP")}件`;
+  settingsUnreadDetail.hidden = !state.status.unreadSummary.uncertain;
+  settingsUnreadDetail.textContent = state.status.unreadSummary.uncertain ? UNREAD_UNCERTAIN_DETAIL : "";
+  settingsWorldCount.textContent = `${state.worlds.length.toLocaleString("ja-JP")}件（非表示${state.status.hiddenCount.toLocaleString("ja-JP")}件）`;
   settingsEventCount.textContent = `${state.events.length.toLocaleString("ja-JP")}件`;
   settingsGroupCount.textContent = `${state.favoriteGroups.length.toLocaleString("ja-JP")}件`;
   settingsThumbnailCount.textContent = state.thumbnailCount === null ? "確認できません" : `${state.thumbnailCount.toLocaleString("ja-JP")}件`;
@@ -1009,11 +1354,11 @@ function renderSettings() {
     : `${warnings.join(" ")} 大切な記録をバックアップしてください。`;
 
   const hasProfile = state.profile !== null;
-  exportButton.disabled = !hasProfile || restoring || purging;
-  importInput.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight;
+  exportButton.disabled = !hasProfile || restoring || purging || recordMutationInFlight;
+  importInput.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight || recordMutationInFlight;
   autoSyncToggle.disabled = restoring || purging;
   notificationToggle.disabled = restoring || purging;
-  purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight;
+  purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight || recordMutationInFlight;
 }
 
 /**
@@ -1064,7 +1409,7 @@ function initialTabFromHash(hash) {
  * @param {string} hash
  */
 function applyInitialRouteFilters(hash) {
-  worldFilter.value = hash === "#all" ? "all" : "attention";
+  worldFilter.value = hash === "#hidden" ? "hidden" : hash === "#all" ? "all" : "attention";
   eventFilter.value = hash === "#attention-events" ? "attention" : "all";
 }
 
@@ -1081,7 +1426,7 @@ async function markHistoryAsRead() {
     markFailed = true;
   }
   try {
-    await loadData();
+    await loadData(null, true);
   } catch {
     markFailed = true;
   } finally {
@@ -1101,6 +1446,9 @@ const initialTab = initialTabFromHash(window.location.hash);
 activateTab(initialTab);
 
 function navigateFromHash() {
+  navigationEpoch += 1;
+  closeRecordDialogs(false);
+  recordActionMessage.textContent = "";
   const tab = initialTabFromHash(window.location.hash);
   if (tab === "worlds") {
     applyInitialRouteFilters(window.location.hash);
@@ -1122,19 +1470,33 @@ for (const link of document.querySelectorAll("a[href^=\"#\"]")) {
   });
 }
 
+// A command may finish after the user has moved on to another control. Observe
+// focus-only moves as well as edits, without making the pending write stale.
+function observeRecordInteraction() {
+  recordInteractionEpoch += 1;
+}
+for (const eventName of ["focusin", "pointerdown", "keydown"]) {
+  document.addEventListener(eventName, observeRecordInteraction, true);
+}
+
 worldSearch.addEventListener("input", () => {
+  observeRecordInteraction();
   visibleWorldCount = PAGE_SIZE;
   renderWorlds();
 });
 worldFilter.addEventListener("change", () => {
+  observeRecordInteraction();
+  closeRecordDialogs(false);
   visibleWorldCount = PAGE_SIZE;
   renderWorlds();
 });
 groupFilter.addEventListener("change", () => {
+  observeRecordInteraction();
   visibleWorldCount = PAGE_SIZE;
   renderWorlds();
 });
 eventFilter.addEventListener("change", () => {
+  observeRecordInteraction();
   visibleEventCount = PAGE_SIZE;
   renderEvents();
 });
@@ -1161,7 +1523,7 @@ openVrchatButton.addEventListener("click", async () => {
 });
 
 async function performSync() {
-  if (state.status.syncing || purging || manualSyncInFlight) return;
+  if (state.status.syncing || purging || manualSyncInFlight || recordMutationInFlight) return;
   if (restoring) {
     showNotice(
       "バックアップを復元しています",
@@ -1270,6 +1632,16 @@ async function updateSettings() {
 autoSyncToggle.addEventListener("change", updateSettings);
 notificationToggle.addEventListener("change", updateSettings);
 
+/** @param {unknown} error @param {boolean} downloadStarted */
+function backupExportErrorMessage(error, downloadStarted) {
+  if (downloadStarted) return "ファイルの書き出しを開始しましたが、最終バックアップ日時を記録できませんでした。ファイルが保存されているか確認してください。";
+  if (error instanceof BackupExportLimitError) {
+    if (error.code === "DISPOSITIONS_LIMIT") return "非表示・削除済みIDが10,000件の上限を超えるため、バックアップを書き出せません。記録を自動で省略せず処理を停止しました";
+    if (error.code === "SIZE_LIMIT") return "バックアップが25MiBの上限を超えるため、バックアップを書き出せません。記録を自動で省略せず処理を停止しました";
+  }
+  return "バックアップを作成できませんでした。少し時間をあけて、もう一度お試しください。";
+}
+
 exportButton.addEventListener("click", async () => {
   if (state.profile === null) {
     backupMessage.textContent = "先に一度、お気に入りを確認してください。";
@@ -1300,10 +1672,8 @@ exportButton.addEventListener("click", async () => {
     state.settings.lastBackupAt = new Date(backedUpAt).toISOString();
     renderSettings();
     backupMessage.textContent = "バックアップを書き出しました。大切な場所へ保管してください。";
-  } catch {
-    backupMessage.textContent = downloadStarted
-      ? "ファイルの書き出しを開始しましたが、最終バックアップ日時を記録できませんでした。ファイルが保存されているか確認してください。"
-      : "バックアップを作成できませんでした。少し時間をあけて、もう一度お試しください。";
+  } catch (error) {
+    backupMessage.textContent = backupExportErrorMessage(error, downloadStarted);
   } finally {
     if (objectUrl !== null) {
       URL.revokeObjectURL(objectUrl);
@@ -1317,6 +1687,8 @@ importInput.addEventListener("change", async () => {
   if (file === undefined) {
     return;
   }
+  if (recordMutationInFlight || purging || restoring) return;
+  closeRecordDialogs(false);
   restoring = true;
   progressEpoch += 1;
   thumbnailRenderGeneration += 1;
@@ -1347,7 +1719,7 @@ importInput.addEventListener("change", async () => {
       return;
     }
     const freshStatus = normalizeStatusResponse(statusResponse);
-    const localSummary = summarizeHistory(state.worlds, state.events);
+    const localSummary = summarizeHistory(state.worlds, state.events, state.worldDispositions);
     state.status = {
       ...freshStatus,
       worldCount: state.worlds.length,
@@ -1364,8 +1736,9 @@ importInput.addEventListener("change", async () => {
     }
     const preview = backupSummary(validated);
     const previewName = preview.displayName.replace(/\s+/gu, " ").slice(0, 80);
+    const legacyWarning = preview.sourceVersion < 3 ? "\nこの旧形式には非表示・削除済みIDがありません。以前に削除した名前や履歴がファイルに含まれていれば、記録へ戻ります" : "";
     const approved = globalThis.confirm(
-      `${previewName}（${preview.userId}）の記録を復元します。\nワールド: ${preview.worldCount.toLocaleString("ja-JP")}件 / 履歴: ${preview.eventCount.toLocaleString("ja-JP")}件\n書き出し日時: ${formatDateTime(preview.exportedAt)}\n\n同じユーザーの現在の記録は、このバックアップの内容に置き換わります。続けますか？`
+      `${previewName}（${preview.userId}）の記録を復元します。\nワールド: ${preview.worldCount.toLocaleString("ja-JP")}件 / 履歴: ${preview.eventCount.toLocaleString("ja-JP")}件\n書き出し日時: ${formatDateTime(preview.exportedAt)}\n\n同じユーザーの現在の記録は、このバックアップの内容に置き換わります。\n表示/非表示・削除済みIDの扱いもバックアップの状態へ戻ります${legacyWarning}\n画像はこのJSONから復元できません。端末に残っている画像は引き続き利用します\n\n続けますか？`
     );
     if (!approved) {
       backupMessage.textContent = "復元を取り消しました。現在の記録は変更していません。";
@@ -1452,6 +1825,8 @@ function showDeletedState(message) {
   state.worlds = [];
   state.events = [];
   state.favoriteGroups = [];
+  state.worldDispositions = [];
+  closeRecordDialogs(false);
   state.thumbnailCount = 0;
   state.status = normalizeStatusResponse({});
   state.settings.lastBackupAt = null;
@@ -1461,7 +1836,7 @@ function showDeletedState(message) {
 }
 
 purgeUninstallButton.addEventListener("click", async () => {
-  if (repository === null || purging) {
+  if (repository === null || purging || recordMutationInFlight) {
     return;
   }
   const approved = globalThis.confirm(
@@ -1472,6 +1847,7 @@ purgeUninstallButton.addEventListener("click", async () => {
     return;
   }
 
+  closeRecordDialogs(false);
   purging = true;
   progressEpoch += 1;
   thumbnailRenderGeneration += 1;
@@ -1517,7 +1893,11 @@ async function refreshObservedStatus(status) {
   const profileChanged = status.activeProfileId !== null && status.activeProfileId !== state.profile?.userId;
   const savedResultsChanged = status.lastSuccessfulSyncAt !== null
     && status.lastSuccessfulSyncAt !== state.status.lastSuccessfulSyncAt;
-  if (profileChanged || savedResultsChanged) {
+  const generationChanged = status.generation !== state.status.generation
+    || status.presentationGeneration !== state.status.presentationGeneration;
+  if (status.activeProfileId !== (state.profile?.userId ?? null)) closeRecordDialogs(false);
+  else if (generationChanged) invalidateRecordDialog();
+  if (profileChanged || savedResultsChanged || generationChanged) {
     try {
       await loadData(null, true);
     } catch {
@@ -1530,8 +1910,8 @@ async function refreshObservedStatus(status) {
     }
     return true;
   }
-  const fields = /** @type {const} */ (["syncing", "authRequired", "nextSyncAt", "lastResult", "pendingProbeCount", "unreadCount", "favoriteGroupStatus"]);
-  const changed = !state.statusAvailable || fields.some((field) => state.status[field] !== status[field]);
+  const fields = /** @type {const} */ (["syncing", "authRequired", "nextSyncAt", "lastResult", "pendingProbeCount", "unreadCount", "unreadSummary", "favoriteGroupStatus"]);
+  const changed = !state.statusAvailable || fields.some((field) => JSON.stringify(state.status[field]) !== JSON.stringify(status[field]));
   state.statusAvailable = true;
   state.status = {...state.status, ...Object.fromEntries(fields.map((field) => [field, status[field]]))};
   if (changed) {
@@ -1544,7 +1924,7 @@ async function refreshObservedStatus(status) {
 }
 
 async function refreshThumbnailProgress() {
-  if (pageClosed || document.hidden || restoring || purging || progressPolling || repository === null) return;
+  if (pageClosed || document.hidden || restoring || purging || progressPolling || recordMutationInFlight || repository === null) return;
   progressPolling = true;
   const epoch = progressEpoch;
   const profileId = state.profile?.userId;
@@ -1600,6 +1980,7 @@ window.addEventListener(
   "pagehide",
   () => {
     pageClosed = true;
+    closeRecordDialogs(false);
     progressEpoch += 1;
     thumbnailRenderGeneration += 1;
     clearInterval(progressTimer);

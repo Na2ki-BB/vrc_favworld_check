@@ -27,6 +27,9 @@ export const MESSAGE_TYPES = Object.freeze({
   updateSettings: "UPDATE_SETTINGS",
   settingsChanged: "SETTINGS_CHANGED",
   markHistoryRead: "MARK_HISTORY_READ",
+  hideWorld: "HIDE_WORLD",
+  restoreHiddenWorld: "RESTORE_HIDDEN_WORLD",
+  purgeHiddenWorld: "PURGE_HIDDEN_WORLD",
   purgeAndUninstall: "PURGE_AND_UNINSTALL"
 });
 
@@ -213,7 +216,7 @@ export function createGatedSyncRunner(dependencies) {
  * never alter synchronization or history state.
  *
  * @param {{
- *   repository: Pick<import("./lib/database.js").DatabaseRepository, "getSetting" | "getUnreadCount">,
+ *   repository: Pick<import("./lib/database.js").DatabaseRepository, "getSetting" | "getUnreadSummary">,
  *   setBadgeText: (details: {text: string}) => Promise<void>,
  *   setBadgeBackgroundColor: (details: {color: string}) => Promise<void>
  * }} dependencies
@@ -223,11 +226,13 @@ export function createBadgeUpdater(dependencies) {
     const activeProfileId = await dependencies.repository.getSetting(
       SETTING_KEYS.activeProfileId
     );
-    const unreadCount = typeof activeProfileId === "string"
-      ? await dependencies.repository.getUnreadCount(activeProfileId)
-      : 0;
-    const text = unreadCount <= 0 ? "" : unreadCount > 99 ? "99+" : String(unreadCount);
-    await dependencies.setBadgeBackgroundColor({ color: "#B4234D" });
+    const summary = typeof activeProfileId === "string"
+      ? await dependencies.repository.getUnreadSummary(activeProfileId)
+      : { exact: true, uncertain: false, count: 0 };
+    const unreadCount = summary.count ?? 0;
+    const text = !summary.exact || summary.uncertain ? "?"
+      : unreadCount <= 0 ? "" : unreadCount > 99 ? "99+" : String(unreadCount);
+    await dependencies.setBadgeBackgroundColor({ color: "#8B3028" });
     await dependencies.setBadgeText({ text });
   };
 }
@@ -240,7 +245,7 @@ export function createBadgeUpdater(dependencies) {
  *
  * @param {{
  *   service: Pick<SyncService, "syncing" | "repairScheduleBestEffort"> &
- *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort">>,
+ *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort" | "recordMutating">>,
  *   repository: Pick<import("./lib/database.js").DatabaseRepository, "beginPurge" | "recoverFromFailedPurge" | "purgeAllData">,
  *   clearAlarm: () => Promise<boolean>,
  *   cleanupAuthCookies: () => Promise<void>,
@@ -263,7 +268,7 @@ export function createPurgeController(dependencies) {
   };
 
   const purgeAndUninstall = async () => {
-    if (purging || dependencies.service.syncing) {
+    if (purging || dependencies.service.syncing || dependencies.service.recordMutating) {
       return /** @type {const} */ ({
         ok: false,
         error: "SYNC_IN_PROGRESS",
@@ -360,7 +365,11 @@ export function createAlarmEventHandler(dependencies) {
         return;
       }
       const result = await runSync(trigger);
-      if (!result.ok && result.error === "SECURITY_RULE_UNAVAILABLE") {
+      if (!result.ok && (result.error === "SECURITY_RULE_UNAVAILABLE"
+        || result.error === "MAINTENANCE_IN_PROGRESS")) {
+        // A one-shot alarm is already consumed, even when a short record
+        // reservation keeps it out of the runner. Recover the ordinary sync
+        // schedule; the service still honors purge and disabled-auto guards.
         await service.repairScheduleBestEffort();
       }
     } catch {
@@ -390,7 +399,8 @@ export function createAlarmEventHandler(dependencies) {
  *
  * @param {{
  *   service: Pick<SyncService, "getStatus" | "updateSettings" | "repairSchedule" | "markHistoryRead"> &
- *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort">>,
+ *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort" | "mutateRecord">>,
+ *   canMutateRecord?: () => boolean,
  *   startSync: ReturnType<typeof createGatedSyncRunner>,
  *   openVrchat: () => Promise<void>,
  *   openDashboard: () => Promise<void>,
@@ -467,6 +477,34 @@ export function createMessageHandler(dependencies) {
           // The read marker is the source of truth; badge repair is best-effort.
         }
         return { ok: true, unreadCount: 0 };
+      }
+      if (message.type === MESSAGE_TYPES.hideWorld
+        || message.type === MESSAGE_TYPES.restoreHiddenWorld
+        || message.type === MESSAGE_TYPES.purgeHiddenWorld) {
+        if (!isRecordMutationMessage(message) || dependencies.service.mutateRecord === undefined) {
+          return { ok: false, error: "INVALID_REQUEST" };
+        }
+        // This synchronous in-worker gate pairs with the service's immediate
+        // reservation, so whole-profile purge cannot slip between the two.
+        if (dependencies.canMutateRecord?.() === false) {
+          return { ok: false, error: "MAINTENANCE_IN_PROGRESS" };
+        }
+        const result = await dependencies.service.mutateRecord(
+          message.type === MESSAGE_TYPES.hideWorld ? "hide"
+            : message.type === MESSAGE_TYPES.restoreHiddenWorld ? "restore" : "purge",
+          {
+            userId: message.userId,
+            worldId: message.worldId,
+            expectedGeneration: message.expectedGeneration,
+            expectedPresentationGeneration: message.expectedPresentationGeneration,
+            expectedRevision: message.expectedRevision
+          }
+        );
+        if (result.ok) {
+          try { await dependencies.refreshBadge(); }
+          catch { /* The committed record remains the source of truth. */ }
+        }
+        return result;
       }
       if (message.type === MESSAGE_TYPES.purgeAndUninstall) {
         return dependencies.purgeAndUninstall();
@@ -578,7 +616,7 @@ function registerChromeBackground() {
       ensureUserAgentRule,
       startSync: (trigger) => service.start(trigger),
       keepAlive: (operation) => keepServiceWorkerAlive(operation),
-      canStart: purgeController.canStartSync,
+      canStart: () => purgeController.canStartSync() && !service.recordMutating,
       afterSync: refreshBadge
     }));
   const handlerPromise = Promise.all([
@@ -592,7 +630,8 @@ function registerChromeBackground() {
       openVrchat,
       openDashboard,
       refreshBadge,
-      purgeAndUninstall: purgeController.purgeAndUninstall
+      purgeAndUninstall: purgeController.purgeAndUninstall,
+      canMutateRecord: purgeController.canStartSync
     }));
   const handleAlarm = createAlarmEventHandler({
     getService: () => servicePromise,
@@ -621,6 +660,25 @@ function registerChromeBackground() {
     void notificationHandlers.onButtonClicked(notificationId, buttonIndex)
       .catch(() => undefined);
   });
+}
+
+/**
+ * A closed schema prevents arbitrary store/key selection and coerced IDs or
+ * generations. Canonical identifiers are checked again by the transaction.
+ * @param {Record<string, unknown>} value
+ * @returns {value is {type: string, userId: string, worldId: string,
+ *   expectedGeneration: number, expectedPresentationGeneration: number, expectedRevision: number}}
+ */
+function isRecordMutationMessage(value) {
+  const keys = ["type", "userId", "worldId", "expectedGeneration", "expectedPresentationGeneration", "expectedRevision"];
+  return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+    && typeof value.type === "string"
+    && typeof value.userId === "string"
+    && /^usr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value.userId)
+    && typeof value.worldId === "string"
+    && /^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value.worldId)
+    && [value.expectedGeneration, value.expectedPresentationGeneration, value.expectedRevision]
+      .every((number) => typeof number === "number" && Number.isSafeInteger(number) && number >= 0);
 }
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */

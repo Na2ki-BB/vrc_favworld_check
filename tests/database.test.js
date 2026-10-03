@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { IDBFactory, IDBKeyRange, IDBObjectStore } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange, IDBObjectStore, IDBIndex } from "fake-indexeddb";
 
 import {
   ANONYMOUS_RETENTION_OWNER,
@@ -11,6 +11,7 @@ import {
   DatabaseRepository,
   GenerationConflictError,
   PurgePendingError,
+  RecordStateConflictError,
   RevisionConflictError,
   STORES,
   SYNC_RUN_RETENTION_ANONYMOUS,
@@ -1092,7 +1093,7 @@ test("v1 databases migrate in place without losing records", async (context) => 
     (/** @type {Array<{ key: string, value: unknown }>} */ (stores.meta))
       .sort((left, right) => left.key.localeCompare(right.key)),
     [
-      { key: "backupFormatVersion", value: 2 },
+      { key: "backupFormatVersion", value: 3 },
       { key: "lastMigration", value: DATABASE_VERSION },
       { key: "schemaVersion", value: DATABASE_VERSION }
     ]
@@ -1142,7 +1143,7 @@ test("v2 databases add the thumbnail store without rewriting existing data", asy
     (/** @type {Array<{ key: string, value: unknown }>} */ (stores.meta))
       .sort((left, right) => left.key.localeCompare(right.key)),
     [
-      { key: "backupFormatVersion", value: 2 },
+      { key: "backupFormatVersion", value: 3 },
       { key: "lastMigration", value: DATABASE_VERSION },
       { key: "schemaVersion", value: DATABASE_VERSION }
     ]
@@ -1291,6 +1292,8 @@ test("getProfileStats counts worlds, events, and pending probes without double c
   assert.deepEqual(await database.getProfileStats(USER_A), {
     worldCount: 4,
     eventCount: 2,
+    hiddenCount: 0, generation: 1, presentationGeneration: 0,
+    unreadSummary: {exact: true, uncertain: false, count: 2},
     pendingProbeCount: 3,
     attentionWorldCount: 1,
     missingCount: 1,
@@ -1299,6 +1302,8 @@ test("getProfileStats counts worlds, events, and pending probes without double c
   assert.deepEqual(await database.getProfileStats(USER_B), {
     worldCount: 0,
     eventCount: 0,
+    hiddenCount: 0, generation: 0, presentationGeneration: 0,
+    unreadSummary: {exact: true, uncertain: false, count: 0},
     pendingProbeCount: 0,
     attentionWorldCount: 0,
     missingCount: 0,
@@ -1382,7 +1387,7 @@ test("purgeAllData atomically leaves only the purge guard and schema metadata", 
     (/** @type {Array<{ key: string, value: unknown }>} */ (stores.meta))
       .sort((left, right) => left.key.localeCompare(right.key)),
     [
-      { key: "backupFormatVersion", value: 2 },
+      { key: "backupFormatVersion", value: 3 },
       { key: "lastMigration", value: DATABASE_VERSION },
       { key: "schemaVersion", value: DATABASE_VERSION }
     ]
@@ -1568,4 +1573,428 @@ test("thumbnail checkpoints validate bounded data and atomically reject stale pr
   await assert.rejects(database.setThumbnailSettings(USER_A, 0, {thumbnailJob: job}), GenerationConflictError);
   await database.beginPurge();
   await assert.rejects(database.setThumbnailSettings(USER_A, 0, {thumbnailJob: job}), PurgePendingError);
+});
+
+/** @param {string} name */
+async function managementFixture(name) {
+  const factory = new IDBFactory();
+  const database = new DatabaseRepository({factory, name});
+  await database.open();
+  for (const userId of [USER_A, USER_B]) {
+    const worlds = [
+      {...world(userId, WORLD_A), membershipState: /** @type {const} */ ("not_in_favorites"), membershipMissCount: /** @type {const} */ (2)},
+      world(userId, WORLD_B)
+    ];
+    await database.commitSync({profile: profile(userId), worlds, favoriteGroups: [favoriteGroup(userId, GROUP_A)],
+      events: worlds.map((item) => event(userId, item.worldId)), syncRun: syncRun(userId),
+      expectedWorldRevisions: worlds.map((item) => ({userId, worldId: item.worldId, revision: null})),
+      expectedGeneration: 0, settings: successSettings(userId)});
+    for (const item of worlds) await database.putThumbnail(thumbnail(userId, item.worldId), 1);
+  }
+  await database.setSetting("activeProfileId", USER_A);
+  return {database, factory, name};
+}
+
+/** @param {DatabaseRepository} database @param {string} [worldId] */
+async function mutationInput(database, worldId = WORLD_A) {
+  const snapshot = await database.getDisplaySnapshot(USER_A);
+  const target = snapshot.worlds.find((item) => item.worldId === worldId);
+  assert.ok(target);
+  return {userId: USER_A, worldId, expectedGeneration: snapshot.generation,
+    expectedPresentationGeneration: snapshot.presentationGeneration, expectedRevision: target.revision};
+}
+
+/** @param {string} [userId] @param {number} [generation] */
+function thumbnailJob(userId = USER_A, generation = 1) {
+  return {version: 1, userId, generation, capturedAt: AT_2,
+    items: [WORLD_A, WORLD_B].map((id, index) => ({id, thumbnailImageUrl: thumbnail(userId, id).sourceUrl, attempts: index + 1})),
+    nextAttemptAt: Date.parse(AT_2) + 1000, state: "waiting"};
+}
+
+/** @param {IDBFactory} factory @param {string} name @param {string} key @param {unknown} value */
+async function rawSetting(factory, name, key, value) {
+  const raw = await openRawDatabase(factory, name);
+  try {
+    const transaction = raw.transaction(STORES.settings, "readwrite");
+    const done = transactionDone(transaction);
+    transaction.objectStore(STORES.settings).put({key, value});
+    await done;
+  } finally { raw.close(); }
+}
+
+test("hide and restore change only presentation, retain outbox and images, and survive natural recovery", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const job = thumbnailJob();
+  await database.setSetting("thumbnailJob", job);
+  await database.claimEvents(USER_A, AT_2, undefined, {expectedGeneration: 1});
+  const beforeWorlds = await database.listWorlds(USER_A);
+  const beforeEvents = await database.listEvents(USER_A);
+  const input = await mutationInput(database);
+  assert.deepEqual(await database.hideWorld(input), {generation: 1, presentationGeneration: 1});
+  assert.deepEqual(await database.listWorlds(USER_A), beforeWorlds);
+  assert.deepEqual(await database.listEvents(USER_A), beforeEvents);
+  assert.deepEqual(await database.getSetting("thumbnailJob"), job);
+  assert.equal((await database.listThumbnailMetadata(USER_A)).length, 2);
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 2});
+  const stats = await database.getProfileStats(USER_A);
+  assert.equal(stats.worldCount, 2);
+  assert.equal(stats.hiddenCount, 1);
+  assert.equal(stats.attentionWorldCount, 0);
+  assert.equal(stats.generation, 1);
+  assert.equal(stats.presentationGeneration, 1);
+  assert.deepEqual((await database.getBackupSnapshot(USER_A)).worldDispositions, [{userId: USER_A, worldId: WORLD_A, state: "hidden"}]);
+
+  const worlds = [world(USER_A, WORLD_A, 2), world(USER_A, WORLD_B)];
+  await database.commitSync({profile: profile(USER_A), worlds, favoriteGroups: [], events: [],
+    syncRun: {...syncRun(USER_A), syncId: "natural-recovery"}, expectedGeneration: 1,
+    expectedWorldRevisions: worlds.map((item) => ({userId: USER_A, worldId: item.worldId, revision: 1})), settings: successSettings(USER_A)});
+  assert.equal((await database.listWorldDispositions(USER_A))[0]?.state, "hidden");
+  assert.deepEqual(await database.restoreHiddenWorld(await mutationInput(database)), {generation: 2, presentationGeneration: 2});
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+  assert.deepEqual(await database.listEvents(USER_A), beforeEvents);
+  assert.equal(await database.getUnreadCount(USER_A), 2);
+});
+
+test("record mutations reject stale confirmations, wrong states, account changes and purge guards", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const input = await mutationInput(database);
+  await assert.rejects(database.hideWorld({...input, worldId: "not-a-world"}), /identifier/);
+  await assert.rejects(database.hideWorld({...input, expectedGeneration: 0}), GenerationConflictError);
+  await assert.rejects(database.hideWorld({...input, expectedPresentationGeneration: 1}), RecordStateConflictError);
+  await assert.rejects(database.hideWorld({...input, expectedRevision: 7}), RevisionConflictError);
+  await assert.rejects(database.hideWorld(await mutationInput(database, WORLD_B)), RecordStateConflictError);
+  await assert.rejects(database.restoreHiddenWorld(input), RecordStateConflictError);
+  await assert.rejects(database.purgeHiddenWorld(input), RecordStateConflictError);
+  await database.setSetting("activeProfileId", USER_B);
+  await assert.rejects(database.hideWorld(input), RecordStateConflictError);
+  await database.setSetting("activeProfileId", USER_A);
+  await database.hideWorld(input);
+  await assert.rejects(database.restoreHiddenWorld(input), RecordStateConflictError);
+  await assert.rejects(database.hideWorld(await mutationInput(database)), RecordStateConflictError);
+  const hiddenInput = await mutationInput(database);
+  await database.beginPurge();
+  for (const operation of ["hideWorld", "restoreHiddenWorld", "purgeHiddenWorld"]) {
+    await assert.rejects(database[/** @type {"hideWorld"|"restoreHiddenWorld"|"purgeHiddenWorld"} */ (operation)](hiddenInput), PurgePendingError);
+  }
+  assert.equal((await database.listWorlds(USER_A)).length, 2);
+  assert.equal((await database.listWorldDispositions(USER_A))[0]?.state, "hidden");
+});
+
+test("purge removes only the hidden target and atomically advances its waiting image job", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const job = thumbnailJob();
+  // The remaining world needs a newer image, so its attempts and retry stay pending.
+  job.items = job.items.map((item) => item.id === WORLD_B ? {...item, thumbnailImageUrl: item.thumbnailImageUrl.replace(/\/1\/file$/u, "/2/file")} : item);
+  await database.setSettings({thumbnailJob: job, thumbnailBackoffUntil: 12345,
+    thumbnailCaptureCursor: {userId: USER_A, items: job.items, next: WORLD_A}});
+  await database.hideWorld(await mutationInput(database));
+  const otherProfile = await database.getDisplaySnapshot(USER_B);
+  assert.deepEqual(await database.purgeHiddenWorld(await mutationInput(database)), {generation: 2, presentationGeneration: 2});
+  assert.deepEqual((await database.listWorlds(USER_A)).map((item) => item.worldId), [WORLD_B]);
+  assert.equal(await database.getThumbnail(USER_A, WORLD_A), null);
+  assert.ok(await database.getThumbnail(USER_A, WORLD_B));
+  assert.deepEqual((await database.listEvents(USER_A)).map((item) => item.worldId), [WORLD_B]);
+  assert.deepEqual(await database.listWorldDispositions(USER_A), [{userId: USER_A, worldId: WORLD_A, state: "purged"}]);
+  assert.deepEqual(await database.getSetting("thumbnailJob"), {...job, generation: 2, items: [job.items[1]]});
+  assert.equal(await database.getSetting("thumbnailBackoffUntil"), 12345);
+  assert.deepEqual(await database.getSetting("thumbnailCaptureCursor"), {userId: USER_A, items: [job.items[1]]});
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 1});
+  assert.deepEqual(await database.getDisplaySnapshot(USER_B), otherProfile);
+  assert.equal((await database.listFavoriteGroups(USER_A)).length, 1);
+  await assert.rejects(database.putThumbnail(thumbnail(USER_A, WORLD_A), 1), GenerationConflictError);
+  await assert.rejects(database.putThumbnail(thumbnail(USER_A, WORLD_A), 2), RecordStateConflictError);
+  await assert.rejects(database.setThumbnailSettings(USER_A, 1, {thumbnailJob: job}), GenerationConflictError);
+  await assert.rejects(database.setThumbnailSettings(USER_A, 2, {thumbnailJob: {...job, generation: 2}}), RecordStateConflictError);
+});
+
+test("purge sanitizes stale, malformed, empty, and foreign thumbnail jobs without reviving stale work", async (context) => {
+  const cases = ["stale", "stale-empty", "current-empty", "malformed-owned", "malformed-unowned", "foreign"];
+  for (const variant of cases) {
+    await context.test(variant, async (child) => {
+      const {database, factory, name} = await managementFixture(`${context.name}-${variant}`);
+      child.after(() => database.close());
+      let job = /** @type {unknown} */ (thumbnailJob());
+      if (variant === "stale") job = thumbnailJob(USER_A, 0);
+      if (variant === "stale-empty") job = {...thumbnailJob(USER_A, 0), items: [thumbnailJob().items[0]]};
+      if (variant === "current-empty") job = {...thumbnailJob(), items: [thumbnailJob().items[0]]};
+      if (variant === "malformed-owned") job = {userId: USER_A, items: "corrupt"};
+      if (variant === "malformed-unowned") job = {items: "corrupt"};
+      if (variant === "foreign") job = {userId: USER_B, items: "corrupt-but-foreign"};
+      await rawSetting(factory, name, "thumbnailJob", job);
+      await database.hideWorld(await mutationInput(database));
+      if (variant === "malformed-unowned") {
+        const before = await readAllStores(factory, name);
+        await assert.rejects(database.purgeHiddenWorld(await mutationInput(database)));
+        assert.deepEqual(await readAllStores(factory, name), before);
+      } else {
+        await database.purgeHiddenWorld(await mutationInput(database));
+        const after = await database.getSetting("thumbnailJob");
+        if (variant === "stale") assert.deepEqual(after, {...thumbnailJob(USER_A, 0), items: [thumbnailJob().items[1]]});
+        if (variant === "stale-empty" || variant === "malformed-owned") assert.equal(after, undefined);
+        if (variant === "current-empty") assert.deepEqual(after, {...thumbnailJob(), generation: 2, items: [], state: "complete", nextAttemptAt: null});
+        if (variant === "foreign") assert.deepEqual(after, job);
+      }
+    });
+  }
+});
+
+test("every purge write boundary rolls back all user data, jobs, generations and unread state", async (context) => {
+  const points = ["worldDispositions:put", "settings:put", "worlds:delete", "thumbnails:delete", "events:delete", "meta:unreadTracking", "meta:unreadCount", "meta:dataGeneration", "meta:presentationGeneration"];
+  for (const point of points) {
+    await context.test(point, async (child) => {
+      const {database, factory, name} = await managementFixture(`${context.name}-${point}`);
+      child.after(() => database.close());
+      await database.setSetting("thumbnailJob", thumbnailJob());
+      await database.hideWorld(await mutationInput(database));
+      const input = await mutationInput(database);
+      const before = await readAllStores(factory, name);
+      const originalPut = IDBObjectStore.prototype.put;
+      const originalDelete = IDBObjectStore.prototype.delete;
+      let injected = false;
+      IDBObjectStore.prototype.put = function(value, key) {
+        const entry = /** @type {{key?: string}} */ (value);
+        if (point === `${this.name}:put` || (this.name === "meta" && point === `meta:${entry.key?.split(":")[0]}`)) {
+          injected = true;
+          throw new Error("Injected atomic-write failure");
+        }
+        return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key);
+      };
+      IDBObjectStore.prototype.delete = function(key) {
+        if (point === `${this.name}:delete`) { injected = true; throw new Error("Injected atomic-delete failure"); }
+        return originalDelete.call(this, key);
+      };
+      try { await assert.rejects(database.purgeHiddenWorld(input)); }
+      finally { IDBObjectStore.prototype.put = originalPut; IDBObjectStore.prototype.delete = originalDelete; }
+      assert.equal(injected, true);
+      assert.deepEqual(await readAllStores(factory, name), before);
+    });
+  }
+});
+
+test("purged IDs require explicit generation-checked, eventless new accessible favorite commits", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  await database.hideWorld(await mutationInput(database));
+  await database.purgeHiddenWorld(await mutationInput(database));
+  const newWorld = {...world(USER_A, WORLD_A), firstSeenAt: AT_2, currentName: "Newly discovered"};
+  const commit = {profile: profile(USER_A), worlds: [newWorld], favoriteGroups: [], events: [],
+    syncRun: {...syncRun(USER_A), syncId: "new-discovery"}, expectedGeneration: 2,
+    expectedWorldRevisions: [{userId: USER_A, worldId: WORLD_A, revision: null}], settings: successSettings(USER_A)};
+  await assert.rejects(database.commitSync(commit), RecordStateConflictError);
+  await assert.rejects(database.commitSync({...commit, expectedGeneration: 1, releasedPurgedWorldIds: [WORLD_A]}), GenerationConflictError);
+  await assert.rejects(database.commitSync({...commit, events: [event(USER_A, WORLD_A)], releasedPurgedWorldIds: [WORLD_A]}), RecordStateConflictError);
+  await assert.rejects(database.commitSync({...commit, worlds: [{...newWorld, membershipState: "not_in_favorites"}], releasedPurgedWorldIds: [WORLD_A]}), RecordStateConflictError);
+  await database.commitSync({...commit, releasedPurgedWorldIds: [WORLD_A]});
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+  assert.deepEqual((await database.listWorlds(USER_A)).find((item) => item.worldId === WORLD_A), newWorld);
+  assert.equal(await database.getThumbnail(USER_A, WORLD_A), null);
+  assert.equal((await database.listEvents(USER_A)).some((item) => item.worldId === WORLD_A), false);
+  await assert.rejects(database.putThumbnail(thumbnail(USER_A, WORLD_A), 1), GenerationConflictError);
+});
+
+test("restore replaces dispositions, removes only purged images and owned jobs, and resets both generations and unread", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  await database.setSetting("thumbnailJob", thumbnailJob());
+  const replacement = {profile: profile(USER_A), worlds: [world(USER_A, WORLD_B)], favoriteGroups: [], events: [],
+    worldDispositions: [{userId: USER_A, worldId: WORLD_A, state: /** @type {const} */ ("purged")},
+      {userId: USER_A, worldId: WORLD_B, state: /** @type {const} */ ("hidden")}]};
+  const before = await database.getDisplaySnapshot(USER_A);
+  await assert.rejects(database.replaceProfileData({...replacement, worlds: []}), /contradicts/);
+  await assert.rejects(database.replaceProfileData({...replacement, worldDispositions: [...replacement.worldDispositions, ...replacement.worldDispositions]}), /Invalid/);
+  assert.deepEqual(await database.getDisplaySnapshot(USER_A), before);
+  await database.replaceProfileData(replacement);
+  assert.deepEqual(await database.listWorldDispositions(USER_A), replacement.worldDispositions);
+  assert.equal(await database.getThumbnail(USER_A, WORLD_A), null);
+  assert.ok(await database.getThumbnail(USER_A, WORLD_B));
+  assert.equal(await database.getSetting("thumbnailJob"), undefined);
+  assert.equal(await database.getDataGeneration(USER_A), 2);
+  assert.equal(await database.getPresentationGeneration(USER_A), 1);
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 0});
+  await database.replaceProfileData({profile: profile(USER_A), worlds: [world(USER_A, WORLD_A)], favoriteGroups: [], events: []});
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+  assert.equal(await database.getThumbnail(USER_A, WORLD_A), null);
+  assert.ok(await database.getThumbnail(USER_A, WORLD_B));
+  assert.equal((await database.listWorlds(USER_B)).length, 2);
+  await database.clearProfile(USER_A);
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+  assert.equal(await database.getPresentationGeneration(USER_A), 3);
+  await database.purgeAllData();
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+  assert.equal(await database.getPresentationGeneration(USER_A), 0);
+});
+
+/** @param {IDBFactory} factory @param {string} name */
+async function createV3WithUnread(factory, name) {
+  await createV2Database(factory, name);
+  const request = factory.open(name, 3);
+  request.addEventListener("upgradeneeded", () => {
+    const raw = request.result;
+    const thumbnails = raw.createObjectStore("thumbnails", {keyPath: ["userId", "worldId"]});
+    thumbnails.createIndex("by-user", "userId");
+    thumbnails.put(thumbnail(USER_A, WORLD_A));
+    const transaction = request.transaction;
+    assert.ok(transaction);
+    transaction.objectStore("worlds").put({...world(USER_A, WORLD_A), membershipState: "not_in_favorites", membershipMissCount: 2});
+    transaction.objectStore("worlds").put({...world(USER_A, WORLD_B), membershipState: "not_in_favorites", membershipMissCount: 2});
+    transaction.objectStore("events").put(event(USER_A, WORLD_B));
+    transaction.objectStore("meta").put({key: `unreadCount:${USER_A}`, value: 1});
+    transaction.objectStore("meta").put({key: `dataGeneration:${USER_A}`, value: 3});
+    transaction.objectStore("meta").put({key: "schemaVersion", value: 3});
+    transaction.objectStore("meta").put({key: "lastMigration", value: 3});
+    transaction.objectStore("settings").put({key: "activeProfileId", value: USER_A});
+  });
+  (await requestValue(request)).close();
+}
+
+test("v3 unread migration preserves the count, reports uncertainty without guessing, then resets accurately", async (context) => {
+  const factory = new IDBFactory();
+  await createV3WithUnread(factory, context.name);
+  const database = new DatabaseRepository({factory, name: context.name});
+  await database.open();
+  context.after(() => database.close());
+  assert.equal(await database.getDataGeneration(USER_A), 3);
+  assert.equal(await database.getUnreadCount(USER_A), 1);
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 1});
+  const claims = (await database.listEvents(USER_A)).map((item) => item.notificationClaimedAt);
+  await database.hideWorld(await mutationInput(database));
+  await database.purgeHiddenWorld(await mutationInput(database));
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: false, uncertain: true, count: null});
+  assert.equal(await database.getUnreadCount(USER_A), 1);
+  const remaining = (await database.listEvents(USER_A))[0];
+  assert.equal(remaining?.notificationClaimedAt, claims[1]);
+  await database.hideWorld(await mutationInput(database, WORLD_B));
+  await database.purgeHiddenWorld(await mutationInput(database, WORLD_B));
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 0});
+
+  await database.commitSync({profile: profile(USER_A), worlds: [world(USER_A, WORLD_C)], favoriteGroups: [], events: [event(USER_A, WORLD_C)],
+    syncRun: {...syncRun(USER_A), syncId: "after-legacy-deletion"}, expectedGeneration: 5,
+    expectedWorldRevisions: [{userId: USER_A, worldId: WORLD_C, revision: null}], settings: successSettings(USER_A)});
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 1});
+  await database.markEventsRead(USER_A);
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 0});
+  assert.equal((await database.listEvents(USER_A))[0]?.notificationClaimedAt, null);
+});
+
+test("v3 upgrade failure rolls back schema and unread migration without touching existing data", async (context) => {
+  const factory = new IDBFactory();
+  await createV3WithUnread(factory, context.name);
+  const originalPut = IDBObjectStore.prototype.put;
+  IDBObjectStore.prototype.put = function(value, key) {
+    if (this.name === STORES.meta && String(/** @type {{key: string}} */ (value).key).startsWith("unreadTracking:")) throw new Error("Injected migration failure");
+    return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key);
+  };
+  const database = new DatabaseRepository({factory, name: context.name});
+  try { await assert.rejects(database.open()); }
+  finally { IDBObjectStore.prototype.put = originalPut; }
+  const raw = await openRawDatabase(factory, context.name);
+  assert.equal(raw.version, 3);
+  assert.equal(raw.objectStoreNames.contains("worldDispositions"), false);
+  const transaction = raw.transaction(["meta", "worlds", "thumbnails"], "readonly");
+  const done = transactionDone(transaction);
+  const [count, worlds, thumbnails] = await Promise.all([
+    requestValue(transaction.objectStore("meta").get(`unreadCount:${USER_A}`)),
+    requestValue(transaction.objectStore("worlds").count()), requestValue(transaction.objectStore("thumbnails").count())]);
+  assert.equal(count.value, 1);
+  assert.equal(worlds, 2);
+  assert.equal(thumbnails, 1);
+  await done;
+  raw.close();
+  await database.open();
+  context.after(() => database.close());
+  assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 1});
+});
+
+test("display snapshots and profile statistics never mix pre-hide counts with post-hide presentation generation", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const input = await mutationInput(database);
+  const [before, , after] = await Promise.all([database.getProfileStats(USER_A), database.hideWorld(input), database.getProfileStats(USER_A)]);
+  assert.equal(before.presentationGeneration, 0);
+  assert.equal(before.hiddenCount, 0);
+  assert.equal(before.attentionWorldCount, 1);
+  assert.equal(after.presentationGeneration, 1);
+  assert.equal(after.hiddenCount, 1);
+  assert.equal(after.attentionWorldCount, 0);
+});
+
+test("v1 and v2 upgrade preserve legacy unread counts and notification claims", async (context) => {
+  for (const version of [1, 2]) await context.test(`v${version}`, async (child) => {
+    const factory = new IDBFactory();
+    const name = `${context.name}-${version}`;
+    if (version === 1) await createV1Database(factory, name);
+    else await createV2Database(factory, name);
+    const raw = await openRawDatabase(factory, name);
+    const transaction = raw.transaction(["meta", "events"], "readwrite");
+    const done = transactionDone(transaction);
+    transaction.objectStore("meta").put({key: `unreadCount:${USER_A}`, value: 7});
+    transaction.objectStore("events").put({...event(USER_A, WORLD_A), notificationClaimedAt: AT_2, notifiedAt: AT_2});
+    await done;
+    raw.close();
+    const database = new DatabaseRepository({factory, name});
+    await database.open();
+    child.after(() => database.close());
+    assert.deepEqual(await database.getUnreadSummary(USER_A), {exact: true, uncertain: false, count: 7});
+    assert.equal(await database.getUnreadCount(USER_A), 7);
+    assert.equal((await database.listEvents(USER_A))[0]?.notificationClaimedAt, AT_2);
+    assert.equal((await database.listEvents(USER_A))[0]?.notifiedAt, AT_2);
+    assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+    assert.equal(await database.getPresentationGeneration(USER_A), 0);
+  });
+});
+
+test("other connections cannot apply an old hide confirmation after restoration or double-submit the same hide", async (context) => {
+  const {database, factory, name} = await managementFixture(context.name);
+  const second = new DatabaseRepository({factory, name});
+  await second.open();
+  context.after(() => {database.close(); second.close();});
+  const input = await mutationInput(database);
+  const results = await Promise.allSettled([database.hideWorld(input), second.hideWorld(input)]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal((await database.listWorldDispositions(USER_A)).length, 1);
+  const pending = await mutationInput(database);
+  const replacement = database.replaceProfileData({profile: profile(USER_A), worlds: [world(USER_A, WORLD_A)], favoriteGroups: [], events: []});
+  const deletion = second.purgeHiddenWorld(pending);
+  await replacement;
+  await assert.rejects(deletion, GenerationConflictError);
+  assert.equal((await database.listWorlds(USER_A)).length, 1);
+  assert.deepEqual(await database.listWorldDispositions(USER_A), []);
+});
+
+test("sync and status snapshots avoid materializing history bodies", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const originalGetAll = IDBIndex.prototype.getAll;
+  IDBIndex.prototype.getAll = function(query, count) {
+    if (this.objectStore.name === STORES.events) throw new Error("History body read is unnecessary");
+    return originalGetAll.call(this, query, count);
+  };
+  try {
+    assert.equal((await database.getSyncSnapshot(USER_A)).worlds.length, 2);
+    assert.equal((await database.getProfileStats(USER_A)).eventCount, 2);
+  } finally { IDBIndex.prototype.getAll = originalGetAll; }
+});
+
+test("purge recomputes terminal image progress from remaining items", async (context) => {
+  for (const variant of ["partial-to-complete", "waiting-to-complete", "exhausted-to-partial"]) await context.test(variant, async (child) => {
+    const {database} = await managementFixture(`${context.name}-${variant}`);
+    child.after(() => database.close());
+    const job = thumbnailJob();
+    job.state = variant === "partial-to-complete" ? "partial" : "waiting";
+    job.items = job.items.map((item) => ({...item, attempts: 3,
+      thumbnailImageUrl: item.id === WORLD_A || variant === "exhausted-to-partial"
+        ? item.thumbnailImageUrl.replace(/\/1\/file$/u, "/2/file") : item.thumbnailImageUrl}));
+    await database.setSettings({thumbnailJob: job, thumbnailBackoffUntil: 12345});
+    await database.hideWorld(await mutationInput(database));
+    await database.purgeHiddenWorld(await mutationInput(database));
+    const isPartial = variant === "exhausted-to-partial";
+    assert.deepEqual(await database.getSetting("thumbnailJob"), {...job, generation: 2,
+      items: [job.items[1]], state: isPartial ? "partial" : "complete", nextAttemptAt: null});
+    assert.deepEqual(await database.getSetting("thumbnailCaptureStatus"), {userId: USER_A, capturedAt: AT_2,
+      saved: isPartial ? 0 : 1, skipped: 0, failed: isPartial ? 1 : 0, deferred: 0, retryAt: null});
+    assert.equal(await database.getSetting("thumbnailBackoffUntil"), 12345);
+  });
 });

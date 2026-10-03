@@ -6,6 +6,7 @@ import {
   isRecord,
   normalizeCommandResponse,
   normalizeStatusResponse,
+  UNREAD_UNCERTAIN_DETAIL,
   presentStatus,
   presentWorldOverview,
   presentThumbnailProgress
@@ -77,6 +78,9 @@ async function readStatus() {
   const overview = presentWorldOverview(status, {hasProfile: status.activeProfileId !== null});
   const attentionCount = Math.max(status.attentionWorldCount, status.unavailableCount, status.missingCount);
   const hasAttention = attentionCount > 0;
+  const unreadSummary = requiredElement("unread-summary");
+  unreadSummary.hidden = !status.unreadSummary.uncertain;
+  unreadSummary.textContent = status.unreadSummary.uncertain ? `未読件数は未確定。${UNREAD_UNCERTAIN_DETAIL}` : "";
   attentionCard.classList.toggle("is-alert", hasAttention);
   attentionTitle.textContent = overview.title;
   attentionDetail.textContent = hasAttention
@@ -86,6 +90,9 @@ async function readStatus() {
       : status.syncing
         ? "前回の記録を表示しています。この画面を閉じても確認は続きます。"
         : "前回の確認結果です。保存済みの記録は下のボタンから開けます。";
+  if (!hasAttention && status.hiddenCount > 0) {
+    attentionDetail.textContent = `非表示の記録が${status.hiddenCount.toLocaleString("ja-JP")}件あります。記録画面で確認できます`;
+  }
   dashboardButton.textContent = hasAttention ? "名前と画像を見る" : "保存済みの記録を見る";
   dashboardButton.className = `button ${hasBaseline ? "button-primary" : "button-secondary"}`;
 

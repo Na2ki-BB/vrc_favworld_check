@@ -103,6 +103,7 @@ export const MAX_PROBE_CANDIDATES = 20;
  * @property {'api_rejected' | 'permission_denied' | 'unavailable' | null} notificationError
  */
 
+/** @typedef {{userId: string, worldId: string, state: 'hidden' | 'purged'}} WorldDisposition */
 /** @typedef {{worldId: string, tags: readonly string[]}} FavoriteRelation */
 /** @typedef {{worldId: string, name: string, authorName: string, favoriteTags: readonly string[]}} WorldMetadata */
 /** @typedef {{worldId: string, status: 200 | 404, metadata?: WorldMetadata}} WorldProbe */
@@ -118,6 +119,8 @@ export const MAX_PROBE_CANDIDATES = 20;
  * @property {string} observedAt
  * @property {string} syncId
  * @property {boolean} isBaseline
+ * @property {readonly WorldDisposition[]} [worldDispositions]
+ * @property {boolean} [allowPurgedReintroduction] Only a fresh initial-generation commit may release suppression.
  */
 
 /**
@@ -126,6 +129,7 @@ export const MAX_PROBE_CANDIDATES = 20;
  * @property {readonly FavoriteRelation[]} favoriteRelations
  * @property {readonly WorldMetadata[]} metadata
  * @property {number} [limit]
+ * @property {readonly WorldDisposition[]} [worldDispositions]
  */
 
 /**
@@ -170,7 +174,7 @@ export function normalizeSearchText(value) {
  * this boundary, so only conclusive 200/404 probes are represented here.
  *
  * @param {ReconcileInput} input
- * @returns {{worlds: WorldRecord[], events: HistoryEvent[]}}
+ * @returns {{worlds: WorldRecord[], events: HistoryEvent[], releasedPurgedWorldIds: string[]}}
  */
 export function reconcileWorlds(input) {
   assertUserId(input.userId);
@@ -189,6 +193,12 @@ export function reconcileWorlds(input) {
     previousById.set(world.worldId, world);
   }
 
+  const purgedIds = new Set((input.worldDispositions ?? []).filter((row) => {
+    if (row.userId !== input.userId) {
+      throw new TypeError("Every disposition must belong to input.userId");
+    }
+    return row.state === "purged";
+  }).map((row) => row.worldId));
   const relationTagsById = indexFavoriteRelations(input.favoriteRelations);
   const metadataById = indexMetadata(input.metadata);
   const probesById = indexProbes(input.probes);
@@ -202,8 +212,21 @@ export function reconcileWorlds(input) {
   /** @type {HistoryEvent[]} */
   const events = [];
 
+  /** @type {string[]} */
+  const releasedPurgedWorldIds = [];
   for (const worldId of [...worldIds].sort(compareText)) {
-    const previous = previousById.get(worldId);
+    const suppressed = purgedIds.has(worldId);
+    const evidence = metadataById.get(worldId);
+    const detail = probesById.get(worldId);
+    if (suppressed) {
+      const availableFavorite = hasCanonicalMetadata(evidence, worldId)
+        || (relationTagsById.has(worldId) && detail?.status === 200
+          && hasCanonicalMetadata(detail.metadata, worldId));
+      if (input.allowPurgedReintroduction !== true || !availableFavorite) continue;
+      releasedPurgedWorldIds.push(worldId);
+    }
+    // A released ID starts a new baseline, never reuses old names or events.
+    const previous = suppressed ? undefined : previousById.get(worldId);
     const relationTags = relationTagsById.get(worldId);
     const bulkMetadata = metadataById.get(worldId);
     const probe = probesById.get(worldId);
@@ -235,7 +258,7 @@ export function reconcileWorlds(input) {
     events.push(...result.events);
   }
 
-  return {worlds, events};
+  return {worlds, events, releasedPurgedWorldIds};
 }
 
 /**
@@ -257,6 +280,8 @@ export function selectProbeCandidates(input) {
     return [];
   }
 
+  const purgedIds = new Set((input.worldDispositions ?? [])
+    .filter((row) => row.state === "purged").map((row) => row.worldId));
   const previousById = new Map(input.previousWorlds.map((world) => [world.worldId, world]));
   const relationIds = new Set(input.favoriteRelations.map((relation) => relation.worldId));
   const metadataIds = new Set(input.metadata.map((world) => world.worldId));
@@ -268,6 +293,7 @@ export function selectProbeCandidates(input) {
    * @param {number} priority
    */
   const offer = (worldId, priority) => {
+    if (purgedIds.has(worldId)) return;
     const existing = candidates.get(worldId);
     if (existing !== undefined && existing.priority <= priority) {
       return;
@@ -325,6 +351,14 @@ export function selectProbeCandidates(input) {
     .sort(compareProbeCandidates)
     .slice(0, limit)
     .map((candidate) => candidate.worldId);
+}
+
+/** @param {WorldMetadata | undefined} metadata @param {string} worldId */
+function hasCanonicalMetadata(metadata, worldId) {
+  return /^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(worldId)
+    && metadata?.worldId === worldId
+    && typeof metadata.name === "string" && metadata.name.trim() !== ""
+    && typeof metadata.authorName === "string";
 }
 
 /**
