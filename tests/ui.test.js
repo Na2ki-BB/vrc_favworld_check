@@ -1092,6 +1092,19 @@ test("popup primary entry is composed with the focused attention opener", async 
 });
 
 
+test("action popup keeps its intrinsic width independent of the initial viewport", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8"));
+  const html = await readFile(new URL("../extension/popup.html", import.meta.url), "utf8");
+  const css = await readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8");
+  const bodyRule = css.match(/(?:^|\n)body\s*\{([^}]+)\}/u)?.[1] ?? "";
+
+  assert.equal(manifest.action.default_popup, "popup.html");
+  assert.match(html, /href="styles\/popup\.css"/u);
+  assert.match(bodyRule, /(?:^|[;\n])\s*width:\s*370px\s*;/u);
+  // A popup's initial viewport is sized from this rule, so 100vw is circular.
+  assert.doesNotMatch(bodyRule, /(?:max-width|min-width|width):[^;]*(?:vw|vi|%)/u);
+});
+
 test("dashboard text and button palette stays above WCAG AA contrast", async () => {
   const css = await readFile(new URL("../extension/styles/dashboard.css", import.meta.url), "utf8");
   /** @param {string} hex */
