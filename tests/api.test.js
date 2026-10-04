@@ -17,6 +17,7 @@ import {
   PaginationError,
   RateLimitedError,
   ServerError,
+  TwoFactorRequiredError,
   UnexpectedRedirectError,
   VRCHAT_API_BASE_URL,
   VrchatApi,
@@ -157,7 +158,7 @@ test("getCurrentUser uses fixed read-only options and projects only safe fields"
   assert.equal(headers.has("Authorization"), false);
 });
 
-test("getCurrentUser discards documented and nested credential-like fields", async () => {
+test("auth probe discards documented and nested credential-like fields", async () => {
   const secret = "do-not-copy-this-value";
   const harness = createHarness([
     jsonResponse({
@@ -175,12 +176,84 @@ test("getCurrentUser discards documented and nested credential-like fields", asy
     })
   ]);
 
-  const user = await harness.api.getCurrentUser();
+  const user = await harness.api.getCurrentUser({ maxRetries: 0, timeoutMs: 5_000 });
 
   assert.deepEqual(user, { id: USER_ID, displayName: "利用者" });
   assert.deepEqual(Object.keys(user), ["id", "displayName"]);
   assert.equal(JSON.stringify(user).includes(secret), false);
   assert.equal(harness.calls.length, 1);
+});
+
+test("getCurrentUser recognizes a 2FA challenge without retaining response fields", async () => {
+  const secret = "do-not-copy-challenge-secrets";
+  const harness = createHarness([
+    jsonResponse({
+      requiresTwoFactorAuth: ["emailOtp", "totp", "future-method"],
+      authToken: secret,
+      nested: { cookie: secret },
+      id: USER_ID,
+      displayName: "challenge-must-not-return-user"
+    })
+  ]);
+
+  await assert.rejects(
+    harness.api.getCurrentUser({ maxRetries: 0, timeoutMs: 5_000 }),
+    (error) => {
+      assert.ok(error instanceof TwoFactorRequiredError);
+      assert.ok(error instanceof AuthRequiredError);
+      assert.equal(error.name, "TwoFactorRequiredError");
+      assert.equal(error.status, 200);
+      assert.equal(error.code, API_ERROR_CODES.AUTH_REQUIRED);
+      assert.equal(error.retryable, false);
+      assert.deepEqual(Object.keys(error).sort(), [
+        "category", "code", "name", "retryable", "status"
+      ]);
+      assert.equal(JSON.stringify(error).includes(secret), false);
+      return true;
+    }
+  );
+  assert.equal(harness.calls.length, 1);
+  assert.deepEqual(harness.sleeps, []);
+
+  const syncHarness = createHarness([
+    jsonResponse({ requiresTwoFactorAuth: ["totp"] })
+  ]);
+  await assert.rejects(syncHarness.api.getCurrentUser(), TwoFactorRequiredError);
+  assert.equal(syncHarness.calls.length, 1);
+});
+
+test("malformed 2FA challenges remain schema errors", async () => {
+  const malformed = [
+    null,
+    "totp",
+    [],
+    [""],
+    ["totp", 1],
+    ["x".repeat(API_MAX_TEXT_CODE_POINTS + 1)],
+    Array(API_MAX_TAGS + 1).fill("totp")
+  ];
+  for (const requiresTwoFactorAuth of malformed) {
+    const harness = createHarness([jsonResponse({ requiresTwoFactorAuth })]);
+    await assert.rejects(harness.api.getCurrentUser(), ApiSchemaError);
+    assert.equal(harness.calls.length, 1);
+  }
+});
+
+test("auth request policy rejects invalid values before making a request", async () => {
+  /** @type {unknown[]} */
+  const invalidOptions = [
+    null, [], "invalid",
+    ...[-1, 0.5, 3, NaN, Infinity, "0", null].map((maxRetries) => ({ maxRetries })),
+    ...[-1, 0, 0.5, 15_001, NaN, Infinity, "5000", null].map((timeoutMs) => ({ timeoutMs }))
+  ];
+  const harness = createHarness([]);
+  for (const options of invalidOptions) {
+    await assert.rejects(harness.api.getCurrentUser(
+      /** @type {import("../extension/lib/api.js").AuthRequestOptions} */ (options)
+    ), (error) => error instanceof TypeError || error instanceof RangeError);
+  }
+  assert.equal(harness.calls.length, 0);
+  assert.deepEqual(harness.sleeps, []);
 });
 
 test("getCurrentUser ignores unknown fields without traversing their structure", async () => {
@@ -774,12 +847,17 @@ test("401 and auth endpoint 403 stop immediately without retry", async () => {
   await assert.rejects(unauthorized.api.getCurrentUser(), (error) => {
     assert.ok(error instanceof AuthRequiredError);
     assert.equal(error.code, API_ERROR_CODES.AUTH_REQUIRED);
+    assert.equal(error.status, 401);
     return true;
   });
   assert.equal(unauthorized.calls.length, 1);
 
   const forbidden = createHarness([new Response(null, { status: 403 })]);
-  await assert.rejects(forbidden.api.getCurrentUser(), AuthRequiredError);
+  await assert.rejects(forbidden.api.getCurrentUser(), (error) => {
+    assert.ok(error instanceof AuthRequiredError);
+    assert.equal(error.status, 403);
+    return true;
+  });
   assert.equal(forbidden.calls.length, 1);
 });
 
@@ -826,6 +904,37 @@ test("5xx and network failures retry at most twice with short jittered delays", 
   assert.deepEqual(networkHarness.sleeps, [2_000, 4_000]);
 });
 
+test("auth probe does not retry network or server failures or change later sync retries", async () => {
+  for (const failure of [
+    { response: () => new Response(null, { status: 503 }), error: ServerError },
+    { response: () => new TypeError("network fixture"), error: NetworkError }
+  ]) {
+    const harness = createHarness(Array.from({ length: 4 }, () => failure.response()));
+    await assert.rejects(
+      harness.api.getCurrentUser({ maxRetries: 0, timeoutMs: 5_000 }),
+      failure.error
+    );
+    assert.equal(harness.calls.length, 1);
+    assert.deepEqual(harness.sleeps, []);
+
+    await assert.rejects(harness.api.getCurrentUser(), failure.error);
+    assert.equal(harness.calls.length, 4);
+    assert.deepEqual(harness.sleeps, [2_000, 2_000, 4_000]);
+  }
+});
+
+test("auth request policy can bound retries to one", async () => {
+  const harness = createHarness([
+    new Response(null, { status: 503 }),
+    jsonResponse({ id: USER_ID, displayName: "利用者" })
+  ]);
+  assert.deepEqual(await harness.api.getCurrentUser({ maxRetries: 1 }), {
+    id: USER_ID, displayName: "利用者"
+  });
+  assert.equal(harness.calls.length, 2);
+  assert.deepEqual(harness.sleeps, [2_000]);
+});
+
 test("manual redirects are rejected and never retried", async () => {
   const harness = createHarness([
     new Response(null, {
@@ -863,7 +972,7 @@ test("concurrent calls are serialized and start at least two seconds apart", asy
   ]);
 
   await Promise.all([
-    harness.api.getCurrentUser(),
+    harness.api.getCurrentUser({ maxRetries: 0, timeoutMs: 5_000 }),
     harness.api.getWorld(WORLD_ID)
   ]);
 
@@ -888,6 +997,45 @@ test("request timeout is classified as a retried network failure", async () => {
 
   await assert.rejects(harness.api.getCurrentUser(), NetworkError);
   assert.equal(harness.calls.length, 3);
+});
+
+test("auth probe aborts at five seconds and preserves the default fifteen-second timeout", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  /** @type {AbortSignal[]} */
+  const signals = [];
+  /** @type {() => void} */
+  let started = () => {};
+  const api = new VrchatApi({
+    fetch: async (input, init) => new Promise((resolve, reject) => {
+      void input;
+      void resolve;
+      assert.ok(init?.signal);
+      signals.push(init.signal);
+      init.signal.addEventListener("abort", () => {
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+      started();
+    }),
+    sleep: async () => {}
+  });
+
+  for (const [index, timeoutMs] of [5_000, 15_000].entries()) {
+    const requestStarted = new Promise((resolve) => {
+      started = () => resolve(undefined);
+    });
+    const result = assert.rejects(api.getCurrentUser(index === 0
+      ? { maxRetries: 0, timeoutMs }
+      : { maxRetries: 0 }), NetworkError);
+    await requestStarted;
+    const signal = signals[index];
+    assert.ok(signal);
+    context.mock.timers.tick(timeoutMs - 1);
+    assert.equal(signal.aborted, false);
+    context.mock.timers.tick(1);
+    await result;
+    assert.equal(signal.aborted, true);
+    assert.equal(signals.length, index + 1);
+  }
 });
 
 

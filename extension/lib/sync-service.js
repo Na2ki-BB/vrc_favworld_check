@@ -1,5 +1,7 @@
 // @ts-check
 
+import { ActiveRateLimitError } from "./auth-status.js";
+
 import {
   ApiSchemaError,
   isAllowedVrchatImageUrl,
@@ -1474,7 +1476,11 @@ export class SyncService {
     /** @type {number | null} */
     let backoffUntil = null;
 
-    if (input.error instanceof RateLimitedError) {
+    if (input.error instanceof ActiveRateLimitError) {
+      // Another operation already persisted this limit; do not count it twice.
+      backoffUntil = input.error.retryAt;
+      await this.#repository.setSetting(SETTING_KEYS.lastSyncResult, classified.runResult);
+    } else if (input.error instanceof RateLimitedError) {
       const previousCount = await this.#repository.getSetting(
         SETTING_KEYS.consecutiveRateLimits
       );

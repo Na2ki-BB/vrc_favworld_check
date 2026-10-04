@@ -1,5 +1,7 @@
 // @ts-check
 
+import { mountAuthStatusPanel } from "./lib/auth-status-ui.js";
+
 import {
   commandErrorMessage,
   formatDateTime,
@@ -86,7 +88,7 @@ async function readStatus() {
   attentionDetail.textContent = hasAttention
     ? "保存済みの名前と画像で確認できます。削除・非公開・手動解除の区別はできません。"
     : !hasBaseline
-      ? "公式サイトでログインしてから「今すぐ確認」を押してください。記録前に消えたワールドは復元できません。"
+      ? "「現在のログイン確認」を参考に「今すぐ確認」を押してください。記録前に消えたワールドは復元できません。"
       : status.syncing
         ? "前回の記録を表示しています。この画面を閉じても確認は続きます。"
         : "前回の確認結果です。保存済みの記録は下のボタンから開けます。";
@@ -107,8 +109,8 @@ async function readStatus() {
     : "";
   statusDetail.textContent = `${operationalPresentation.detail}${groupNameWarning}`;
   lastSync.textContent = status.lastSuccessfulSyncAt === null
-    ? "最終確認: まだありません"
-    : `最終確認: ${formatDateTime(status.lastSuccessfulSyncAt)}`;
+    ? "前回の同期成功: まだありません"
+    : `前回の同期成功: ${formatDateTime(status.lastSuccessfulSyncAt)}`;
   lastKnownSyncing = status.syncing;
   syncButton.disabled = status.syncing || syncInFlight;
   syncButton.textContent = syncButton.disabled ? "確認しています…" : "今すぐ確認";
@@ -126,7 +128,7 @@ function showUnavailableStatus() {
   statusDot.className = "status-dot is-error";
   statusTitle.textContent = "状態を読み込めませんでした";
   statusDetail.textContent = "拡張を開き直して、もう一度お試しください。保存済みの記録はそのままです。";
-  lastSync.textContent = "最終確認: 読み込めません";
+  lastSync.textContent = "前回の同期成功: 読み込めません";
   attentionCard.classList.remove("is-alert");
   attentionTitle.textContent = "最新の状態はまだ確認できていません";
   attentionDetail.textContent = "通信状態を読めない場合も、端末内に保存済みの記録は開けます。";
@@ -206,6 +208,8 @@ window.addEventListener("pagehide", () => {
   statusRequest += 1;
   clearInterval(progressTimer);
 }, { once: true });
+
+mountAuthStatusPanel({document, window, sendMessage});
 
 try {
   await refreshStatus();

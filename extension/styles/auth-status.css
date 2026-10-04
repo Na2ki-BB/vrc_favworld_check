@@ -1,0 +1,61 @@
+.auth-status-panel {
+  padding: 12px;
+  border: 1px solid #D4D8CF;
+  border-radius: 9px;
+  background: #FFFFFF;
+}
+.auth-status-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.auth-status-heading h2 {
+  margin: 0;
+  font-size: 13px;
+}
+.auth-status-heading .button {
+  width: auto;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.auth-status-panel strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.auth-status-panel p {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+.auth-status-panel[data-state="ready"] strong {
+  color: #356447;
+}
+.auth-status-panel[data-state="attention"] strong {
+  color: #725321;
+}
+.auth-status-panel .auth-cache-note {
+  color: #5C635A;
+  font-size: 11px;
+}
+#auth-open-vrchat-button {
+  margin-top: 10px;
+}
+.auth-status-panel .action-message {
+  color: #8B3028;
+}
+.auth-status-panel .action-message:empty {
+  display: none;
+}
+.app-shell .auth-status-panel {
+  margin-bottom: 24px;
+}
+.attention-card > .sync-section-label,
+.primary-focus > .sync-section-label {
+  margin: 0 0 6px;
+  color: #5C635A;
+  font-size: 12px;
+}
