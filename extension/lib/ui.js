@@ -257,8 +257,8 @@ export function presentStatus(status, now = Date.now()) {
   if (status.authRequired) {
     return {
       tone: "error",
-      title: "VRChatへのログインが必要です",
-      detail: "VRChat公式サイトでいつも通りログインしてから、もう一度確認してください。"
+      title: "前回の同期でログインを確認できませんでした",
+      detail: "現在の状態は「現在のログイン確認」を参照してください。必要ならVRChat公式サイトでログインし、「今すぐ確認」で同期をやり直してください。"
     };
   }
   if (status.lastResult === RESULT_CODES.rateLimited) {

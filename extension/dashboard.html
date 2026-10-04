@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VRC Favorite World History</title>
     <link rel="stylesheet" href="styles/dashboard.css">
+    <link rel="stylesheet" href="styles/auth-status.css">
   </head>
   <body>
     <div class="app-shell">
@@ -23,6 +24,22 @@
       </nav>
 
       <main>
+      <section id="auth-status-panel" class="auth-status-panel" aria-labelledby="auth-section-title">
+        <div class="auth-status-heading">
+          <h2 id="auth-section-title">現在のログイン確認</h2>
+          <button id="auth-recheck-button" class="button button-secondary" type="button" aria-label="ログイン状態を再確認" disabled>再確認</button>
+        </div>
+        <div aria-live="polite">
+          <strong id="auth-status-title">ログイン状態を確認しています…</strong>
+          <p id="auth-status-detail">お気に入りの同期とは別に確認しています。</p>
+          <p id="auth-checked-at" class="muted">確認時刻: 未確認</p>
+          <p id="auth-retry-at" class="muted" hidden></p>
+        </div>
+        <p class="auth-cache-note">結果は最大60秒再利用します</p>
+        <button id="auth-open-vrchat-button" class="button button-secondary" type="button" hidden>VRChat公式サイトを開く</button>
+        <p id="auth-action-message" class="action-message" role="status"></p>
+      </section>
+
         <section id="notice-panel" class="notice-panel" aria-live="polite" hidden>
           <div>
             <strong id="notice-title"></strong>
@@ -33,9 +50,10 @@
 
         <section id="worlds-panel" class="tab-panel" aria-labelledby="primary-focus-title">
           <section id="primary-focus" class="primary-focus" aria-live="polite">
+            <p class="sync-section-label">前回の同期結果</p>
             <h2 id="primary-focus-title" tabindex="-1">保存済みの記録を読み込んでいます</h2>
             <p id="primary-focus-detail">しばらくお待ちください。</p>
-            <p id="last-sync" class="muted">最終確認: まだありません</p>
+            <p id="last-sync" class="muted">前回の同期成功: まだありません</p>
             <p class="meaning-note">削除・非公開・自分でお気に入りから外した場合の区別はできません。</p>
           </section>
 

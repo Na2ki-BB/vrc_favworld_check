@@ -53,6 +53,7 @@ const WORLD_FAVORITE_GROUP_TYPES = new Set(["world", "vrcPlusWorld"]);
  * @typedef {() => number} RandomLike
  *
  * @typedef {{id: string, displayName: string}} AuthenticatedUser
+ * @typedef {{maxRetries?: number, timeoutMs?: number}} AuthRequestOptions
  * @typedef {{favoriteId: string, tags: string[], type: "world"}} FavoriteRelation
  * @typedef {{
  *   id: string,
@@ -114,6 +115,13 @@ export class AuthRequiredError extends VrchatApiError {
   constructor(status = 401) {
     super(API_ERROR_CODES.AUTH_REQUIRED, "auth", status, false);
     this.name = "AuthRequiredError";
+  }
+}
+
+export class TwoFactorRequiredError extends AuthRequiredError {
+  constructor() {
+    super(200);
+    this.name = "TwoFactorRequiredError";
   }
 }
 
@@ -214,15 +222,61 @@ export class VrchatApi {
     }
   }
 
-  /** @returns {Promise<AuthenticatedUser>} */
-  async getCurrentUser() {
-    const response = await this.#requestJson("/auth/user", false, true);
+  /**
+   * @param {AuthRequestOptions} [options]
+   * @returns {Promise<AuthenticatedUser>}
+   */
+  async getCurrentUser(options = {}) {
+    if (!isRecord(options)) {
+      throw new TypeError("auth request options must be an object");
+    }
+    const maxRetries = options.maxRetries === undefined
+      ? API_MAX_RETRIES
+      : options.maxRetries;
+    const timeoutMs = options.timeoutMs === undefined
+      ? this.#timeoutMs
+      : options.timeoutMs;
+    if (
+      !Number.isSafeInteger(maxRetries)
+      || maxRetries < 0
+      || maxRetries > API_MAX_RETRIES
+    ) {
+      throw new RangeError(`maxRetries must be an integer from 0 to ${API_MAX_RETRIES}`);
+    }
+    if (
+      options.timeoutMs !== undefined
+      && (
+        !Number.isSafeInteger(timeoutMs)
+        || timeoutMs <= 0
+        || timeoutMs > DEFAULT_TIMEOUT_MS
+      )
+    ) {
+      throw new RangeError(`timeoutMs must be an integer from 1 to ${DEFAULT_TIMEOUT_MS}`);
+    }
+    const response = await this.#requestJson(
+      "/auth/user", false, true, maxRetries, timeoutMs
+    );
     if (response.status !== 200) {
       throw new ApiSchemaError();
     }
 
     if (!isRecord(response.body)) {
       throw new ApiSchemaError();
+    }
+
+    // A successful auth response can instead request another login step.
+    // Validate only that known discriminator; never copy challenge details.
+    const requiresTwoFactorAuth = response.body.requiresTwoFactorAuth;
+    if (requiresTwoFactorAuth !== undefined) {
+      if (
+        !Array.isArray(requiresTwoFactorAuth)
+        || requiresTwoFactorAuth.length === 0
+        || requiresTwoFactorAuth.length > API_MAX_TAGS
+        || !requiresTwoFactorAuth.every(isNonEmptyString)
+      ) {
+        throw new ApiSchemaError();
+      }
+      throw new TwoFactorRequiredError();
     }
 
     // CurrentUser can contain fields such as authToken. Never enumerate or
@@ -437,18 +491,23 @@ export class VrchatApi {
    * @param {string} path
    * @param {boolean} allowNotFound
    * @param {boolean} authEndpoint
+   * @param {number} [maxRetries]
+   * @param {number} [timeoutMs]
    * @returns {Promise<ApiResponse>}
    */
-  async #requestJson(path, allowNotFound, authEndpoint) {
-    for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt += 1) {
+  async #requestJson(
+    path, allowNotFound, authEndpoint,
+    maxRetries = API_MAX_RETRIES, timeoutMs = this.#timeoutMs
+  ) {
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       try {
         return await this.#withThrottle(
-          () => this.#fetchJson(path, allowNotFound, authEndpoint)
+          () => this.#fetchJson(path, allowNotFound, authEndpoint, timeoutMs)
         );
       } catch (error) {
         const canRetry = error instanceof NetworkError
           || error instanceof ServerError;
-        if (!canRetry || attempt === API_MAX_RETRIES) {
+        if (!canRetry || attempt === maxRetries) {
           throw error;
         }
         await this.#sleep(this.#retryDelayMs(attempt));
@@ -462,11 +521,12 @@ export class VrchatApi {
    * @param {string} path
    * @param {boolean} allowNotFound
    * @param {boolean} authEndpoint
+   * @param {number} timeoutMs
    * @returns {Promise<ApiResponse>}
    */
-  async #fetchJson(path, allowNotFound, authEndpoint) {
+  async #fetchJson(path, allowNotFound, authEndpoint, timeoutMs) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     /** @type {Response} */
     let response;
 

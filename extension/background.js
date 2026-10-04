@@ -2,6 +2,8 @@
 
 import { VrchatApi } from "./lib/api.js";
 import { AuthCookieBridge } from "./lib/auth-cookie-bridge.js";
+import { ActiveRateLimitError, ApiSessionCoordinator, AUTH_STATUS_CACHE_KEY, createAuthStatusChecker } from "./lib/auth-status.js";
+import { calculateRateLimitBackoff } from "./lib/schedule.js";
 import { openDatabase } from "./lib/database.js";
 import { installUserAgentRule } from "./lib/dnr.js";
 import {
@@ -21,6 +23,7 @@ export const ALL_WORLDS_DASHBOARD_PATH = "dashboard.html#all";
 
 export const MESSAGE_TYPES = Object.freeze({
   getStatus: "GET_STATUS",
+  checkAuthStatus: "CHECK_AUTH_STATUS",
   startSync: "START_SYNC",
   openVrchat: "OPEN_VRCHAT",
   openDashboard: "OPEN_DASHBOARD",
@@ -401,6 +404,7 @@ export function createAlarmEventHandler(dependencies) {
  *   service: Pick<SyncService, "getStatus" | "updateSettings" | "repairSchedule" | "markHistoryRead"> &
  *     Partial<Pick<SyncService, "repairThumbnailScheduleBestEffort" | "mutateRecord">>,
  *   canMutateRecord?: () => boolean,
+ *   checkAuthStatus?: () => Promise<import("./lib/auth-status.js").AuthStatus>,
  *   startSync: ReturnType<typeof createGatedSyncRunner>,
  *   openVrchat: () => Promise<void>,
  *   openDashboard: () => Promise<void>,
@@ -421,6 +425,9 @@ export function createMessageHandler(dependencies) {
     try {
       if (message.type === MESSAGE_TYPES.getStatus) {
         return { ok: true, status: await dependencies.service.getStatus() };
+      }
+      if (message.type === MESSAGE_TYPES.checkAuthStatus && dependencies.checkAuthStatus) {
+        return { ok: true, auth: await dependencies.checkAuthStatus() };
       }
       if (message.type === MESSAGE_TYPES.startSync) {
         return dependencies.startSync("manual");
@@ -519,6 +526,8 @@ export function createMessageHandler(dependencies) {
 function registerChromeBackground() {
   const repositoryPromise = openDatabase();
   const authCookieBridge = new AuthCookieBridge({ cookies: chrome.cookies });
+  const apiSessions = new ApiSessionCoordinator();
+  const api = new VrchatApi();
   const alarmAdapter = {
     get: (/** @type {string} */ name) => chrome.alarms.get(name),
     create: async (
@@ -540,13 +549,20 @@ function registerChromeBackground() {
   const ensureUserAgentRule = () => installRule();
   const servicePromise = repositoryPromise.then((repository) => new SyncService({
     repository,
-    api: new VrchatApi(),
+    api,
     alarms: alarmAdapter,
     notifications: {
       getPermissionLevel: () => chrome.notifications.getPermissionLevel(),
       create: (id, options) => chrome.notifications.create(id, options)
     },
-    withApiSession: (operation) => authCookieBridge.withTemporaryApiCookies(operation)
+    withApiSession: (operation) => apiSessions.run(async () => {
+      // A queued sync must also honor a limit observed by an earlier auth probe.
+      const until = await repository.getSetting(SETTING_KEYS.backoffUntil);
+      if (typeof until === "number" && Number.isFinite(until) && until > Date.now()) {
+        throw new ActiveRateLimitError(until, Date.now());
+      }
+      return authCookieBridge.withTemporaryApiCookies(operation);
+    })
   }));
 
   const badgeUpdaterPromise = repositoryPromise.then((repository) => createBadgeUpdater({
@@ -561,7 +577,7 @@ function registerChromeBackground() {
 
   const initialize = async () => {
     const ruleReady = installRule().catch(() => undefined);
-    const cookieCleanup = authCookieBridge.cleanupStaleCookies().catch(() => undefined);
+    const cookieCleanup = apiSessions.run(() => authCookieBridge.cleanupStaleCookies()).catch(() => undefined);
     try {
       const service = await servicePromise;
       await service.repairScheduleBestEffort();
@@ -607,7 +623,7 @@ function registerChromeBackground() {
         await chrome.alarms.clear(THUMBNAIL_ALARM_NAME);
         return cleared;
       },
-      cleanupAuthCookies: () => authCookieBridge.cleanupStaleCookies(),
+      cleanupAuthCookies: () => apiSessions.run(() => authCookieBridge.cleanupStaleCookies()),
       clearBadge: () => chrome.action.setBadgeText({ text: "" }),
       uninstallSelf: () => chrome.management.uninstallSelf({ showConfirmDialog: true })
     }));
@@ -619,13 +635,46 @@ function registerChromeBackground() {
       canStart: () => purgeController.canStartSync() && !service.recordMutating,
       afterSync: refreshBadge
     }));
+  const authCheckerPromise = Promise.all([repositoryPromise, servicePromise, purgeControllerPromise])
+    .then(([repository, service, purgeController]) => createAuthStatusChecker({
+      sessions: apiSessions,
+      loadCache: () => repository.getSetting(AUTH_STATUS_CACHE_KEY),
+      saveCache: (status) => repository.setSetting(AUTH_STATUS_CACHE_KEY, status),
+      canCheck: () => purgeController.canStartSync() && !service.syncing && !service.recordMutating,
+      isMaintenancePending: async () => await repository.getSetting(SETTING_KEYS.purgePending) === true,
+      getBackoffUntil: async () => {
+        const until = await repository.getSetting(SETTING_KEYS.backoffUntil);
+        return typeof until === "number" && Number.isFinite(until) ? until : null;
+      },
+      recordRateLimit: async (error) => {
+        const now = Date.now();
+        const previous = await repository.getSetting(SETTING_KEYS.consecutiveRateLimits);
+        const existing = await repository.getSetting(SETTING_KEYS.backoffUntil);
+        const backoff = calculateRateLimitBackoff({
+          nowMs: now,
+          previousCount: typeof previous === "number" && Number.isSafeInteger(previous) && previous >= 0 ? previous : 0,
+          retryAfter: error.retryAt === null ? null : String(Math.max(1, Math.ceil((error.retryAt - now) / 1_000))),
+          randomValue: Math.random()
+        });
+        const until = Math.max(backoff.backoffUntil, typeof existing === "number" && Number.isFinite(existing) ? existing : 0);
+        await repository.setSettings({
+          [SETTING_KEYS.backoffUntil]: until,
+          [SETTING_KEYS.consecutiveRateLimits]: backoff.consecutiveRateLimits
+        });
+        return until;
+      },
+      ensureUserAgentRule,
+      probe: () => authCookieBridge.withTemporaryApiCookies(() => api.getCurrentUser({maxRetries: 0, timeoutMs: 5_000}))
+    }));
   const handlerPromise = Promise.all([
     servicePromise,
     runnerPromise,
-    purgeControllerPromise
+    purgeControllerPromise,
+    authCheckerPromise
   ])
-    .then(([service, startSync, purgeController]) => createMessageHandler({
+    .then(([service, startSync, purgeController, authChecker]) => createMessageHandler({
       service,
+      checkAuthStatus: () => authChecker.check(),
       startSync,
       openVrchat,
       openDashboard,

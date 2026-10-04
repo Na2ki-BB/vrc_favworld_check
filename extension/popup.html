@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VRC Favorite World History</title>
     <link rel="stylesheet" href="styles/popup.css">
+    <link rel="stylesheet" href="styles/auth-status.css">
   </head>
   <body>
     <main class="popup-shell">
@@ -13,7 +14,24 @@
         <h1>お気に入りワールド記録</h1>
       </header>
 
+      <section id="auth-status-panel" class="auth-status-panel" aria-labelledby="auth-section-title">
+        <div class="auth-status-heading">
+          <h2 id="auth-section-title">現在のログイン確認</h2>
+          <button id="auth-recheck-button" class="button button-secondary" type="button" aria-label="ログイン状態を再確認" disabled>再確認</button>
+        </div>
+        <div aria-live="polite">
+          <strong id="auth-status-title">ログイン状態を確認しています…</strong>
+          <p id="auth-status-detail">お気に入りの同期とは別に確認しています。</p>
+          <p id="auth-checked-at" class="muted">確認時刻: 未確認</p>
+          <p id="auth-retry-at" class="muted" hidden></p>
+        </div>
+        <p class="auth-cache-note">結果は最大60秒再利用します</p>
+        <button id="auth-open-vrchat-button" class="button button-secondary" type="button" hidden>VRChat公式サイトを開く</button>
+        <p id="auth-action-message" class="action-message" role="status"></p>
+      </section>
+
       <section id="attention-card" class="attention-card" aria-live="polite">
+        <p class="sync-section-label">前回の同期結果</p>
         <h2 id="attention-title">保存済みの状態を確認しています</h2>
         <p id="attention-detail">しばらくお待ちください。</p>
         <button id="dashboard-button" class="button button-primary" type="button">名前と画像を見る</button>
@@ -30,7 +48,7 @@
       <button id="login-button" class="button button-secondary" type="button" hidden>VRChat公式サイトを開く</button>
       <button id="sync-button" class="button button-secondary" type="button" disabled>今すぐ確認</button>
       <p id="unread-summary" class="muted" hidden></p>
-      <p id="last-sync" class="muted">最終確認: まだありません</p>
+      <p id="last-sync" class="muted">前回の同期成功: まだありません</p>
       <p id="action-message" class="action-message" role="status"></p>
 
       <details class="record-status">

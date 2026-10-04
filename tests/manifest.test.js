@@ -92,15 +92,15 @@ test("background wires bridge cleanup into startup, sync, and purge boundaries",
   assert.match(background, /new AuthCookieBridge\(\{ cookies: chrome\.cookies \}\)/u);
   assert.match(
     background,
-    /withApiSession: \(operation\) => authCookieBridge\.withTemporaryApiCookies\(operation\)/u
+    /withApiSession: \(operation\) => apiSessions\.run\(async \(\) => \{[\s\S]*return authCookieBridge\.withTemporaryApiCookies\(operation\)/u
   );
   assert.match(
     background,
-    /const cookieCleanup = authCookieBridge\.cleanupStaleCookies\(\)\.catch/u
+    /const cookieCleanup = apiSessions\.run\(\(\) => authCookieBridge\.cleanupStaleCookies\(\)\)\.catch/u
   );
   assert.match(
     background,
-    /cleanupAuthCookies: \(\) => authCookieBridge\.cleanupStaleCookies\(\)/u
+    /cleanupAuthCookies: \(\) => apiSessions\.run\(\(\) => authCookieBridge\.cleanupStaleCookies\(\)\)/u
   );
   assert.match(background, /chrome\.runtime\.onInstalled[\s\S]*void initialize\(\)/u);
   assert.match(background, /chrome\.runtime\.onStartup[\s\S]*void initialize\(\)/u);

@@ -30,6 +30,7 @@ import {
   AuthCookieSetupError
 } from "../extension/lib/auth-cookie-bridge.js";
 import { DatabaseRepository } from "../extension/lib/database.js";
+import { ActiveRateLimitError } from "../extension/lib/auth-status.js";
 import {
   ATTENTION_NOTIFICATION_ID_PREFIX,
   MANUAL_SYNC_COOLDOWN_MS,
@@ -1417,6 +1418,21 @@ test("schedule failure after an API failure preserves the safe fixed API result"
   assert.deepEqual(await repository.listWorlds(USER_ID), []);
 });
 
+test("queued sync honors a probe's existing backoff without counting a second 429", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service, alarms } = createService({repository, api, withApiSession: async () => {
+    // Simulate a probe observing 429 while this sync waits for its session.
+    await repository.setSettings({[SETTING_KEYS.backoffUntil]: NOW + 30_000, [SETTING_KEYS.consecutiveRateLimits]: 1});
+    throw new ActiveRateLimitError(NOW + 30_000, NOW);
+  }});
+  assert.deepEqual(await service.start("alarm"), {ok: false, error: "RATE_LIMITED", retryAt: new Date(NOW + 30_000).toISOString()});
+  assert.equal(await repository.getSetting(SETTING_KEYS.consecutiveRateLimits), 1);
+  assert.equal(await repository.getSetting(SETTING_KEYS.backoffUntil), NOW + 30_000);
+  assert.equal(alarms.scheduledAt, NOW + 30_000);
+  assert.equal(api.calls.length, 0);
+});
+
 test("429 persists saturated state and blocks every API call until backoff", async () => {
   const repository = await createRepository();
   const api = new FakeApi();
@@ -2183,6 +2199,35 @@ test("keepalive pulses below 30 seconds and always clears its interval", async (
   resolveOperation("done");
   assert.equal(await kept, "done");
   assert.equal(cleared, 123);
+});
+
+test("auth command is separate from status polling and cannot switch stored profiles", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const { service } = createService({ repository, api });
+  await repository.setSettings({[SETTING_KEYS.lastSyncResult]: "auth_required"});
+  let checks = 0;
+  const handler = createMessageHandler({
+    service,
+    checkAuthStatus: async () => {
+      checks += 1;
+      return {state: "authenticated", checkedAt: new Date(NOW).toISOString(), retryAt: null};
+    },
+    startSync: createGatedSyncRunner({
+      ensureUserAgentRule: async () => {}, startSync: (trigger) => service.start(trigger),
+      keepAlive: async (operation) => operation
+    }),
+    openVrchat: async () => {}, openDashboard: async () => {}, refreshBadge: async () => {},
+    purgeAndUninstall: async () => ({ok: true, dataDeleted: true})
+  });
+  for (let i = 0; i < 5; i += 1) await handler({type: MESSAGE_TYPES.getStatus});
+  assert.equal(checks, 0);
+  const response = await handler({type: MESSAGE_TYPES.checkAuthStatus, url: "https://example.invalid", userId: "ignored"});
+  assert.deepEqual(response, {ok: true, auth: {state: "authenticated", checkedAt: new Date(NOW).toISOString(), retryAt: null}});
+  assert.equal(checks, 1);
+  assert.equal(api.calls.length, 0);
+  assert.equal((await service.getStatus()).activeProfileId, null);
+  assert.equal(await repository.getSetting(SETTING_KEYS.lastSyncResult), "auth_required");
 });
 
 test("message router exposes only fixed operations and never accepts a URL", async () => {

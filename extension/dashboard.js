@@ -1,5 +1,7 @@
 // @ts-check
 
+import { mountAuthStatusPanel } from "./lib/auth-status-ui.js";
+
 import { BackupExportLimitError, MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
 import { openDatabase } from "./lib/database.js";
 import { createFavoriteGroupOptions } from "./lib/favorite-groups.js";
@@ -464,7 +466,7 @@ function renderPrimaryFocus() {
     primaryFocus.classList.remove("is-alert");
     primaryFocusTitle.textContent = "非表示の記録";
     primaryFocusDetail.textContent = "戻すと通常の一覧で再び確認できます。完全に削除する操作は取り消せません。";
-    lastSync.textContent = state.status.lastSuccessfulSyncAt === null ? "最終確認: まだありません" : `最終確認: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
+    lastSync.textContent = state.status.lastSuccessfulSyncAt === null ? "前回の同期成功: まだありません" : `前回の同期成功: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
     return;
   }
   const hidden = hiddenWorldIds(state.worldDispositions);
@@ -477,8 +479,8 @@ function renderPrimaryFocus() {
   primaryFocusTitle.textContent = overview.title;
   primaryFocusDetail.textContent = overview.detail;
   lastSync.textContent = state.status.lastSuccessfulSyncAt === null
-    ? "最終確認: まだありません"
-    : `最終確認: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
+    ? "前回の同期成功: まだありません"
+    : `前回の同期成功: ${formatDateTime(state.status.lastSuccessfulSyncAt)}`;
 }
 
 function renderConnection() {
@@ -510,8 +512,8 @@ function renderConnection() {
   }
   if (state.status.authRequired) {
     showNotice(
-      "VRChatへのログインが必要です",
-      "公式サイトでいつも通りログインしてから「今すぐ確認」を押してください。パスワードや2FAコードをこの拡張へ入力する必要はありません。",
+      presentation.title,
+      presentation.detail,
       { label: "VRChat公式サイト", run: openVrchat }
     );
     return;
@@ -1989,6 +1991,8 @@ window.addEventListener(
   },
   { once: true }
 );
+
+mountAuthStatusPanel({document, window, sendMessage});
 
 try {
   repository = await openDatabase();
