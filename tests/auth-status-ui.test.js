@@ -239,12 +239,22 @@ test("both pages load auth once outside their status-polling paths and retain ex
     assert.match(html, /現在のログイン確認/u);
     assert.match(html, /前回の同期結果/u);
     assert.match(html, /前回の同期成功/u);
-    assert.match(html, /結果は最大60秒再利用/u);
+    assert.match(html, /再確認でも60秒以内は同じ結果を表示します/u);
     assert.match(html, /id="auth-recheck-button"/u);
     assert.doesNotMatch(source, /CHECK_AUTH_STATUS/u, "only the isolated shared controller requests auth");
   }
   const source = await readFile(new URL("../extension/lib/auth-status-ui.js", import.meta.url), "utf8");
   assert.doesNotMatch(source, /setInterval|chrome\.cookies|fetch\(|innerHTML|START_SYNC/u);
+});
+
+test("popup primary actions stay before the variable-height auth panel", async () => {
+  const html = await readFile(new URL("../extension/popup.html", import.meta.url), "utf8");
+  const css = await readFile(new URL("../extension/styles/popup.css", import.meta.url), "utf8");
+  for (const id of ["dashboard-button", "sync-button", "last-sync", "action-message"]) {
+    assert.ok(html.indexOf(`id="${id}"`) < html.indexOf('id="auth-status-panel"'));
+  }
+  assert.match(css, /width: 370px/u);
+  assert.doesNotMatch(css, /overflow(?:-y)?:\s*(?:hidden|clip)/u);
 });
 
 test("dashboard status polling remains independent of the one-time auth request", async () => {
