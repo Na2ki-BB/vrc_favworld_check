@@ -342,7 +342,8 @@ test("thumbnail capture defers remaining work at its time and attempt limits", a
     skipped: 0,
     failed: 0,
     deferred: 4,
-    retryAt: null
+    retryAt: null,
+    timedOut: {worldId: "wrld_20000000-0000-4000-8000-000000000001", reason: "timeout_fetch"}
   });
   assert.equal(saved, 1);
   assert.deepEqual(encoderTimeouts, [25, 4]);
@@ -411,7 +412,8 @@ test("thumbnail capture aborts a stalled encoder at the overall deadline", async
     skipped: 0,
     failed: 0,
     deferred: 1,
-    retryAt: null
+    retryAt: null,
+    timedOut: {worldId: WORLD_ID, reason: "timeout_fetch"}
   });
   assert.equal(encoderTimeout, 20);
   const capturedSignal = /** @type {AbortSignal | null} */ (
@@ -688,7 +690,7 @@ async function createRepository() {
  *   notifications?: FakeNotifications,
  *   now?: {value: number},
  *   withApiSession?: <T>(operation: () => Promise<T>) => Promise<T>,
- *   encodeThumbnail?: (sourceUrl: string) => Promise<{
+ *   encodeThumbnail?: (sourceUrl: string, options: import("../extension/lib/sync-service.js").ThumbnailEncodeOptions) => Promise<{
  *     bytes: Uint8Array,
  *     contentType: "image/webp",
  *     width: number,
@@ -3183,4 +3185,73 @@ test("sync preserves reasons with unfinished attempts, but a completed batch res
   const reset = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
   assert.equal(reset.items[0]?.attempts, 1);
   assert.equal(reset.items[0]?.failureReason, "decode");
+});
+
+test("deadline reports the stalled stage without invoking a diagnostic write after expiry", async () => {
+  for (const stage of /** @type {const} */ (["checkpoint", "fetch", "decode", "resize", "storage"])) {
+    let writes = 0;
+    let failures = 0;
+    const result = await captureAvailableWorldThumbnails({userId: USER_ID, generation: 1, capturedAt: new Date(NOW).toISOString(),
+      timeBudgetMs: 20, clock: () => NOW,
+      metadata: [{id: WORLD_ID, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}],
+      repository: {listThumbnailMetadata: async () => [], putThumbnail: async () => {writes += 1; await new Promise(() => {});}},
+      onAttempt: async () => {if (stage === "checkpoint") await new Promise(() => {});},
+      onFailure: async () => {failures += 1; await new Promise(() => {});},
+      encode: async (sourceUrl, options) => {
+        if (stage === "fetch" || stage === "decode" || stage === "resize") {
+          options.onStage?.(stage);
+          return new Promise(() => {});
+        }
+        return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+      }
+    });
+    assert.deepEqual(result.timedOut, {worldId: WORLD_ID, reason: `timeout_${stage}`});
+    assert.equal(result.deferred, 1);
+    assert.equal(failures, 0);
+    assert.equal(writes, stage === "storage" ? 1 : 0);
+  }
+});
+
+test("deadline reason survives the normal guarded checkpoint and stops after the existing three attempts", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "ダミー", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  let encodes = 0;
+  const {service} = createService({repository, api, now, alarms, encodeThumbnail: async (sourceUrl, options) => {
+    encodes += 1;
+    options.onStage?.("decode");
+    now.value += 30_001;
+    return {bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl};
+  }});
+  await service.start("manual");
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const job = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
+    assert.equal(job.items[0]?.failureReason, "timeout_decode");
+    assert.equal(job.items[0]?.attempts, attempt);
+    assert.doesNotMatch(JSON.stringify(await repository.getSetting("thumbnailCaptureStatus")), /timedOut|worldId/u);
+    now.value += 60_000;
+    await service.start("thumbnail");
+  }
+  assert.equal(encodes, 3);
+  assert.equal(alarms.thumbnailAt, null);
+  assert.deepEqual((await service.getStatus()).thumbnailProgress?.failureReasons, ["timeout_decode"]);
+});
+
+test("a slow failure checkpoint does not relabel a known image error as an operation timeout", async () => {
+  let now = NOW;
+  /** @type {string[]} */
+  const reasons = [];
+  const result = await captureAvailableWorldThumbnails({userId: USER_ID, generation: 1, capturedAt: new Date(NOW).toISOString(),
+    timeBudgetMs: 20, clock: () => now,
+    metadata: [{id: WORLD_ID, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}],
+    repository: {listThumbnailMetadata: async () => [], putThumbnail: async () => {}},
+    encode: async (_url, options) => {options.onStage?.("decode"); throw new ThumbnailError("DECODE_FAILED");},
+    onFailure: async (_id, reason) => {reasons.push(reason); now += 21;}
+  });
+  assert.deepEqual(reasons, ["decode"]);
+  assert.equal(result.timedOut, undefined);
+  assert.equal(result.deferred, 1);
 });

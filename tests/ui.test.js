@@ -1816,3 +1816,11 @@ test("thumbnail guidance exposes only actionable, plain-language reasons", () =>
   assert.deepEqual(normalizeThumbnailProgress({...base, failureReasons: ["network", "network", "private text"]})?.failureReasons, ["network"]);
   assert.equal(normalizeThumbnailProgress(base)?.failureReasons, undefined);
 });
+
+test("time limits and cancellation never become a network-blame message", () => {
+  for (const reason of ["timeout_fetch", "timeout_decode", "timeout_resize", "timeout_storage", "timeout_checkpoint", "aborted"]) {
+    const progress = normalizeThumbnailProgress({total: 1, saved: 0, failed: 1, remaining: 0, nextAttemptAt: null, state: "partial", failureReasons: [reason]});
+    assert.deepEqual(progress?.failureReasons, [reason]);
+    assert.doesNotMatch(presentThumbnailProgress(progress), /ネット接続|通信に失敗|空き容量/u);
+  }
+});

@@ -144,7 +144,7 @@ function isThumbnailJob(value) {
 /** @typedef {Awaited<ReturnType<Repository["claimEvents"]>>[number]} ClaimedNotificationEvent */
 /** @typedef {Awaited<ReturnType<VrchatApi["listAllFavoriteWorlds"]>>[number]} FavoriteWorldMetadata */
 /** @typedef {Awaited<ReturnType<typeof fetchAndEncodeThumbnail>>} EncodedThumbnail */
-/** @typedef {{timeoutMs: number, clock: () => number, signal: AbortSignal}} ThumbnailEncodeOptions */
+/** @typedef {{timeoutMs: number, clock: () => number, signal: AbortSignal, onStage?: (stage: "fetch" | "decode" | "resize") => void}} ThumbnailEncodeOptions */
 
 /**
  * @typedef {object} NotificationPresentation
@@ -228,7 +228,8 @@ export function createNotificationPresentation(events) {
  *   skipped: number,
  *   failed: number,
  *   deferred: number,
- *   retryAt: number | null
+ *   retryAt: number | null,
+ *   timedOut?: {worldId: string, reason: import("./thumbnail.js").ThumbnailFailureReason}
  * }>}
  */
 export async function captureAvailableWorldThumbnails(input) {
@@ -276,6 +277,8 @@ export async function captureAvailableWorldThumbnails(input) {
   let deferred = 0;
   /** @type {number | null} */
   let retryAt = null;
+  /** @type {{worldId: string, reason: import("./thumbnail.js").ThumbnailFailureReason} | undefined} */
+  let timedOut;
   for (const [index, world] of candidates.entries()) {
     if (
       index >= maxAttempts
@@ -305,6 +308,9 @@ export async function captureAvailableWorldThumbnails(input) {
       continue;
     }
     let saving = false;
+    // Stage names stay in memory; only the fixed reason is kept on the job.
+    /** @type {"checkpoint" | "fetch" | "decode" | "resize" | "storage"} */
+    let stage = "checkpoint";
     try {
       if (input.onAttempt !== undefined) {
         await runBeforeThumbnailDeadline(
@@ -316,6 +322,7 @@ export async function captureAvailableWorldThumbnails(input) {
       if (encodeBudgetMs <= 0) {
         throw new ThumbnailCaptureDeadlineError();
       }
+      stage = "fetch";
       const encodeController = new AbortController();
       const encoded = await runBeforeThumbnailDeadline(
         () => encode(sourceUrl, {
@@ -324,7 +331,8 @@ export async function captureAvailableWorldThumbnails(input) {
             Math.min(THUMBNAIL_FETCH_TIMEOUT_MS, Math.floor(encodeBudgetMs))
           ),
           clock,
-          signal: encodeController.signal
+          signal: encodeController.signal,
+          onStage: (value) => { stage = value; }
         }),
         encodeBudgetMs,
         () => encodeController.abort()
@@ -335,6 +343,7 @@ export async function captureAvailableWorldThumbnails(input) {
       const buffer = new ArrayBuffer(encoded.bytes.byteLength);
       new Uint8Array(buffer).set(encoded.bytes);
       saving = true;
+      stage = "storage";
       await runBeforeThumbnailDeadline(
         () => input.repository.putThumbnail({
           userId: input.userId,
@@ -350,9 +359,9 @@ export async function captureAvailableWorldThumbnails(input) {
       );
       saved += 1;
     } catch (error) {
-      if (!(error instanceof GenerationConflictError)
-        && !(error instanceof ThumbnailCaptureDeadlineError)
-        && thumbnailRemainingMs(deadlineAt, clock) > 0) {
+      const operationTimedOut = error instanceof ThumbnailCaptureDeadlineError
+        || thumbnailRemainingMs(deadlineAt, clock) <= 0;
+      if (!(error instanceof GenerationConflictError) && !operationTimedOut) {
         const reason = thumbnailFailureReason(error, saving);
         try {
           await runBeforeThumbnailDeadline(
@@ -374,6 +383,9 @@ export async function captureAvailableWorldThumbnails(input) {
         error instanceof ThumbnailCaptureDeadlineError
         || thumbnailRemainingMs(deadlineAt, clock) <= 0
       ) {
+        if (operationTimedOut && !(error instanceof GenerationConflictError)) {
+          timedOut = {worldId: world.id, reason: `timeout_${stage}`};
+        }
         deferred += candidates.length - index;
         break;
       }
@@ -398,7 +410,8 @@ export async function captureAvailableWorldThumbnails(input) {
     skipped: input.metadata.length - candidates.length,
     failed,
     deferred,
-    retryAt
+    retryAt,
+    ...(timedOut === undefined ? {} : {timedOut})
   };
 }
 
@@ -442,7 +455,8 @@ async function runBeforeThumbnailDeadline(operation, remainingMs, onTimeout = ()
 
 /** @param {ThumbnailError} error */
 function shouldStopThumbnailBatch(error) {
-  if (error.code === "FETCH_FAILED" || error.code === "UNEXPECTED_REDIRECT") {
+  if (error.code === "FETCH_FAILED" || error.code === "FETCH_TIMEOUT"
+    || error.code === "FETCH_ABORTED" || error.code === "UNEXPECTED_REDIRECT") {
     return true;
   }
   if (!(error instanceof ThumbnailFetchError) || error.code !== "HTTP_STATUS") {
@@ -1085,12 +1099,17 @@ export class SyncService {
           await this.#saveThumbnailJob(activeJob);
         }
       });
+      const {timedOut, ...captureStatus} = result;
+      if (timedOut !== undefined) {
+        const item = job.items.find((entry) => entry.id === timedOut.worldId);
+        if (item !== undefined) item.failureReason = timedOut.reason;
+      }
       const progress = await this.#thumbnailProgress();
       if (progress === null) return { ok: true };
       job.state = progress.remaining === 0 ? (progress.failed === 0 ? "complete" : "partial") : "waiting";
       job.nextAttemptAt = progress.remaining === 0 ? null : Math.max(this.#now() + THUMBNAIL_BATCH_DELAY_MS, result.retryAt ?? 0);
       await this.#saveThumbnailJob(job, {
-        [SETTING_KEYS.thumbnailCaptureStatus]: {userId: job.userId, capturedAt: job.capturedAt, ...result},
+        [SETTING_KEYS.thumbnailCaptureStatus]: {userId: job.userId, capturedAt: job.capturedAt, ...captureStatus},
         [SETTING_KEYS.thumbnailBackoffUntil]: result.retryAt,
         ...(result.retryAt === null ? {} : {[SETTING_KEYS.backoffUntil]: result.retryAt})
       });
