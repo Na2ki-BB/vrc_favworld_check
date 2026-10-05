@@ -839,15 +839,17 @@ export function isAllowedVrchatImageUrl(value) {
 }
 
 /**
- * Match the final public image to its requested file and version. Signed CDN
- * query parameters are used only by fetch and must never become stored data.
+ * Validate the final public image. File-bearing paths bind file and version;
+ * the narrowly observed numeric CDN form relies on the API redirect instead.
+ * Signed CDN query parameters are used only by fetch and never stored.
  * The extension CSP restricts every redirect hop before a request is sent.
  *
  * @param {string} sourceUrl
  * @param {string} finalUrl
+ * @param {boolean} [redirected]
  * @returns {boolean}
  */
-export function isAllowedVrchatImageResponseUrl(sourceUrl, finalUrl) {
+export function isAllowedVrchatImageResponseUrl(sourceUrl, finalUrl, redirected = false) {
   if (!isAllowedVrchatImageUrl(sourceUrl)) {
     return false;
   }
@@ -875,6 +877,13 @@ export function isAllowedVrchatImageResponseUrl(sourceUrl, finalUrl) {
   const size = sourceParts[6];
   const path = target.pathname;
   if (kind === "image") {
+    // Observed API redirect only: opaque 9-digit + 1-digit CDN identifiers.
+    // Neither number is assumed to encode the requested file or version.
+    if (redirected && size === "256"
+      && /^\/thumbnails\/[0-9]{9}\.[0-9]\.thumbnail-256\.png$/u.test(path)
+      && finalUrl.split("?", 1)[0] === target.origin + path) {
+      return true;
+    }
     const match = /^\/thumbnails\/(file_[a-f0-9-]+)\.([a-f0-9]{64})\.(\d+)\.thumbnail-(\d+)\.(?:png|jpe?g|webp)$/u.exec(path);
     return match !== null && match[1] === fileId && match[3] === version && match[4] === size;
   }

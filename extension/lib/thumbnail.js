@@ -283,7 +283,7 @@ async function fetchBoundedImage(sourceUrl, fetch, timeoutMs, clock, externalSig
         retryAt
       );
     }
-    if (!isAllowedVrchatImageResponseUrl(sourceUrl, response.url)) {
+    if (!isAllowedVrchatImageResponseUrl(sourceUrl, response.url, response.redirected)) {
       throw new ThumbnailFetchError(
         THUMBNAIL_ERROR_CODES.UNEXPECTED_REDIRECT,
         response.status
