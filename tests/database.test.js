@@ -1998,3 +1998,24 @@ test("purge recomputes terminal image progress from remaining items", async (con
     assert.equal(await database.getSetting("thumbnailBackoffUntil"), 12345);
   });
 });
+
+
+test("thumbnail job accepts older checkpoints and only optional fixed failure reasons", async (context) => {
+  const {database} = await managementFixture(context.name);
+  context.after(() => database.close());
+  const legacy = thumbnailJob();
+  await database.setThumbnailSettings(USER_A, 1, {thumbnailJob: legacy});
+  assert.deepEqual(await database.getSetting("thumbnailJob"), legacy);
+  const current = {...legacy, items: legacy.items.map((item) => ({...item, failureReason: "decode"}))};
+  await database.setThumbnailSettings(USER_A, 1, {thumbnailJob: current});
+  assert.deepEqual(await database.getSetting("thumbnailJob"), current);
+  for (const patch of [{failureReason: "private text"}, {failureReason: null}, {failureReason: undefined}, {error: "private text"}]) {
+    const invalid = {...legacy, items: legacy.items.map((item) => ({...item, ...patch}))};
+    await assert.rejects(database.setThumbnailSettings(USER_A, 1, {thumbnailJob: invalid}), /Invalid thumbnail job item/u);
+    assert.deepEqual(await database.getSetting("thumbnailJob"), current);
+  }
+  await database.hideWorld(await mutationInput(database));
+  await database.purgeHiddenWorld(await mutationInput(database));
+  const remaining = /** @type {{items:{id:string}[]}} */ (await database.getSetting("thumbnailJob"));
+  assert.equal(remaining.items.some((item) => item.id === WORLD_A), false);
+});

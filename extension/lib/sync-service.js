@@ -31,7 +31,9 @@ import {
 import {
   ThumbnailError,
   ThumbnailFetchError,
-  fetchAndEncodeThumbnail
+  fetchAndEncodeThumbnail,
+  isThumbnailFailureReason,
+  thumbnailFailureReason
 } from "./thumbnail.js";
 import {
   MAX_PROBE_CANDIDATES,
@@ -108,8 +110,8 @@ export const SETTING_KEYS = Object.freeze({
  *   "listThumbnailMetadata" | "putThumbnail">>} Repository
  */
 
-/** @typedef {{total:number,saved:number,remaining:number,failed:number,nextAttemptAt:string|null,state:"running"|"waiting"|"complete"|"partial"|"paused"}} ThumbnailProgress */
-/** @typedef {{version:1,userId:string,generation:number,capturedAt:string,items:{id:string,thumbnailImageUrl:string,attempts:number}[],nextAttemptAt:number|null,state:ThumbnailProgress["state"]}} ThumbnailJob */
+/** @typedef {{total:number,saved:number,remaining:number,failed:number,nextAttemptAt:string|null,state:"running"|"waiting"|"complete"|"partial"|"paused",failureReasons?:import("./thumbnail.js").ThumbnailFailureReason[]}} ThumbnailProgress */
+/** @typedef {{version:1,userId:string,generation:number,capturedAt:string,items:{id:string,thumbnailImageUrl:string,attempts:number,failureReason?:import("./thumbnail.js").ThumbnailFailureReason}[],nextAttemptAt:number|null,state:ThumbnailProgress["state"]}} ThumbnailJob */
 /** @param {unknown} value @returns {value is ThumbnailJob} */
 function isThumbnailJob(value) {
   if (typeof value !== "object" || value === null) return false;
@@ -122,7 +124,8 @@ function isThumbnailJob(value) {
     && job.items.every((item) => typeof item === "object" && item !== null
       && typeof item.id === "string" && /^wrld_[a-f0-9-]{36}$/.test(item.id)
       && typeof item.thumbnailImageUrl === "string" && isAllowedVrchatImageUrl(item.thumbnailImageUrl)
-      && Number.isSafeInteger(item.attempts) && item.attempts >= 0 && item.attempts <= 3);
+      && Number.isSafeInteger(item.attempts) && item.attempts >= 0 && item.attempts <= 3
+      && (item.failureReason === undefined || isThumbnailFailureReason(item.failureReason)));
 }
 
 /**
@@ -217,7 +220,8 @@ export function createNotificationPresentation(events) {
  *   timeBudgetMs?: number,
  *   maxAttempts?: number,
  *   startAfterWorldId?: string,
- *   onAttempt?: (worldId: string) => void | Promise<void>
+ *   onAttempt?: (worldId: string) => void | Promise<void>,
+ *   onFailure?: (worldId: string, reason: import("./thumbnail.js").ThumbnailFailureReason) => void | Promise<void>
  * }} input
  * @returns {Promise<{
  *   saved: number,
@@ -300,6 +304,7 @@ export async function captureAvailableWorldThumbnails(input) {
     if (sourceUrl === undefined) {
       continue;
     }
+    let saving = false;
     try {
       if (input.onAttempt !== undefined) {
         await runBeforeThumbnailDeadline(
@@ -329,6 +334,7 @@ export async function captureAvailableWorldThumbnails(input) {
       }
       const buffer = new ArrayBuffer(encoded.bytes.byteLength);
       new Uint8Array(buffer).set(encoded.bytes);
+      saving = true;
       await runBeforeThumbnailDeadline(
         () => input.repository.putThumbnail({
           userId: input.userId,
@@ -344,6 +350,19 @@ export async function captureAvailableWorldThumbnails(input) {
       );
       saved += 1;
     } catch (error) {
+      if (!(error instanceof GenerationConflictError)
+        && !(error instanceof ThumbnailCaptureDeadlineError)
+        && thumbnailRemainingMs(deadlineAt, clock) > 0) {
+        const reason = thumbnailFailureReason(error, saving);
+        try {
+          await runBeforeThumbnailDeadline(
+            async () => input.onFailure?.(world.id, reason),
+            thumbnailRemainingMs(deadlineAt, clock)
+          );
+        } catch {
+          // Optional diagnostics must not hide the original failure or Retry-After.
+        }
+      }
       if (error instanceof ThumbnailFetchError && error.status === 429) {
         failed += 1;
         deferred += candidates.length - index - 1;
@@ -961,11 +980,13 @@ export class SyncService {
     if (job === null || this.#repository.listThumbnailMetadata === undefined) return null;
     const stored = new Map((await this.#repository.listThumbnailMetadata(job.userId)).map((item) => [item.worldId, item.sourceUrl]));
     const missing = job.items.filter((item) => stored.get(item.id) !== item.thumbnailImageUrl);
-    const failed = missing.filter((item) => item.attempts >= 3).length;
+    const failedItems = missing.filter((item) => item.attempts >= 3);
+    const failed = failedItems.length;
+    const failureReasons = [...new Set(failedItems.flatMap((item) => item.failureReason === undefined ? [] : [item.failureReason]))];
     return { total: job.items.length, saved: job.items.length - missing.length,
       remaining: missing.length - failed, failed,
       nextAttemptAt: job.nextAttemptAt === null ? null : new Date(job.nextAttemptAt).toISOString(),
-      state: job.state };
+      state: job.state, ...(failureReasons.length === 0 ? {} : {failureReasons}) };
   }
 
   /**
@@ -1052,7 +1073,15 @@ export class SyncService {
         encode: this.#encodeThumbnail, wait: this.#thumbnailWait, clock: this.#clock,
         onAttempt: async (worldId) => {
           const item = activeJob.items.find((entry) => entry.id === worldId);
-          if (item !== undefined) item.attempts += 1;
+          if (item !== undefined) {
+            item.attempts += 1;
+            delete item.failureReason;
+          }
+          await this.#saveThumbnailJob(activeJob);
+        },
+        onFailure: async (worldId, reason) => {
+          const item = activeJob.items.find((entry) => entry.id === worldId);
+          if (item !== undefined) item.failureReason = reason;
           await this.#saveThumbnailJob(activeJob);
         }
       });
@@ -1281,18 +1310,22 @@ export class SyncService {
       });
       if (this.#repository.listThumbnailMetadata !== undefined && this.#repository.putThumbnail !== undefined) {
         const previous = await this.#repository.getSetting(SETTING_KEYS.thumbnailJob);
-        const attempts = new Map(isThumbnailJob(previous) && previous.userId === thumbnailCapturePlan.userId
-          ? previous.items.map((item) => [`${item.id}:${item.thumbnailImageUrl}`, item.attempts]) : []);
+        const previousItems = new Map(isThumbnailJob(previous) && previous.userId === thumbnailCapturePlan.userId
+          && previous.state !== "complete" && previous.state !== "partial"
+          ? previous.items.map((item) => [`${item.id}:${item.thumbnailImageUrl}`, item]) : []);
         /** @type {ThumbnailJob} */
         const job = {
           version: 1, userId: thumbnailCapturePlan.userId, generation: thumbnailCapturePlan.generation,
           capturedAt: thumbnailCapturePlan.capturedAt,
           items: thumbnailCapturePlan.metadata.filter((world) => typeof world.thumbnailImageUrl === "string"
-            && isAllowedVrchatImageUrl(world.thumbnailImageUrl)).map((world) => ({
-              id: world.id, thumbnailImageUrl: /** @type {string} */ (world.thumbnailImageUrl),
-              attempts: previous !== undefined && isThumbnailJob(previous) && previous.state !== "complete" && previous.state !== "partial"
-                ? attempts.get(`${world.id}:${world.thumbnailImageUrl}`) ?? 0 : 0
-            })),
+            && isAllowedVrchatImageUrl(world.thumbnailImageUrl)).map((world) => {
+              const previousItem = previousItems.get(`${world.id}:${world.thumbnailImageUrl}`);
+              return {
+                id: world.id, thumbnailImageUrl: /** @type {string} */ (world.thumbnailImageUrl),
+                attempts: previousItem?.attempts ?? 0,
+                ...(previousItem?.failureReason === undefined ? {} : {failureReason: previousItem.failureReason})
+              };
+            }),
           nextAttemptAt: null, state: "waiting"
         };
         try {

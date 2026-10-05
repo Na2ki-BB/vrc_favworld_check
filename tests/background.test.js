@@ -2441,7 +2441,7 @@ test("thumbnail continuation honors Retry-After and terminates permanent failure
   assert.equal(attempts, 3);
   assert.equal(api.calls.length, metadataCalls);
   assert.deepEqual((await service.getStatus()).thumbnailProgress, {
-    total: 1, saved: 0, remaining: 0, failed: 1, nextAttemptAt: null, state: "partial"
+    total: 1, saved: 0, remaining: 0, failed: 1, nextAttemptAt: null, state: "partial", failureReasons: ["not_found"]
   });
 });
 
@@ -3060,4 +3060,127 @@ test("maintenance alarm recovery stays fail closed when autosync is disabled or 
       assert.equal(alarms.creates.length, 0);
     });
   }
+});
+
+
+test("thumbnail failure classification is checkpointed and cleared on successful retry", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  const failed = createService({repository, api, now, alarms, encodeThumbnail: async () => {
+    throw new ThumbnailError("DECODE_FAILED");
+  }}).service;
+  await failed.start("manual");
+  const readJob = async () => /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
+  assert.equal((await readJob()).items[0]?.failureReason, "decode");
+  assert.equal((await readJob()).items[0]?.attempts, 1);
+  // A new service represents worker restart; use the existing continuation path.
+  const recovered = createService({repository, api, now, alarms, encodeThumbnail: async (sourceUrl) => ({
+    bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl
+  })}).service;
+  now.value += 60_000;
+  await recovered.start("thumbnail");
+  assert.equal((await readJob()).items[0]?.failureReason, undefined);
+  assert.equal((await recovered.getStatus()).thumbnailProgress?.state, "complete");
+  assert.equal((await recovered.getStatus()).thumbnailProgress?.failureReasons, undefined);
+});
+
+test("thumbnail capture records storage quota separately without leaking exception text", async () => {
+  /** @type {unknown[]} */
+  const failures = [];
+  const result = await captureAvailableWorldThumbnails({userId: USER_ID, generation: 1, capturedAt: new Date(NOW).toISOString(),
+    metadata: [{id: WORLD_ID, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}],
+    repository: {listThumbnailMetadata: async () => [], putThumbnail: async () => { throw new DOMException("private text", "QuotaExceededError"); }},
+    encode: async (sourceUrl) => ({bytes: new Uint8Array([1]), contentType: "image/webp", width: 1, height: 1, sourceUrl}),
+    onFailure: (id, reason) => { failures.push([id, reason]); }
+  });
+  assert.deepEqual(failures, [[WORLD_ID, "storage_full"]]);
+  assert.equal(result.failed, 1);
+  assert.doesNotMatch(JSON.stringify({result, failures}), /private text/u);
+});
+
+test("existing continuation can retry just eight failed images without refetching saved images or metadata", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  api.favoriteWorldsOverride = Array.from({length: 10}, (_, index) => ({
+    id: `wrld_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+    name: "ダミー", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: /** @type {const} */ ("public"),
+    thumbnailImageUrl: `https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}/1/256`
+  }));
+  api.favoriteRelationsOverride = api.favoriteWorldsOverride.map((world) => ({favoriteId: world.id, tags: ["worlds1"], type: "world"}));
+  const targets = new Set(api.favoriteWorldsOverride.slice(0, 8).map((world) => world.id));
+  const failedSources = new Set(api.favoriteWorldsOverride.slice(0, 8).map((world) => world.thumbnailImageUrl));
+  /** @type {string[]} */
+  const requested = [];
+  let recovered = false;
+  const dependencies = {repository, api, now, alarms, encodeThumbnail: async (/** @type {string} */ sourceUrl) => {
+    requested.push(sourceUrl);
+    if (!recovered && failedSources.has(sourceUrl)) throw new ThumbnailError("DECODE_FAILED");
+    return {bytes: new Uint8Array([1]), contentType: /** @type {const} */ ("image/webp"), width: 1, height: 1, sourceUrl};
+  }};
+  const service = createService(dependencies).service;
+  await service.start("manual");
+  for (let round = 0; round < 2; round += 1) {
+    now.value += 60_000;
+    await service.start("thumbnail");
+  }
+  assert.equal((await service.getStatus()).thumbnailProgress?.failed, 8);
+  const job = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
+  // This is a one-off, explicitly scoped local repair, not a new product command.
+  for (const item of job.items) if (targets.has(item.id)) { item.attempts = 0; delete item.failureReason; }
+  job.state = "waiting";
+  job.nextAttemptAt = now.value;
+  await repository.setThumbnailSettings(USER_ID, job.generation, {thumbnailJob: job});
+  recovered = true;
+  requested.length = 0;
+  const metadataCalls = api.calls.length;
+  await createService(dependencies).service.start("thumbnail");
+  assert.equal(requested.length, 8);
+  assert.deepEqual(new Set(requested), failedSources);
+  assert.equal(api.calls.length, metadataCalls);
+  assert.equal((await service.getStatus()).thumbnailProgress?.state, "complete");
+});
+
+test("failed or stalled reason checkpoints preserve Retry-After and the batch deadline", async () => {
+  for (const onFailure of [async () => { throw new Error("checkpoint failed"); }, () => new Promise(() => {})]) {
+    const retryAt = Date.now() + 120_000;
+    const result = await captureAvailableWorldThumbnails({userId: USER_ID, generation: 1, capturedAt: new Date(NOW).toISOString(),
+      metadata: [{id: WORLD_ID, thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}],
+      repository: {listThumbnailMetadata: async () => [], putThumbnail: async () => {}},
+      encode: async () => { throw new ThumbnailFetchError("HTTP_STATUS", 429, retryAt); },
+      timeBudgetMs: 100, onFailure
+    });
+    assert.equal(result.retryAt, retryAt);
+    assert.equal(result.failed, 1);
+  }
+});
+
+test("sync preserves reasons with unfinished attempts, but a completed batch resets them", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const alarms = new FakeAlarms();
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1", releaseStatus: "public",
+    thumbnailImageUrl: "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256"}];
+  const {service} = createService({repository, api, now, alarms, encodeThumbnail: async () => { throw new ThumbnailError("DECODE_FAILED"); }});
+  await service.start("manual");
+  const job = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
+  assert.ok(job.items[0]);
+  job.items[0].attempts = 3;
+  job.items[0].failureReason = "network";
+  job.state = "waiting";
+  await repository.setThumbnailSettings(USER_ID, job.generation, {thumbnailJob: job});
+  now.value += 60_000;
+  await service.start("alarm");
+  assert.deepEqual((await service.getStatus()).thumbnailProgress?.failureReasons, ["network"]);
+  now.value += 60_000;
+  await service.start("alarm");
+  const reset = /** @type {import("../extension/lib/sync-service.js").ThumbnailJob} */ (await repository.getSetting("thumbnailJob"));
+  assert.equal(reset.items[0]?.attempts, 1);
+  assert.equal(reset.items[0]?.failureReason, "decode");
 });

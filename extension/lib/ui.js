@@ -1,5 +1,7 @@
 // @ts-check
 
+import { isThumbnailFailureReason } from "./thumbnail.js";
+
 import { normalizeSearchText } from "./domain.js";
 import {
   createFavoriteGroupLabelMap,
@@ -49,6 +51,7 @@ export async function readThumbnailCount(repository, userId) {
  * @property {number} total
  * @property {number} saved
  * @property {number} remaining
+ * @property {import("./thumbnail.js").ThumbnailFailureReason[]} [failureReasons]
  * @property {number} failed
  * @property {string | null} nextAttemptAt
  * @property {"running" | "waiting" | "complete" | "partial" | "paused"} state
@@ -66,7 +69,9 @@ export function normalizeThumbnailProgress(value) {
   const progress = /** @type {ThumbnailProgress} */ (/** @type {unknown} */ (value));
   if (progress.saved + progress.remaining + progress.failed !== progress.total) return null;
   if (progress.state === "complete" && (progress.remaining !== 0 || progress.failed !== 0)) return null;
-  return { total: progress.total, saved: progress.saved, remaining: progress.remaining, failed: progress.failed, nextAttemptAt: progress.nextAttemptAt, state: progress.state };
+  const failureReasons = Array.isArray(value.failureReasons)
+    ? [...new Set(value.failureReasons.filter(isThumbnailFailureReason))] : [];
+  return { ...(failureReasons.length === 0 ? {} : {failureReasons}), total: progress.total, saved: progress.saved, remaining: progress.remaining, failed: progress.failed, nextAttemptAt: progress.nextAttemptAt, state: progress.state };
 }
 
 /**
@@ -87,7 +92,15 @@ export function presentThumbnailProgress(progress, fallback = {}) {
   }
   const count = `保存済み${progress.saved.toLocaleString("ja-JP")}/${progress.total.toLocaleString("ja-JP")}件（残り${progress.remaining.toLocaleString("ja-JP")}件）`;
   if (progress.state === "complete") return `画像の保存が完了しました。${count}`;
-  if (progress.state === "partial") return `一部の画像を取得できませんでした。${count}。取得できなかった画像は${progress.failed.toLocaleString("ja-JP")}件です。保存済みの画像と履歴は保持しています。`;
+  if (progress.state === "partial") {
+    const reasons = progress.failureReasons ?? [];
+    const action = reasons.includes("storage_full")
+      ? "Chromeの画像保存用の空き容量が不足しています。端末の空き容量を確保してから「今すぐ確認」を押してください。"
+      : reasons.includes("network")
+        ? "画像の通信に失敗しました。ネット接続を確認してから「今すぐ確認」を押してください。"
+        : "取得できなかった画像は次回の確認時に再試行します。";
+    return `一部の画像を取得できませんでした。${count}。取得できなかった画像は${progress.failed.toLocaleString("ja-JP")}件です。${action}保存済みの画像と履歴は保持しています。`;
+  }
   if (progress.state === "paused") return `画像の保存を一時停止しています。${count}。Chromeを開き直しても再開しない場合は「今すぐ確認」を押してください。`;
   const waiting = progress.state === "waiting"
     ? `待機中です。${progress.nextAttemptAt === null ? "準備ができ次第" : `${formatDateTime(progress.nextAttemptAt)}以降に`}自動再開します。`

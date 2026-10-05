@@ -1,5 +1,6 @@
 // @ts-check
 
+import { isThumbnailFailureReason } from "./thumbnail.js";
 import { isAllowedVrchatImageUrl } from "./api.js";
 import {
   EVENT_KIND_ORDER,
@@ -720,7 +721,8 @@ function validateThumbnailJob(value) {
   for (const entry of job.items) {
     if (typeof entry !== "object" || entry === null) throw new Error("Invalid thumbnail job item");
     const item = /** @type {Record<string, unknown>} */ (entry);
-    if (Object.keys(item).length !== 3 || Object.keys(item).some((key) => !["id", "thumbnailImageUrl", "attempts"].includes(key))
+    if (Object.keys(item).some((key) => !["id", "thumbnailImageUrl", "attempts", "failureReason"].includes(key))
+      || (Object.hasOwn(item, "failureReason") && !isThumbnailFailureReason(item.failureReason))
       || typeof item.id !== "string" || !/^wrld_[a-f0-9-]{36}$/.test(item.id) || ids.has(item.id)
       || typeof item.thumbnailImageUrl !== "string" || item.thumbnailImageUrl.length > THUMBNAIL_SOURCE_URL_MAX_LENGTH
       || !isAllowedVrchatImageUrl(item.thumbnailImageUrl)

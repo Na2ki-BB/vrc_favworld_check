@@ -15,7 +15,9 @@ import {
   ThumbnailFetchError,
   ThumbnailLimitError,
   ThumbnailResizeError,
-  fetchAndEncodeThumbnail
+  fetchAndEncodeThumbnail,
+  isThumbnailFailureReason,
+  thumbnailFailureReason
 } from "../extension/lib/thumbnail.js";
 
 const FILE_ID = "file_00000000-0000-0000-0000-000000000001";
@@ -724,4 +726,29 @@ test("rejects unsafe or mismatched image targets before reading their bodies", a
     });
     assert.equal(bodyAccessed, false, finalUrl);
   }
+});
+
+
+test("failure reasons are fixed classifications without raw error content", () => {
+  const cases = /** @type {[import("../extension/lib/thumbnail.js").ThumbnailErrorCode, string][]} */ ([
+    ["INVALID_URL", "unsafe_url"], ["FETCH_FAILED", "network"],
+    ["UNEXPECTED_REDIRECT", "unsafe_url"], ["INVALID_MEDIA_TYPE", "format"],
+    ["DECODE_FAILED", "decode"], ["RESIZE_FAILED", "resize"],
+    ["SOURCE_TOO_LARGE", "image_limit"], ["PIXEL_LIMIT", "image_limit"],
+    ["OUTPUT_TOO_LARGE", "image_limit"]
+  ]);
+  for (const [code, reason] of cases) {
+    assert.equal(thumbnailFailureReason(new ThumbnailError(code)), reason);
+    assert.equal(isThumbnailFailureReason(reason), true);
+  }
+  for (const [status, reason] of [[401, "access_denied"], [403, "access_denied"],
+    [404, "not_found"], [410, "not_found"], [429, "rate_limited"], [500, "http_error"]]) {
+    assert.equal(thumbnailFailureReason(new ThumbnailFetchError("HTTP_STATUS", Number(status))), reason);
+  }
+  assert.equal(thumbnailFailureReason(new DOMException("private text", "QuotaExceededError"), true), "storage_full");
+  assert.equal(thumbnailFailureReason(new Error("private text"), true), "storage_error");
+  for (const error of [new Error("private text"), {code: "DECODE_FAILED", message: "private text"}, null]) {
+    assert.equal(thumbnailFailureReason(error), "unknown");
+  }
+  for (const value of [undefined, null, "private text", {}, "DECODE_FAILED"]) assert.equal(isThumbnailFailureReason(value), false);
 });

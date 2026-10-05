@@ -1799,3 +1799,19 @@ test("restore refresh cannot steal focus when the user edits during the post-com
   const source = await readFile(new URL("../extension/dashboard.js", import.meta.url), "utf8");
   assert.match(source, /restoreWorldFocus\(focused, !recordMutationInFlight\)/u, "passive card redraw preserves exact surviving controls but leaves fallback to the guarded action owner");
 });
+
+
+test("thumbnail guidance exposes only actionable, plain-language reasons", () => {
+  const base = {total: 8, saved: 0, remaining: 0, failed: 8, nextAttemptAt: null, state: "partial"};
+  const present = (/** @type {unknown[]} */ failureReasons) => presentThumbnailProgress(normalizeThumbnailProgress({...base, failureReasons}));
+  assert.match(present(["storage_full"]), /空き容量.*「今すぐ確認」/u);
+  assert.match(present(["network"]), /ネット接続.*「今すぐ確認」/u);
+  assert.match(present(["network", "storage_full"]), /空き容量/u);
+  for (const reason of ["access_denied", "not_found", "format", "decode", "resize", "image_limit", "http_error", "rate_limited", "unknown", "private text"]) {
+    const message = present([reason]);
+    assert.match(message, /次回の確認時に再試行/u);
+    assert.doesNotMatch(message, /ログイン|削除され|private text|HTTP|decode/u);
+  }
+  assert.deepEqual(normalizeThumbnailProgress({...base, failureReasons: ["network", "network", "private text"]})?.failureReasons, ["network"]);
+  assert.equal(normalizeThumbnailProgress(base)?.failureReasons, undefined);
+});
