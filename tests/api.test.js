@@ -1051,3 +1051,32 @@ test("public image redirect validation binds CDN paths to the requested file", (
   assert.equal(isAllowedVrchatImageResponseUrl(source, finalUrl.replace("files.vrchat.cloud", "files.vrchat.cloud:443")), false);
   assert.equal(isAllowedVrchatImageResponseUrl("https://example.com/file", finalUrl), false);
 });
+
+
+test("numeric CDN paths accept only the observed redirected 9-digit, 1-digit, 256 PNG form", () => {
+  const source = "https://api.vrchat.cloud/api/1/image/file_00000000-0000-0000-0000-000000000001/17/256";
+  const target = "https://files.vrchat.cloud/thumbnails/123456789.1.thumbnail-256.png";
+  assert.equal(isAllowedVrchatImageResponseUrl(source, target, true), true);
+  assert.equal(isAllowedVrchatImageResponseUrl(source, `${target}?Signature=synthetic`, true), true);
+  assert.equal(isAllowedVrchatImageResponseUrl(source, target), false);
+  assert.equal(isAllowedVrchatImageUrl(target), false);
+  assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/256", "/512"), target, true), false);
+  assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/image/", "/file/").replace("/256", "/file"), target, true), false);
+  assert.equal(isAllowedVrchatImageResponseUrl("https://example.com/image", target, true), false);
+  for (const invalid of [
+    target.replace("https:", "http:"),
+    target.replace("files.vrchat.cloud", "files.vrchat.cloud.evil.example"),
+    target.replace("files.vrchat.cloud", "user@files.vrchat.cloud"),
+    target.replace("files.vrchat.cloud", "files.vrchat.cloud:443"),
+    target.replace("files.vrchat.cloud", "files.vrchat.cloud:8443"),
+    `${target}#`, `${target}#fragment`, `${target}/extra`,
+    target.replace("123456789", "12345678"), target.replace("123456789", "1234567890"),
+    target.replace("123456789", "12345678a"), target.replace("123456789", "%3123456789"),
+    target.replace(".1.", ".."), target.replace(".1.", ".12."), target.replace(".1.", ".a."),
+    target.replace("256.png", "64.png"), target.replace("256.png", "512.png"),
+    target.replace(".png", ".webp"), target.replace(".png", ".jpg"), target.replace(".png", ".svg"),
+    target.replace("/thumbnails/", "/other/"), target.replace("/thumbnails/", "/other/../thumbnails/"),
+    target.replace("/thumbnails/", "/other/%2e%2e/thumbnails/"),
+    target.replace("thumbnail-", "modified-thumbnail-")
+  ]) assert.equal(isAllowedVrchatImageResponseUrl(source, invalid, true), false, invalid);
+});

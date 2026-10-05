@@ -233,3 +233,12 @@ error bodyは不安定で秘密情報を含む可能性があるため、画面�
 - ChromeのCookie、partitioning、DNR、Manifest V3 Service Worker lifecycle。
 
 互換性を確認できない変更では同期を停止し、履歴閲覧とJSONエクスポートは利用可能なまま保つ。
+
+
+### 8.4 数値形式の画像CDNパス（0.1.13）
+
+2026-10-05の実ブラウザ確認で、許可済みの `/api/1/image/<file ID>/<version>/256` から、HTTPSの `files.vrchat.cloud` 上の `/thumbnails/<9桁の数字>.<1桁の数字>.thumbnail-256.png` へ転送され、HTTP 200が返る例を確認した。実URL、数字の値、署名queryは保守記録やfixtureへ残さず、テストは合成値だけを使う。
+
+[公式Creator GuidelinesのAPI Usage / Bots](https://hello.vrchat.com/creator-guidelines) は、APIが公開仕様として提供されず、形式などが予告なく変わり得ると説明している。公式資料およびコミュニティ仕様元の [paths.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths.yaml)・[files.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths/files.yaml) を確認した範囲では、この数値パスの意味や許容範囲を保証する記載は見つからなかった。上記は公開仕様ではなく実測した互換形式であり、桁数・size・拡張子を推測して広げない。
+
+数値2ブロックは不透明な識別子として扱う。元のfile ID・versionとの対応はURLだけでは照合できないため、この形式だけは元画像APIからの実際のredirect、固定HTTPS host、厳密なパス、要求size 256を条件として受理する。従来のfile IDを含む形式ではfile ID・version・sizeの一致検査を維持する。署名queryの扱い、CSP、Cookie・Referer抑止、画像のサイズ・形式・再encode検査は変更しない。未知の桁数や形式は引き続き拒否し、必要があれば新たな観測とレビューで対応を判断する。

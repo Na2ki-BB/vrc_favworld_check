@@ -47,7 +47,8 @@ import {
 import {
   THUMBNAIL_ERROR_CODES,
   ThumbnailError,
-  ThumbnailFetchError
+  ThumbnailFetchError,
+  fetchAndEncodeThumbnail
 } from "../extension/lib/thumbnail.js";
 import {
   RECOVERY_MIN_DELAY_MS,
@@ -3254,4 +3255,57 @@ test("a slow failure checkpoint does not relabel a known image error as an opera
   assert.deepEqual(reasons, ["decode"]);
   assert.equal(result.timedOut, undefined);
   assert.equal(result.deferred, 1);
+});
+
+
+test("numeric CDN thumbnail retry uses the normal fetch, encode and database save path", async () => {
+  const repository = await createRepository();
+  const api = new FakeApi();
+  const now = {value: NOW};
+  const sourceUrl = "https://api.vrchat.cloud/api/1/image/file_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/1/256";
+  api.favoriteWorldsOverride = [{id: WORLD_ID, name: "画像", authorName: "作者", favoriteGroup: "worlds1",
+    releaseStatus: "public", thumbnailImageUrl: sourceUrl}];
+  const failed = createService({repository, api, now, encodeThumbnail: async () => {
+    throw new ThumbnailFetchError("UNEXPECTED_REDIRECT", 200);
+  }}).service;
+  await failed.start("manual");
+  assert.equal((await repository.getSetting(SETTING_KEYS.thumbnailJob)).items[0]?.failureReason, "unsafe_url");
+  const png = new Uint8Array(24);
+  png.set([137, 80, 78, 71, 13, 10, 26, 10]);
+  new DataView(png.buffer).setUint32(8, 13);
+  png.set([73, 72, 68, 82], 12);
+  new DataView(png.buffer).setUint32(16, 1);
+  new DataView(png.buffer).setUint32(20, 1);
+  let fetches = 0;
+  const recovered = createService({repository, api, now,
+    encodeThumbnail: (url) => fetchAndEncodeThumbnail(url, {
+      fetch: async (input, init) => {
+        fetches += 1;
+        assert.equal(input, sourceUrl);
+        assert.equal(init?.credentials, "omit");
+        assert.equal(init?.referrerPolicy, "no-referrer");
+        assert.equal(init?.redirect, "follow");
+        const response = new Response(png, {headers: {"Content-Type": "image/png"}});
+        Object.defineProperties(response, {
+          url: {value: "https://files.vrchat.cloud/thumbnails/123456789.1.thumbnail-256.png?Signature=synthetic"},
+          redirected: {value: true}
+        });
+        return response;
+      },
+      createBitmap: async () => ({width: 1, height: 1}),
+      createCanvas: () => ({getContext: () => ({drawImage: () => {}}),
+        convertToBlob: async () => new Blob([new Uint8Array([1])], {type: "image/webp"})})
+    })
+  }).service;
+  now.value += 60_000;
+  await recovered.start("thumbnail");
+  assert.equal(fetches, 1);
+  const stored = await repository.getThumbnail(USER_ID, WORLD_ID);
+  assert.equal(stored?.sourceUrl, sourceUrl);
+  assert.equal(stored?.blob.type, "image/webp");
+  assert.equal(stored?.blob.size, 1);
+  assert.equal((await recovered.getStatus()).thumbnailProgress?.state, "complete");
+  assert.equal((await recovered.getStatus()).thumbnailProgress?.failureReasons, undefined);
+  assert.doesNotMatch(JSON.stringify({stored, job: await repository.getSetting(SETTING_KEYS.thumbnailJob)}),
+    /Signature|synthetic|files\.vrchat\.cloud/u);
 });

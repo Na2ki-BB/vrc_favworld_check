@@ -683,6 +683,7 @@ test("returns the smallest under-cap candidate or a typed output limit error", a
 
 test("follows matching VRChat CDN images without persisting signed response URLs", async () => {
   for (const [source, path] of [
+    [SOURCE_URL, "/thumbnails/123456789.1.thumbnail-256.png"],
     [SOURCE_URL, `/thumbnails/${FILE_ID}.${"a".repeat(64)}.1.thumbnail-256.png`],
     [`https://api.vrchat.cloud/api/1/file/${FILE_ID}/1/file`, `/World-Image.${FILE_ID}.1.png`]
   ]) {
@@ -783,4 +784,27 @@ test("encoder reports only fixed in-memory stages in execution order", async () 
   const stages = [];
   await fetchAndEncodeThumbnail(SOURCE_URL, {...image.dependencies, onStage: (stage) => { stages.push(stage); }});
   assert.deepEqual(stages, ["fetch", "decode", "resize"]);
+});
+
+
+test("rejects numeric CDN variants before reading the image body", async () => {
+  const path = "/thumbnails/123456789.1.thumbnail-256.png";
+  const safe = `https://files.vrchat.cloud${path}`;
+  for (const [url, redirected] of [
+    [safe, false],
+    [safe.replace("123456789", "12345678"), true],
+    [safe.replace("123456789", "1234567890"), true],
+    [safe.replace(".1.", ".12."), true],
+    [safe.replace("256.png", "512.png"), true],
+    [safe.replace(".png", ".jpg"), true],
+    [safe.replace("/thumbnails/", "/other/../thumbnails/"), true],
+    [safe.replace("files.vrchat.cloud", "evil.example"), true]
+  ]) {
+    const response = imageResponse(pngHeader(1, 1), {url: String(url), redirected: Boolean(redirected)});
+    let bodyAccessed = false;
+    Object.defineProperty(response, "body", {get() {bodyAccessed = true; throw new Error("must not read body");}});
+    await assert.rejects(fetchAndEncodeThumbnail(SOURCE_URL, {fetch: async () => response}),
+      (error) => error instanceof ThumbnailFetchError && error.code === "UNEXPECTED_REDIRECT");
+    assert.equal(bodyAccessed, false);
+  }
 });
