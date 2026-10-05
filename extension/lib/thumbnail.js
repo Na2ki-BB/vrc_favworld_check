@@ -23,6 +23,43 @@ export const THUMBNAIL_ERROR_CODES = /** @type {const} */ ({
   OUTPUT_TOO_LARGE: "OUTPUT_TOO_LARGE"
 });
 
+// Only these fixed values may be persisted. Never retain exception messages,
+// response bodies, headers, or redirected image URLs.
+export const THUMBNAIL_FAILURE_REASONS = /** @type {const} */ ([
+  "network", "access_denied", "not_found", "rate_limited", "http_error",
+  "unsafe_url", "format", "decode", "resize", "image_limit",
+  "storage_full", "storage_error", "unknown"
+]);
+/** @typedef {(typeof THUMBNAIL_FAILURE_REASONS)[number]} ThumbnailFailureReason */
+/** @param {unknown} value @returns {value is ThumbnailFailureReason} */
+export function isThumbnailFailureReason(value) {
+  return THUMBNAIL_FAILURE_REASONS.some((reason) => reason === value);
+}
+
+/** @param {unknown} error @param {boolean} [saving] @returns {ThumbnailFailureReason} */
+export function thumbnailFailureReason(error, saving = false) {
+  if (saving) return error instanceof DOMException && error.name === "QuotaExceededError"
+    ? "storage_full" : "storage_error";
+  if (!(error instanceof ThumbnailError)) return "unknown";
+  switch (error.code) {
+    case "FETCH_FAILED": return "network";
+    case "HTTP_STATUS":
+      if (error.status === 401 || error.status === 403) return "access_denied";
+      if (error.status === 404 || error.status === 410) return "not_found";
+      if (error.status === 429) return "rate_limited";
+      return "http_error";
+    case "INVALID_URL":
+    case "UNEXPECTED_REDIRECT": return "unsafe_url";
+    case "INVALID_MEDIA_TYPE": return "format";
+    case "DECODE_FAILED": return "decode";
+    case "RESIZE_FAILED": return "resize";
+    case "SOURCE_TOO_LARGE":
+    case "PIXEL_LIMIT":
+    case "OUTPUT_TOO_LARGE": return "image_limit";
+    default: return "unknown";
+  }
+}
+
 const ALLOWED_SOURCE_MEDIA_TYPES = new Set([
   "image/jpeg",
   "image/png",
