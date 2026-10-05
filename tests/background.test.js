@@ -3258,7 +3258,7 @@ test("a slow failure checkpoint does not relabel a known image error as an opera
 });
 
 
-test("numeric CDN thumbnail retry uses the normal fetch, encode and database save path", async () => {
+test("flexible CDN thumbnail retry uses the normal fetch, encode and database save path", async () => {
   const repository = await createRepository();
   const api = new FakeApi();
   const now = {value: NOW};
@@ -3287,7 +3287,7 @@ test("numeric CDN thumbnail retry uses the normal fetch, encode and database sav
         assert.equal(init?.redirect, "follow");
         const response = new Response(png, {headers: {"Content-Type": "image/png"}});
         Object.defineProperties(response, {
-          url: {value: "https://files.vrchat.cloud/thumbnails/123456789.1.thumbnail-256.png?Signature=synthetic"},
+          url: {value: "https://files.vrchat.cloud/thumbnails/1234567890.12.thumbnail-512.png?Signature=synthetic"},
           redirected: {value: true}
         });
         return response;
