@@ -13,6 +13,8 @@ export const THUMBNAIL_MAX_OUTPUT_BYTES = 48 * 1024;
 export const THUMBNAIL_ERROR_CODES = /** @type {const} */ ({
   INVALID_URL: "INVALID_URL",
   FETCH_FAILED: "FETCH_FAILED",
+  FETCH_TIMEOUT: "FETCH_TIMEOUT",
+  FETCH_ABORTED: "FETCH_ABORTED",
   UNEXPECTED_REDIRECT: "UNEXPECTED_REDIRECT",
   HTTP_STATUS: "HTTP_STATUS",
   INVALID_MEDIA_TYPE: "INVALID_MEDIA_TYPE",
@@ -28,7 +30,8 @@ export const THUMBNAIL_ERROR_CODES = /** @type {const} */ ({
 export const THUMBNAIL_FAILURE_REASONS = /** @type {const} */ ([
   "network", "access_denied", "not_found", "rate_limited", "http_error",
   "unsafe_url", "format", "decode", "resize", "image_limit",
-  "storage_full", "storage_error", "unknown"
+  "storage_full", "storage_error", "unknown", "aborted",
+  "timeout_checkpoint", "timeout_fetch", "timeout_decode", "timeout_resize", "timeout_storage"
 ]);
 /** @typedef {(typeof THUMBNAIL_FAILURE_REASONS)[number]} ThumbnailFailureReason */
 /** @param {unknown} value @returns {value is ThumbnailFailureReason} */
@@ -43,6 +46,8 @@ export function thumbnailFailureReason(error, saving = false) {
   if (!(error instanceof ThumbnailError)) return "unknown";
   switch (error.code) {
     case "FETCH_FAILED": return "network";
+    case "FETCH_TIMEOUT": return "timeout_fetch";
+    case "FETCH_ABORTED": return "aborted";
     case "HTTP_STATUS":
       if (error.status === 401 || error.status === 403) return "access_denied";
       if (error.status === 404 || error.status === 410) return "not_found";
@@ -94,7 +99,8 @@ const DEFAULT_TIMEOUT_MS = 5_000;
  *   createCanvas?: CreateCanvasLike,
  *   timeoutMs?: number,
  *   clock?: () => number,
- *   signal?: AbortSignal
+ *   signal?: AbortSignal,
+ *   onStage?: (stage: "fetch" | "decode" | "resize") => void
  * }} ThumbnailDependencies
  * @typedef {{
  *   bytes: Uint8Array,
@@ -121,7 +127,7 @@ export class ThumbnailError extends Error {
 
 export class ThumbnailFetchError extends ThumbnailError {
   /**
-   * @param {"FETCH_FAILED" | "UNEXPECTED_REDIRECT" | "HTTP_STATUS"} code
+   * @param {"FETCH_FAILED" | "FETCH_TIMEOUT" | "FETCH_ABORTED" | "UNEXPECTED_REDIRECT" | "HTTP_STATUS"} code
    * @param {number | null} [status]
    * @param {number | null} [retryAt]
    */
@@ -168,6 +174,7 @@ export async function fetchAndEncodeThumbnail(sourceUrl, dependencies = {}) {
   }
   throwIfThumbnailAborted(dependencies.signal);
 
+  dependencies.onStage?.("fetch");
   const fetched = await fetchBoundedImage(
     sourceUrl,
     dependencies.fetch ?? defaultFetch,
@@ -176,6 +183,7 @@ export async function fetchAndEncodeThumbnail(sourceUrl, dependencies = {}) {
     dependencies.signal
   );
   throwIfThumbnailAborted(dependencies.signal);
+  dependencies.onStage?.("decode");
   const encodedDimensions = readEncodedDimensions(
     fetched.bytes,
     fetched.mediaType
@@ -192,12 +200,14 @@ export async function fetchAndEncodeThumbnail(sourceUrl, dependencies = {}) {
   try {
     bitmap = await createBitmap(sourceBlob);
   } catch {
+    throwIfThumbnailAborted(dependencies.signal);
     throw new ThumbnailResizeError(THUMBNAIL_ERROR_CODES.DECODE_FAILED);
   }
 
   try {
     throwIfThumbnailAborted(dependencies.signal);
     validateDecodedDimensions(bitmap);
+    dependencies.onStage?.("resize");
     const encoded = await encodeBoundedWebp(
       bitmap,
       createCanvas,
@@ -229,7 +239,8 @@ async function fetchBoundedImage(sourceUrl, fetch, timeoutMs, clock, externalSig
   } else {
     externalSignal?.addEventListener("abort", abortFromExternalSignal, { once: true });
   }
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeoutId = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
   /** @type {Response} */
   let response;
   try {
@@ -246,7 +257,8 @@ async function fetchBoundedImage(sourceUrl, fetch, timeoutMs, clock, externalSig
     clearTimeout(timeoutId);
     externalSignal?.removeEventListener("abort", abortFromExternalSignal);
     controller.abort();
-    throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.FETCH_FAILED);
+    throwIfThumbnailAborted(externalSignal);
+    throw new ThumbnailFetchError(timedOut ? THUMBNAIL_ERROR_CODES.FETCH_TIMEOUT : THUMBNAIL_ERROR_CODES.FETCH_FAILED);
   }
 
   try {
@@ -291,6 +303,10 @@ async function fetchBoundedImage(sourceUrl, fetch, timeoutMs, clock, externalSig
       bytes: await readBoundedBytes(response),
       mediaType
     };
+  } catch (error) {
+    throwIfThumbnailAborted(externalSignal);
+    if (timedOut) throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.FETCH_TIMEOUT);
+    throw error;
   } finally {
     clearTimeout(timeoutId);
     externalSignal?.removeEventListener("abort", abortFromExternalSignal);
@@ -301,7 +317,7 @@ async function fetchBoundedImage(sourceUrl, fetch, timeoutMs, clock, externalSig
 /** @param {AbortSignal | undefined} signal */
 function throwIfThumbnailAborted(signal) {
   if (signal?.aborted === true) {
-    throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.FETCH_FAILED);
+    throw new ThumbnailFetchError(THUMBNAIL_ERROR_CODES.FETCH_ABORTED);
   }
 }
 

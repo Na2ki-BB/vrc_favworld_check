@@ -430,7 +430,7 @@ test("an external deadline signal stops thumbnail work before decoding", async (
     }),
     (error) => {
       assert.ok(error instanceof ThumbnailFetchError);
-      assert.equal(error.code, THUMBNAIL_ERROR_CODES.FETCH_FAILED);
+      assert.equal(error.code, THUMBNAIL_ERROR_CODES.FETCH_ABORTED);
       return true;
     }
   );
@@ -751,4 +751,36 @@ test("failure reasons are fixed classifications without raw error content", () =
     assert.equal(thumbnailFailureReason(error), "unknown");
   }
   for (const value of [undefined, null, "private text", {}, "DECODE_FAILED"]) assert.equal(isThumbnailFailureReason(value), false);
+});
+
+test("fetch timeout and external cancellation are distinct from a network failure", async () => {
+  for (const mode of ["timeout", "abort", "body_timeout"]) {
+    const external = new AbortController();
+    await assert.rejects(fetchAndEncodeThumbnail(SOURCE_URL, {
+      timeoutMs: 10, signal: external.signal,
+      fetch: async (_url, options) => {
+        assert.ok(options?.signal);
+        const signal = options.signal;
+        if (mode === "body_timeout") return imageResponse(new ReadableStream({
+          start(controller) { signal.addEventListener("abort", () => controller.error(new DOMException("private", "AbortError")), {once: true}); }
+        }));
+        const response = new Promise((_, reject) => signal.addEventListener("abort", () => reject(new DOMException("private", "AbortError")), {once: true}));
+        if (mode === "abort") external.abort();
+        return /** @type {Promise<Response>} */ (response);
+      }
+    }), (error) => {
+      assert.ok(error instanceof ThumbnailFetchError);
+      assert.equal(error.code, mode === "abort" ? "FETCH_ABORTED" : "FETCH_TIMEOUT");
+      assert.equal(thumbnailFailureReason(error), mode === "abort" ? "aborted" : "timeout_fetch");
+      return true;
+    });
+  }
+});
+
+test("encoder reports only fixed in-memory stages in execution order", async () => {
+  const image = createImageDependencies();
+  /** @type {string[]} */
+  const stages = [];
+  await fetchAndEncodeThumbnail(SOURCE_URL, {...image.dependencies, onStage: (stage) => { stages.push(stage); }});
+  assert.deepEqual(stages, ["fetch", "decode", "resize"]);
 });
