@@ -684,6 +684,8 @@ test("returns the smallest under-cap candidate or a typed output limit error", a
 test("follows matching VRChat CDN images without persisting signed response URLs", async () => {
   for (const [source, path] of [
     [SOURCE_URL, "/thumbnails/123456789.1.thumbnail-256.png"],
+    [SOURCE_URL, "/thumbnails/1234567890.12.thumbnail-512.webp"],
+    [SOURCE_URL, "/thumbnails/future-image-without-extension"],
     [SOURCE_URL, `/thumbnails/${FILE_ID}.${"a".repeat(64)}.1.thumbnail-256.png`],
     [`https://api.vrchat.cloud/api/1/file/${FILE_ID}/1/file`, `/World-Image.${FILE_ID}.1.png`]
   ]) {
@@ -701,7 +703,7 @@ test("follows matching VRChat CDN images without persisting signed response URLs
   }
 });
 
-test("rejects unsafe or mismatched image targets before reading their bodies", async () => {
+test("rejects unsafe image targets before reading their bodies", async () => {
   const safePath = `/thumbnails/${FILE_ID}.${"a".repeat(64)}.1.thumbnail-256.png`;
   const safeUrl = `https://files.vrchat.cloud${safePath}`;
   for (const finalUrl of [
@@ -712,9 +714,6 @@ test("rejects unsafe or mismatched image targets before reading their bodies", a
     `${safeUrl}#fragment`,
     `${safeUrl}#`,
     safeUrl.replace("/thumbnails/", "/arbitrary/"),
-    safeUrl.replace(FILE_ID, "file_00000000-0000-0000-0000-000000000002"),
-    safeUrl.replace(".1.thumbnail", ".2.thumbnail"),
-    safeUrl.replace("thumbnail-256", "thumbnail-512"),
     SOURCE_URL.replace("/1/256", "/2/256")
   ]) {
     const response = imageResponse(pngHeader(640, 360), { url: finalUrl, redirected: true });
@@ -787,16 +786,13 @@ test("encoder reports only fixed in-memory stages in execution order", async () 
 });
 
 
-test("rejects numeric CDN variants before reading the image body", async () => {
+test("rejects unsafe CDN paths before reading the image body", async () => {
   const path = "/thumbnails/123456789.1.thumbnail-256.png";
   const safe = `https://files.vrchat.cloud${path}`;
   for (const [url, redirected] of [
     [safe, false],
-    [safe.replace("123456789", "12345678"), true],
-    [safe.replace("123456789", "1234567890"), true],
-    [safe.replace(".1.", ".12."), true],
-    [safe.replace("256.png", "512.png"), true],
-    [safe.replace(".png", ".jpg"), true],
+    [`${safe}/nested`, true],
+    [safe.replace("123456789", "%31"), true],
     [safe.replace("/thumbnails/", "/other/../thumbnails/"), true],
     [safe.replace("files.vrchat.cloud", "evil.example"), true]
   ]) {
@@ -806,5 +802,23 @@ test("rejects numeric CDN variants before reading the image body", async () => {
     await assert.rejects(fetchAndEncodeThumbnail(SOURCE_URL, {fetch: async () => response}),
       (error) => error instanceof ThumbnailFetchError && error.code === "UNEXPECTED_REDIRECT");
     assert.equal(bodyAccessed, false);
+  }
+});
+
+
+test("flexible CDN names cannot bypass media type, magic bytes or pixel limits", async () => {
+  const url = "https://files.vrchat.cloud/thumbnails/future-name";
+  const cases = [
+    {bytes: pngHeader(1, 1), contentType: "text/html", code: "INVALID_MEDIA_TYPE"},
+    {bytes: new TextEncoder().encode("<svg><script>unsafe</script></svg>"), contentType: "image/png", code: "DECODE_FAILED"},
+    {bytes: pngHeader(8193, 1), contentType: "image/png", code: "PIXEL_LIMIT"}
+  ];
+  for (const item of cases) {
+    let decoded = false;
+    await assert.rejects(fetchAndEncodeThumbnail(SOURCE_URL, {
+      fetch: async () => imageResponse(item.bytes, {url, redirected: true, contentType: item.contentType}),
+      createBitmap: async () => {decoded = true; return {width: 1, height: 1};}
+    }), (error) => error instanceof ThumbnailError && error.code === item.code);
+    assert.equal(decoded, false);
   }
 });

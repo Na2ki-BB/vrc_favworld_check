@@ -179,7 +179,7 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - HTTPS 以外を拒否する。
 - URL は文字列連結ではなく固定 base URL と検証済み world ID から構築する。
 - world ID は `^wrld_[0-9a-fA-F-]{36}$` 相当の UUID 形式を満たすものだけ path に入れる。
-- JSON APIのfetchは `redirect: "manual"` に固定し、3xx / opaque redirectでは同期を停止する。画像fetchだけは `redirect: "follow"` とし、CSP `connect-src`をself・HTTPSの`api.vrchat.cloud`・`files.vrchat.cloud`に限定して各転送の送信前に接続先を制限する。画像にはCookieとRefererを付けず、本文読出し前に最終URLの既知pathを検査し、file IDを含む形式は画像ID・版・サイズを照合する。数値形式は実測した9桁・1桁・256 PNGのパスだけを、元画像APIからのredirectかつ要求size 256の場合に許可する。この形式では画像ID・版をURL上で照合できず、公式APIの転送結果を信頼する。転送回数はブラウザ上限とtimeoutで制限し、厳密な1回限定とはしない。
+- JSON APIのfetchは `redirect: "manual"` に固定し、3xx / opaque redirectでは同期を停止する。画像fetchだけは `redirect: "follow"` とし、CSP `connect-src`をself・HTTPSの`api.vrchat.cloud`・`files.vrchat.cloud`に限定して各転送の送信前に接続先を制限する。画像にはCookieとRefererを付けず、本文読出し前に最終URLの既知pathを検査し、画像ルートは元APIからの実redirectかつ`files.vrchat.cloud/thumbnails/`直下の単一ファイル名に限定する。ファイル名は英数字と`._~-`の1〜1024文字とし、階層・エンコードされた区切り・制御文字・空白・バックスラッシュを拒否する。名前のID・版・sizeは照合せず、公式APIの転送結果を信頼するため、別画像・古い版との対応不一致は名前から検出できない。独立したfileルートの画像ID・版の照合は維持する。転送回数はブラウザ上限とtimeoutで制限し、厳密な1回限定とはしない。
 - method は GET に固定し、request body を送らない。
 - APIが返したURLは、検証済みの `thumbnailImageUrl` だけを画像取得に使う。host、path、scheme、port、query、fragmentを検査し、認証Cookieを付けない。
 - 通信先はVRChatの固定API、画像配信先files、固定ログイン画面に限定する。WebSocket、分析サービス、開発者サーバーへは接続しない。
@@ -215,7 +215,7 @@ VRChat Creator Guidelines は `applicationName/Version contactInfo` 形式の Us
 - 配列要素は `unknown` から必要 DTO へ 1 件ずつ検証する。
 - `id`、`favoriteId` の prefix と UUID 形式を検査する。例外は `/worlds/favorites` のページング境界だけが明示的にopt-inするnullable identityとする。canonical検査に一致しないIDは追加解釈・コピーせず `{ identity: null, metadata: null }` とし、raw件数だけをoffsetと総数上限へ含めてmetadata出力前に除外する。
 - favorite group は `fvgrp_` ID、本人 `ownerId`、一意な内部名、`world|vrcPlusWorld` type を検査する。avatar/friend groupは検証後に破棄し、raw objectを保存しない。
-- 任意の`thumbnailImageUrl`はHTTPSの`api.vrchat.cloud`、port・userinfo・query・fragmentなし、既知の`/api/1/file/`または`/api/1/image/` pathに一致する値だけを画像候補として受理する。不正な任意値は主要world metadataを止めず破棄する。取得後も最終URLの限定形式（数値形式の条件と残余リスクは上記参照）、MIME、byte数、PNG・JPEG・WebP header寸法をdecode前に検査し、decode後にも寸法を再検査する。Cookie・Refererを送信しない。画像APIからfilesへの転送はCSPと最終URL検証の下で許可し、署名付き転送先は保存・ログ出力せず、元API URLだけを保存版の識別に使う。画面はCSP img-src self/blobで外部画像の直接表示も防ぐ。画像処理は1回最大100件・共通deadline 30秒とし、fetch timeoutは5秒と残り時間の短い方、期限時はAbortSignalで後続処理も中止する。通信断・5xx・429では残りを止める。429では待機期限を保存し、期限前は主要APIも含めて追加通信しない。
+- 任意の`thumbnailImageUrl`はHTTPSの`api.vrchat.cloud`、port・userinfo・query・fragmentなし、既知の`/api/1/file/`または`/api/1/image/` pathに一致する値だけを画像候補として受理する。不正な任意値は主要world metadataを止めず破棄する。取得後も最終URLの限定形式（画像ルートの条件と残余リスクは上記参照）、MIME、byte数、PNG・JPEG・WebP header寸法をdecode前に検査し、decode後にも寸法を再検査する。Cookie・Refererを送信しない。画像APIからfilesへの転送はCSPと最終URL検証の下で許可し、署名付き転送先は保存・ログ出力せず、元API URLだけを保存版の識別に使う。画面はCSP img-src self/blobで外部画像の直接表示も防ぐ。画像処理は1回最大100件・共通deadline 30秒とし、fetch timeoutは5秒と残り時間の短い方、期限時はAbortSignalで後続処理も中止する。通信断・5xx・429では残りを止める。429では待機期限を保存し、期限前は主要APIも含めて追加通信しない。
 - 名前と作者名は制御文字を除外し、表示・保存長を合理的な上限にする。ただし空白や Unicode 名を不必要に破壊しない。
 - 未知フィールドは無視する。必須フィールド欠落はpage全体を不正として同期を中止する。noncanonical ID行もID以外の必須fieldをすべて検査する。null identityはglobal重複検査から除外し、canonical ID重複は中止する。canonical IDがあるpageのfingerprintはcanonical ID列と除外件数から作り、全件nullのpageを除外件数だけで反復判定しない。非空snapshot全体のcanonical metadataが0件なら中止する。
 - `/worlds/favorites` の `n=100` は要求件数であり、応答上限には使わない。100件超のraw pageは総数10,000件の残枠を投影前に検査し、他の一覧endpointは1ページ100件上限を維持する。

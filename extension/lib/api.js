@@ -839,8 +839,8 @@ export function isAllowedVrchatImageUrl(value) {
 }
 
 /**
- * Validate the final public image. File-bearing paths bind file and version;
- * the narrowly observed numeric CDN form relies on the API redirect instead.
+ * Image thumbnails trust the API redirect, not a CDN filename convention.
+ * The separate file route still binds the requested file and version.
  * Signed CDN query parameters are used only by fetch and never stored.
  * The extension CSP restricts every redirect hop before a request is sent.
  *
@@ -874,18 +874,14 @@ export function isAllowedVrchatImageResponseUrl(sourceUrl, finalUrl, redirected 
   const kind = sourceParts[3];
   const fileId = sourceParts[4];
   const version = sourceParts[5];
-  const size = sourceParts[6];
   const path = target.pathname;
   if (kind === "image") {
-    // Observed API redirect only: opaque 9-digit + 1-digit CDN identifiers.
-    // Neither number is assumed to encode the requested file or version.
-    if (redirected && size === "256"
-      && /^\/thumbnails\/[0-9]{9}\.[0-9]\.thumbnail-256\.png$/u.test(path)
-      && finalUrl.split("?", 1)[0] === target.origin + path) {
-      return true;
-    }
-    const match = /^\/thumbnails\/(file_[a-f0-9-]+)\.([a-f0-9]{64})\.(\d+)\.thumbnail-(\d+)\.(?:png|jpe?g|webp)$/u.exec(path);
-    return match !== null && match[1] === fileId && match[3] === version && match[4] === size;
+    // One bounded, unescaped filename: no subdirectories or encoded separators.
+    // This is a product limit, not a claim about VRChat's naming scheme.
+    return redirected
+      && /^\/thumbnails\/[A-Za-z0-9._~-]{1,1024}$/u.test(path)
+      && !/[\p{Cc}\s\\]/u.test(finalUrl)
+      && finalUrl.split("?", 1)[0] === target.origin + path;
   }
   const match = /^\/[^/]+\.(file_[a-f0-9-]+)\.(\d+)\.(?:png|jpe?g|webp)$/u.exec(path);
   return match !== null && match[1] === fileId && match[2] === version;

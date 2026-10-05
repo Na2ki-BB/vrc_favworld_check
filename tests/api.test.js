@@ -1053,15 +1053,21 @@ test("public image redirect validation binds CDN paths to the requested file", (
 });
 
 
-test("numeric CDN paths accept only the observed redirected 9-digit, 1-digit, 256 PNG form", () => {
+test("image CDN names are opaque while origin, redirect and path boundaries stay strict", () => {
   const source = "https://api.vrchat.cloud/api/1/image/file_00000000-0000-0000-0000-000000000001/17/256";
-  const target = "https://files.vrchat.cloud/thumbnails/123456789.1.thumbnail-256.png";
-  assert.equal(isAllowedVrchatImageResponseUrl(source, target, true), true);
-  assert.equal(isAllowedVrchatImageResponseUrl(source, `${target}?Signature=synthetic`, true), true);
-  assert.equal(isAllowedVrchatImageResponseUrl(source, target), false);
-  assert.equal(isAllowedVrchatImageUrl(target), false);
-  assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/256", "/512"), target, true), false);
-  assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/image/", "/file/").replace("/256", "/file"), target, true), false);
+  const root = "https://files.vrchat.cloud/thumbnails/";
+  for (const filename of ["123456789.1.thumbnail-256.png", "1234567890.12.thumbnail-512.webp",
+    "file_00000000-0000-0000-0000-000000000002." + "a".repeat(64) + ".9.thumbnail-128.jpg",
+    "Future_name-~.image", "no-extension", "a".repeat(1024)]) {
+    const target = root + filename;
+    assert.equal(isAllowedVrchatImageResponseUrl(source, target, true), true);
+    assert.equal(isAllowedVrchatImageResponseUrl(source, `${target}?Signature=synthetic`, true), true);
+    assert.equal(isAllowedVrchatImageResponseUrl(source, target), false);
+    assert.equal(isAllowedVrchatImageUrl(target), false);
+    assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/256", "/512"), target, true), true);
+    assert.equal(isAllowedVrchatImageResponseUrl(source.replace("/image/", "/file/").replace("/256", "/file"), target, true), false);
+  }
+  const target = root + "image.png";
   assert.equal(isAllowedVrchatImageResponseUrl("https://example.com/image", target, true), false);
   for (const invalid of [
     target.replace("https:", "http:"),
@@ -1070,13 +1076,10 @@ test("numeric CDN paths accept only the observed redirected 9-digit, 1-digit, 25
     target.replace("files.vrchat.cloud", "files.vrchat.cloud:443"),
     target.replace("files.vrchat.cloud", "files.vrchat.cloud:8443"),
     `${target}#`, `${target}#fragment`, `${target}/extra`,
-    target.replace("123456789", "12345678"), target.replace("123456789", "1234567890"),
-    target.replace("123456789", "12345678a"), target.replace("123456789", "%3123456789"),
-    target.replace(".1.", ".."), target.replace(".1.", ".12."), target.replace(".1.", ".a."),
-    target.replace("256.png", "64.png"), target.replace("256.png", "512.png"),
-    target.replace(".png", ".webp"), target.replace(".png", ".jpg"), target.replace(".png", ".svg"),
+    root, root + ".", root + "..", root + "a".repeat(1025),
+    root + "a%2fb.png", root + "a%5cb.png", root + "%2e%2e", root + "a%252fb.png",
+    root + "a\\b.png", root + "a b.png", root + "a\nb.png", `${target}?x=\n`,
     target.replace("/thumbnails/", "/other/"), target.replace("/thumbnails/", "/other/../thumbnails/"),
-    target.replace("/thumbnails/", "/other/%2e%2e/thumbnails/"),
-    target.replace("thumbnail-", "modified-thumbnail-")
+    target.replace("/thumbnails/", "/other/%2e%2e/thumbnails/")
   ]) assert.equal(isAllowedVrchatImageResponseUrl(source, invalid, true), false, invalid);
 });

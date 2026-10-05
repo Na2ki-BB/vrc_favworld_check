@@ -239,6 +239,12 @@ error bodyは不安定で秘密情報を含む可能性があるため、画面�
 
 2026-10-05の実ブラウザ確認で、許可済みの `/api/1/image/<file ID>/<version>/256` から、HTTPSの `files.vrchat.cloud` 上の `/thumbnails/<9桁の数字>.<1桁の数字>.thumbnail-256.png` へ転送され、HTTP 200が返る例を確認した。実URL、数字の値、署名queryは保守記録やfixtureへ残さず、テストは合成値だけを使う。
 
-[公式Creator GuidelinesのAPI Usage / Bots](https://hello.vrchat.com/creator-guidelines) は、APIが公開仕様として提供されず、形式などが予告なく変わり得ると説明している。公式資料およびコミュニティ仕様元の [paths.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths.yaml)・[files.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths/files.yaml) を確認した範囲では、この数値パスの意味や許容範囲を保証する記載は見つからなかった。上記は公開仕様ではなく実測した互換形式であり、桁数・size・拡張子を推測して広げない。
+[公式Creator GuidelinesのAPI Usage / Bots](https://hello.vrchat.com/creator-guidelines) は、APIが公開仕様として提供されず、形式などが予告なく変わり得ると説明している。公式資料およびコミュニティ仕様元の [paths.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths.yaml)・[files.yaml](https://github.com/vrchatapi/specification/blob/main/openapi/components/paths/files.yaml) を確認した範囲では、この数値パスの意味や許容範囲を保証する記載は見つからなかった。上記は公開仕様ではなく実測した互換形式である。
 
-数値2ブロックは不透明な識別子として扱う。元のfile ID・versionとの対応はURLだけでは照合できないため、この形式だけは元画像APIからの実際のredirect、固定HTTPS host、厳密なパス、要求size 256を条件として受理する。従来のfile IDを含む形式ではfile ID・version・sizeの一致検査を維持する。署名queryの扱い、CSP、Cookie・Referer抑止、画像のサイズ・形式・再encode検査は変更しない。未知の桁数や形式は引き続き拒否し、必要があれば新たな観測とレビューで対応を判断する。
+0.1.13では観測した9桁・1桁・256 PNGだけを限定許可した。0.1.14では桁数ごとの例外追加をやめ、元画像APIから実際に転送された固定HTTPS hostの `/thumbnails/` 直下にある単一ファイル名を不透明な識別子として扱う。名前は英数字と `._~-`、1〜1024文字に限定し、階層・エンコードされた区切り・制御文字・空白・バックスラッシュ・userinfo・明示port・fragmentを拒否する。この文字数上限は製品側の防御的な上限であり、VRChatの仕様ではない。
+
+画像ルートではファイル名のID・version・size・拡張子を解析しない。公式API/CDNが別画像や古い版を返す場合、名前からの対応不一致は検出できなくなる。一方、従来の64hexも画像bytesのhashや署名の検証ではなかった。独立した `/file/` ルートのID・version照合は維持する。queryは転送時だけ利用し、署名を拡張側で検証したとはみなさず保存・ログ出力しない。
+
+CSP、Cookie・Referer抑止、5MiB・8192px・1600万画素上限、MIMEと画像header検査、decode、WebP再生成と48KiB出力上限を維持する。拡張子がどう見えるかではなく中身で判定する。将来の未知host・ディレクトリ・実画像形式は自動許可しない。ブラウザの画像処理の脆弱性等の残余リスクはあり、安全を保証する設計ではない。
+
+[MDNのResponse.redirected](https://developer.mozilla.org/en-US/docs/Web/API/Response/redirected) が説明するように、redirect済みフラグと最終URLは通信後の検査である。通信先の制限は [Chrome拡張のCSP](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests) で維持し、最終URLの検査だけで外部通信を防げるとは扱わない。
