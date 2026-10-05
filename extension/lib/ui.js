@@ -95,7 +95,7 @@ export function presentThumbnailProgress(progress, fallback = {}) {
   if (progress.state === "partial") {
     const reasons = progress.failureReasons ?? [];
     const action = reasons.includes("storage_full")
-      ? "Chromeの画像保存用の空き容量が不足しています。端末の空き容量を確保してから「今すぐ確認」を押してください。"
+      ? "ブラウザの保存容量の上限に達しました。端末の空き容量が少ない場合は、確保してから「今すぐ確認」を押してください。"
       : reasons.includes("network")
         ? "画像の通信に失敗しました。ネット接続を確認してから「今すぐ確認」を押してください。"
         : "取得できなかった画像は次回の確認時に再試行します。";

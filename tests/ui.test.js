@@ -1804,7 +1804,8 @@ test("restore refresh cannot steal focus when the user edits during the post-com
 test("thumbnail guidance exposes only actionable, plain-language reasons", () => {
   const base = {total: 8, saved: 0, remaining: 0, failed: 8, nextAttemptAt: null, state: "partial"};
   const present = (/** @type {unknown[]} */ failureReasons) => presentThumbnailProgress(normalizeThumbnailProgress({...base, failureReasons}));
-  assert.match(present(["storage_full"]), /空き容量.*「今すぐ確認」/u);
+  assert.match(present(["storage_full"]), /ブラウザの保存容量の上限/u);
+  assert.match(present(["storage_full"]), /端末の空き容量が少ない場合.*「今すぐ確認」/u);
   assert.match(present(["network"]), /ネット接続.*「今すぐ確認」/u);
   assert.match(present(["network", "storage_full"]), /空き容量/u);
   for (const reason of ["access_denied", "not_found", "format", "decode", "resize", "image_limit", "http_error", "rate_limited", "unknown", "private text"]) {
