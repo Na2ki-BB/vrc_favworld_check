@@ -1,8 +1,9 @@
 // @ts-check
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
+
+import { readFile } from "./source-text.js";
 
 import {
   ALL_WORLDS_DASHBOARD_PATH,
