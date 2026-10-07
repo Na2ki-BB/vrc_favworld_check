@@ -26,7 +26,8 @@ VRC Favorite World Historyは、VRChatのお気に入りワールドをChrome内
 | `extension/lib/domain.js` | ワールドの状態遷移と履歴を計算する純粋関数 |
 | `extension/lib/favorite-groups.js` | お気に入りリストの照合、名前の履歴、表示用の枠 |
 | `extension/lib/database.js` | IndexedDB、移行、世代検査、原子的な保存・削除 |
-| `extension/lib/backup.js` | JSONの検証、書き出し、復元 |
+| `extension/lib/backup.js` | 記録JSONの検証・シリアライズと復元 |
+| `extension/lib/backup-archive.js` | 保存済み画像を含むZIPの生成・検証・復元 |
 | `extension/lib/schedule.js` | 次回確認とレート制限時の待機時刻 |
 | `extension/lib/thumbnail.js` | 画像URL・形式の検証、取得、WebPへの縮小 |
 | `extension/popup.*`、`extension/dashboard.*` | ポップアップ、記録・履歴・設定画面 |
@@ -196,10 +197,12 @@ IndexedDB名は `vrc-favworld-check`、スキーマはversion 4です。
 
 ## バックアップと利用終了
 
-JSONバックアップは `vrc_favworld_check-backup` のversion 3で、version 1・2も読み込めます。1利用者分のワールド、リスト、履歴、表示状態と安全な設定を含み、画像・認証情報・ジョブ・未読追跡は含みません。上限は25MiB、ワールド10,000件、履歴100,000件、リスト100件、表示状態10,000件です。
+書き出しは記録と保存済み画像をまとめたstored ZIPです。`backup.json` は `vrc_favworld_check-backup` のversion 3で、1利用者分のワールド、リスト、履歴、表示状態と安全な設定を含みます。画像索引は `vrc_favworld_check-image-backup` のversion 1で、対応するWebPを同梱します。認証情報・ジョブ・未読追跡は含みません。書き出しに新たな画像取得は不要です。
 
-復元は全検証後、対象利用者の記録を1トランザクションで置き換えます。設定は `autoSyncEnabled` と `notificationsEnabled` の明示された値だけを反映し、`backoffUntil`、実行予定、選択中プロフィールなどの端末状態をファイルから取り込みません。他利用者の記録は保持し、対象の古い画像ジョブを破棄します。完全削除済みとされたID以外の既存画像は保持します。過去の通知は再送せず、未読はリセットします。旧形式にない表示状態は通常表示に戻ります。
+同じ復元操作でZIPと従来のJSON version 1・2・3を読み込みます。ZIP全体は64MiB、記録JSONは25MiB、画像索引は5MiB、画像は10,000件・各48KiB・最大辺320pxが上限です。記録の上限はワールド10,000件、履歴100,000件、リスト100件、表示状態10,000件です。詳細は[画像込みバックアップ仕様](IMAGE_BACKUP.md)を参照してください。
+
+復元はZIP構造、記録の参照関係、画像の構造とブラウザでのデコードを検証した後、対象利用者の記録・表示状態の置換と画像の追加・更新を1トランザクションで行います。設定は `autoSyncEnabled` と `notificationsEnabled` の明示された値だけを反映し、`backoffUntil`、実行予定、選択中プロフィールなどの端末状態をファイルから取り込みません。他利用者の記録は保持し、対象の古い画像ジョブを破棄します。バックアップにない既存画像は保持しますが、完全削除済みとされたIDの画像は同じトランザクションで消去します。過去の通知は再送せず、未読はリセットします。旧形式にない表示状態は通常表示に戻ります。
 
 全消去では永続的な書き込み停止フラグ `purgePending` を立て、アラーム停止と一時Cookieの不在確認後、全利用者データを原子的に消去して自己アンインストールへ進みます。消去後にChrome側の削除が失敗しても停止フラグは残します。
 
-Windowsインストーラーは実行時の常駐処理ではなく、拡張ファイルを固定場所へ配置するものです。Chrome内のDBや書き出したJSONはWindows側アンインストーラーの削除対象にしません。配布・更新・削除の詳細は[インストーラー仕様](INSTALLER.md)を参照してください。
+Windowsインストーラーは実行時の常駐処理ではなく、拡張ファイルを固定場所へ配置するものです。Chrome内のDBや書き出したバックアップはWindows側アンインストーラーの削除対象にしません。配布・更新・削除の詳細は[インストーラー仕様](INSTALLER.md)を参照してください。

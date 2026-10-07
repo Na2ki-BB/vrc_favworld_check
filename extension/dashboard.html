@@ -163,12 +163,12 @@
             <article class="settings-card">
               <p class="section-label">BACKUP</p>
               <h2>記録をバックアップ</h2>
-              <p>ワールド名と履歴をJSONファイルへ保存できます。パスワードやCookieは含まれません。サムネイル画像は現在のJSONには含まれません。表示/非表示・削除済みIDも保存します。この形式を復元するには対応する最新版が必要です。</p>
+              <p>記録と保存済み画像を、ひとつのZIPファイルへ保存します。自動確認・通知の設定、非表示や削除済みの状態も含まれます。パスワードやCookieは含まれません。復元には、このZIPまたは以前のJSONを選んでください。</p>
               <div class="stacked-actions">
                 <button id="export-button" class="button button-secondary" type="button">バックアップを書き出す</button>
                 <label class="button button-ghost file-button">
                   バックアップを復元する
-                  <input id="import-input" type="file" accept="application/json,.json">
+                  <input id="import-input" type="file" accept="application/zip,.zip,application/json,.json">
                 </label>
               </div>
               <p id="backup-message" class="form-message" role="status"></p>

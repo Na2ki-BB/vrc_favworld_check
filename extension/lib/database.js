@@ -21,7 +21,7 @@ const UNREAD_TRACKING_PREFIX = "unreadTracking:";
 const PRESENTATION_GENERATION_PREFIX = "presentationGeneration:";
 const THUMBNAIL_IDENTIFIER_MAX_LENGTH = 256;
 const THUMBNAIL_SOURCE_URL_MAX_LENGTH = 8_192;
-const THUMBNAIL_MAX_DIMENSION = 320;
+export const THUMBNAIL_MAX_DIMENSION = 320;
 const EVENT_KIND_SET = new Set(EVENT_KIND_ORDER);
 const NOTIFICATION_ERROR_SET = /** @type {ReadonlySet<unknown>} */ (new Set([
   "api_rejected",
@@ -286,6 +286,7 @@ const INDEXES = Object.freeze({
  * @property {readonly HistoryEvent[]} events
  * @property {Readonly<Record<string, boolean>>} [preferences]
  * @property {readonly WorldDisposition[]} [worldDispositions]
+ * @property {readonly ThumbnailRecord[]} [thumbnails]
  */
 
 /** @typedef {{ key: string, value: unknown }} StoredValue */
@@ -312,6 +313,7 @@ const INDEXES = Object.freeze({
  * @property {HistoryEvent[]} events
  * @property {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} preferences
  * @property {WorldDisposition[]} worldDispositions
+ * @property {ThumbnailRecord[]} [thumbnails]
  */
 
 /**
@@ -887,6 +889,73 @@ async function getAllValues(index, query) {
 }
 
 /**
+ * Queue the thumbnail cursor only after the earlier world request succeeds in
+ * the same readonly transaction. Orphan Blob records are visited one at a
+ * time but never retained. Matching records stop at maximum + 1 so callers can
+ * distinguish an exact limit from overflow without loading an unbounded set.
+ *
+ * @param {IDBIndex} thumbnailIndex
+ * @param {string} userId
+ * @param {IDBRequest<unknown[]>} worldRequest
+ * @param {number} maximum
+ * @returns {Promise<unknown[]>}
+ */
+function getBackupThumbnailValues(thumbnailIndex, userId, worldRequest, maximum) {
+  return new Promise((resolve, reject) => {
+    worldRequest.addEventListener("error", () => {
+      reject(worldRequest.error ?? new Error("IndexedDB world request failed"));
+    }, { once: true });
+    worldRequest.addEventListener("success", () => {
+      const worldIds = new Set();
+      for (const value of worldRequest.result) {
+        if (
+          typeof value === "object"
+          && value !== null
+          && "worldId" in value
+          && typeof value.worldId === "string"
+        ) {
+          worldIds.add(value.worldId);
+        }
+      }
+      /** @type {unknown[]} */
+      const records = [];
+      let request;
+      try {
+        request = thumbnailIndex.openCursor(userId);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      request.addEventListener("error", () => {
+        reject(request.error ?? new Error("IndexedDB backup thumbnail cursor failed"));
+      }, { once: true });
+      request.addEventListener("success", () => {
+        const cursor = request.result;
+        if (cursor === null) {
+          resolve(records);
+          return;
+        }
+        const value = cursor.value;
+        if (
+          typeof value === "object"
+          && value !== null
+          && "worldId" in value
+          && typeof value.worldId === "string"
+          && worldIds.has(value.worldId)
+        ) {
+          records.push(value);
+          if (records.length > maximum) {
+            resolve(records);
+            return;
+          }
+        }
+        cursor.continue();
+      });
+    }, { once: true });
+  });
+}
+
+/**
  * Delete every object selected by an index. Cursor deletion keeps the operation
  * inside the caller's transaction.
  *
@@ -1352,11 +1421,22 @@ export class DatabaseRepository {
   /**
    * Read every exported field in one transaction. Generation and operational
    * settings are intentionally absent from the returned backup snapshot.
+   * Optional thumbnails are restricted to this snapshot's worlds and retained
+   * only through the caller's limit plus one overflow sentinel.
    *
    * @param {string} userId
+   * @param {{ includeThumbnails?: boolean, thumbnailLimit?: number }} [options]
    * @returns {Promise<BackupSnapshot>}
    */
-  async getBackupSnapshot(userId) {
+  async getBackupSnapshot(userId, options = {}) {
+    const includeThumbnails = options.includeThumbnails === true;
+    const thumbnailLimit = options.thumbnailLimit ?? Number.MAX_SAFE_INTEGER;
+    if (
+      includeThumbnails
+      && (!Number.isSafeInteger(thumbnailLimit) || thumbnailLimit < 0)
+    ) {
+      throw new RangeError("Backup thumbnail limit must be a non-negative safe integer");
+    }
     const transaction = this.#requireDatabase().transaction(
       [
         STORES.profiles,
@@ -1364,9 +1444,13 @@ export class DatabaseRepository {
         STORES.favoriteGroups,
         STORES.events,
         STORES.worldDispositions,
-        STORES.settings
+        STORES.settings,
+        ...(includeThumbnails ? [STORES.thumbnails] : [])
       ],
       "readonly"
+    );
+    const worldRequest = /** @type {IDBRequest<unknown[]>} */ (
+      transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser).getAll(userId)
     );
     const [
       profileValue,
@@ -1375,16 +1459,14 @@ export class DatabaseRepository {
       eventValues,
       dispositionValues,
       autoSyncRecord,
-      notificationRecord
+      notificationRecord,
+      thumbnailValues
     ] =
       await completeRead(
         transaction,
         Promise.all([
           getValue(transaction.objectStore(STORES.profiles), userId),
-          getAllValues(
-            transaction.objectStore(STORES.worlds).index(INDEXES.worldsByUser),
-            userId
-          ),
+          requestResult(worldRequest),
           getAllValues(
             transaction.objectStore(STORES.favoriteGroups).index(INDEXES.favoriteGroupsByUser),
             userId
@@ -1395,7 +1477,15 @@ export class DatabaseRepository {
           ),
           getAllValues(transaction.objectStore(STORES.worldDispositions).index("by-user"), userId),
           getValue(transaction.objectStore(STORES.settings), "autoSyncEnabled"),
-          getValue(transaction.objectStore(STORES.settings), "notificationsEnabled")
+          getValue(transaction.objectStore(STORES.settings), "notificationsEnabled"),
+          includeThumbnails
+            ? getBackupThumbnailValues(
+                transaction.objectStore(STORES.thumbnails).index(INDEXES.thumbnailsByUser),
+                userId,
+                worldRequest,
+                thumbnailLimit
+              )
+            : Promise.resolve([])
         ])
       );
 
@@ -1405,6 +1495,8 @@ export class DatabaseRepository {
     favoriteGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
     const events = /** @type {HistoryEvent[]} */ (eventValues);
     events.sort((left, right) => left.eventId.localeCompare(right.eventId));
+    const thumbnails = /** @type {ThumbnailRecord[]} */ (thumbnailValues);
+    thumbnails.sort((left, right) => left.worldId.localeCompare(right.worldId));
     /** @type {{ autoSyncEnabled?: boolean, notificationsEnabled?: boolean }} */
     const preferences = {};
     const autoSyncEnabled =
@@ -1428,7 +1520,8 @@ export class DatabaseRepository {
       favoriteGroups,
       events,
       preferences,
-      worldDispositions: /** @type {WorldDisposition[]} */ (dispositionValues).sort((a, b) => a.worldId.localeCompare(b.worldId))
+      worldDispositions: /** @type {WorldDisposition[]} */ (dispositionValues).sort((a, b) => a.worldId.localeCompare(b.worldId)),
+      ...(includeThumbnails ? { thumbnails } : {})
     };
   }
 
@@ -2386,6 +2479,9 @@ export class DatabaseRepository {
    */
   async replaceProfileData(replacement) {
     const { profile, worlds, favoriteGroups, events, preferences = {}, worldDispositions = [] } = replacement;
+    const storedThumbnails = replacement.thumbnails === undefined
+      ? null
+      : replacement.thumbnails.map((thumbnail) => thumbnailRecordSnapshot(thumbnail));
     if (worlds.some((world) => world.userId !== profile.userId)) {
       throw new Error("Replacement contains a world owned by another profile");
     }
@@ -2395,6 +2491,23 @@ export class DatabaseRepository {
     validateFavoriteGroupPlan(favoriteGroups, profile.userId);
     validateEventPlan(events);
     validateDispositions(worldDispositions, profile.userId, worlds, events);
+    if (storedThumbnails !== null) {
+      const worldIds = new Set(worlds.map((world) => world.worldId));
+      const thumbnailIds = new Set();
+      for (const thumbnail of storedThumbnails) {
+        validateThumbnailRecord(thumbnail);
+        if (thumbnail.userId !== profile.userId) {
+          throw new Error("Replacement contains a thumbnail owned by another profile");
+        }
+        if (!worldIds.has(thumbnail.worldId)) {
+          throw new Error("Replacement thumbnail does not refer to a replacement world");
+        }
+        if (thumbnailIds.has(thumbnail.worldId)) {
+          throw new Error("Replacement contains duplicate thumbnails");
+        }
+        thumbnailIds.add(thumbnail.worldId);
+      }
+    }
     for (const key of Object.keys(preferences)) {
       if (!BACKUP_PREFERENCE_KEYS.includes(key)) {
         throw new Error(`Replacement contains an unsafe preference: ${key}`);
@@ -2469,6 +2582,12 @@ export class DatabaseRepository {
       for (const row of worldDispositions) {
         dispositionStore.put(row);
         if (row.state === "purged") transaction.objectStore(STORES.thumbnails).delete([profile.userId, row.worldId]);
+      }
+      if (storedThumbnails !== null) {
+        const thumbnailStore = transaction.objectStore(STORES.thumbnails);
+        for (const thumbnail of storedThumbnails) {
+          thumbnailStore.put(thumbnail);
+        }
       }
       const settingStore = transaction.objectStore(STORES.settings);
       for (const [key, stored] of [["thumbnailJob", job], ["thumbnailCaptureCursor", cursor], ["thumbnailCaptureStatus", captureStatus]]) {

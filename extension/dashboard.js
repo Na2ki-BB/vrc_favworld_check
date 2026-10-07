@@ -2,7 +2,16 @@
 
 import { mountAuthStatusPanel } from "./lib/auth-status-ui.js";
 
-import { BackupExportLimitError, MAX_BACKUP_BYTES, backupSummary, createBackup, parseBackup, restoreBackup } from "./lib/backup.js";
+import { BackupExportLimitError, MAX_BACKUP_BYTES, backupSummary, parseBackup, restoreBackup } from "./lib/backup.js";
+import {
+  ImageBackupExportError,
+  ImageBackupValidationError,
+  MAX_IMAGE_BACKUP_BYTES,
+  createImageBackup,
+  hasZipSignature,
+  parseImageBackup,
+  restoreImageBackup
+} from "./lib/backup-archive.js";
 import { openDatabase } from "./lib/database.js";
 import { createFavoriteGroupOptions } from "./lib/favorite-groups.js";
 import {
@@ -110,7 +119,10 @@ let manualSyncInFlight = false;
 let noticeAction = null;
 let visibleWorldCount = PAGE_SIZE;
 let visibleEventCount = PAGE_SIZE;
+let exporting = false;
 let restoring = false;
+/** @type {AbortController | null} */
+let restoreController = null;
 let markingHistoryRead = false;
 let purging = false;
 let thumbnailRenderGeneration = 0;
@@ -884,7 +896,7 @@ async function openRecordDialog(action) {
     }
     controls.description.textContent = action.type === "HIDE_WORLD"
       ? `『${name}』を通常の一覧から隠します。名前・画像・変更履歴は残り、『非表示の記録』から戻せます。同期と通知は続きます。VRChatのお気に入りは変更しません`
-      : `『${name}』の保存名・画像・変更履歴を、このブラウザから完全に削除します。この操作は取り消せません。\n現在のJSONバックアップには画像が含まれないため、削除した画像はJSONから戻せません。\n同じ記録の再表示を防ぐためWorld IDだけを残します。今後、VRChatのお気に入りで利用可能と確認できた場合は、新しい記録として保存します。\nVRChatのお気に入りや、ほかのワールドの記録は変更しません${world.membershipState === "favorited" && world.availabilityState === "accessible" ? "\n現在は利用可能なため、次回の確認で新しい記録として保存される可能性があります" : ""}`;
+      : `『${name}』の保存名・画像・変更履歴を、このブラウザから完全に削除します。この操作は取り消せません。\n必要な記録と画像は、削除前にZIPバックアップへ保存してください。削除後に新しく書き出したバックアップには含まれません。\n同じ記録の再表示を防ぐためWorld IDだけを残します。今後、VRChatのお気に入りで利用可能と確認できた場合は、新しい記録として保存します。\nVRChatのお気に入りや、ほかのワールドの記録は変更しません${world.membershipState === "favorited" && world.availabilityState === "accessible" ? "\n現在は利用可能なため、次回の確認で新しい記録として保存される可能性があります" : ""}`;
     controls.feedback.textContent = "";
     controls.cancel.textContent = "キャンセル";
     controls.submit.disabled = false;
@@ -1356,11 +1368,11 @@ function renderSettings() {
     : `${warnings.join(" ")} 大切な記録をバックアップしてください。`;
 
   const hasProfile = state.profile !== null;
-  exportButton.disabled = !hasProfile || restoring || purging || recordMutationInFlight;
-  importInput.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight || recordMutationInFlight;
+  exportButton.disabled = !hasProfile || exporting || restoring || purging || recordMutationInFlight;
+  importInput.disabled = repository === null || state.status.syncing || exporting || restoring || purging || manualSyncInFlight || recordMutationInFlight;
   autoSyncToggle.disabled = restoring || purging;
   notificationToggle.disabled = restoring || purging;
-  purgeUninstallButton.disabled = repository === null || state.status.syncing || restoring || purging || manualSyncInFlight || recordMutationInFlight;
+  purgeUninstallButton.disabled = repository === null || state.status.syncing || exporting || restoring || purging || manualSyncInFlight || recordMutationInFlight;
 }
 
 /**
@@ -1641,28 +1653,36 @@ function backupExportErrorMessage(error, downloadStarted) {
     if (error.code === "DISPOSITIONS_LIMIT") return "非表示・削除済みIDが10,000件の上限を超えるため、バックアップを書き出せません。記録を自動で省略せず処理を停止しました";
     if (error.code === "SIZE_LIMIT") return "バックアップが25MiBの上限を超えるため、バックアップを書き出せません。記録を自動で省略せず処理を停止しました";
   }
-  return "バックアップを作成できませんでした。少し時間をあけて、もう一度お試しください。";
+  if (error instanceof ImageBackupExportError) {
+    if (error.code === "ARCHIVE_SIZE_LIMIT") return "画像を含めると64MiBの上限を超えるため、書き出せません。記録や画像は省略していません。不要な記録を整理する前に、現在のデータを保持してください。";
+    if (error.code === "INDEX_SIZE_LIMIT") return "画像の管理情報が5MiBの上限を超えるため、書き出せません。記録や画像は省略していません。";
+    if (error.code === "THUMBNAIL_COUNT_LIMIT") return "保存画像が10,000件の上限を超えるため、書き出せません。記録や画像は省略していません。";
+    if (error.code === "INVALID_THUMBNAIL") return "読み出せない保存画像があるため、書き出せません。この画面を開き直して再試行してください。記録や画像は変更していません。";
+  }
+  return "バックアップを作成できませんでした。この画面を開き直して、もう一度お試しください。";
 }
 
 exportButton.addEventListener("click", async () => {
+  if (exporting || restoring || purging || recordMutationInFlight || pageClosed) return;
   if (state.profile === null) {
     backupMessage.textContent = "先に一度、お気に入りを確認してください。";
     return;
   }
-  exportButton.disabled = true;
-  backupMessage.textContent = "バックアップを準備しています…";
+  exporting = true;
+  renderSettings();
+  backupMessage.textContent = "記録と保存済み画像のバックアップを準備しています…";
   /** @type {string | null} */
   let objectUrl = null;
   let downloadStarted = false;
   try {
-    const text = await createBackup(requireRepository(), state.profile.userId, {
+    const blob = await createImageBackup(requireRepository(), state.profile.userId, {
       appVersion: chrome.runtime.getManifest().version
     });
-    const blob = new Blob([text], { type: "application/json" });
+    if (pageClosed) return;
     objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = objectUrl;
-    anchor.download = `vrc-favorite-worlds-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.download = `vrc-favorite-worlds-${new Date().toISOString().slice(0, 10)}.zip`;
     anchor.hidden = true;
     document.body.append(anchor);
     anchor.click();
@@ -1673,14 +1693,15 @@ exportButton.addEventListener("click", async () => {
     await requireRepository().setSetting("lastBackupAt", backedUpAt);
     state.settings.lastBackupAt = new Date(backedUpAt).toISOString();
     renderSettings();
-    backupMessage.textContent = "バックアップを書き出しました。大切な場所へ保管してください。";
+    backupMessage.textContent = "記録と保存済み画像のZIPを書き出しました。ダウンロードが完了したことを確認し、大切な場所へ保管してください。";
   } catch (error) {
     backupMessage.textContent = backupExportErrorMessage(error, downloadStarted);
   } finally {
     if (objectUrl !== null) {
       URL.revokeObjectURL(objectUrl);
     }
-    exportButton.disabled = state.profile === null || restoring;
+    exporting = false;
+    renderSettings();
   }
 });
 
@@ -1689,9 +1710,10 @@ importInput.addEventListener("change", async () => {
   if (file === undefined) {
     return;
   }
-  if (recordMutationInFlight || purging || restoring) return;
+  if (recordMutationInFlight || purging || exporting || restoring || pageClosed) return;
   closeRecordDialogs(false);
   restoring = true;
+  restoreController = new AbortController();
   progressEpoch += 1;
   thumbnailRenderGeneration += 1;
   renderConnection();
@@ -1699,13 +1721,32 @@ importInput.addEventListener("change", async () => {
   backupMessage.textContent = "バックアップを確認しています…";
   let validationCompleted = false;
   let restoreCompleted = false;
+  /** @type {Uint8Array | null} */
+  let archiveBytes = null;
+  let thumbnailCount = 0;
+  let text = "";
   try {
-    if (file.size > MAX_BACKUP_BYTES) {
-      backupMessage.textContent = "ファイルが25MBを超えているため復元できません。正しいバックアップを選んでください。";
-      return;
+    const header = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    /** @type {ReturnType<typeof parseBackup>} */
+    let validated;
+    if (hasZipSignature(header)) {
+      if (file.size > MAX_IMAGE_BACKUP_BYTES) {
+        backupMessage.textContent = "ZIPが64MiBの上限を超えるため復元できません。この拡張で書き出したバックアップを選んでください。";
+        return;
+      }
+      archiveBytes = new Uint8Array(await file.arrayBuffer());
+      const archive = parseImageBackup(archiveBytes);
+      validated = archive.backup;
+      thumbnailCount = archive.thumbnails.length;
+    } else {
+      if (file.size > MAX_BACKUP_BYTES) {
+        backupMessage.textContent = "JSONが25MiBの上限を超えるため復元できません。正しいバックアップを選んでください。";
+        return;
+      }
+      text = await file.text();
+      validated = parseBackup(text);
     }
-    const text = await file.text();
-    const validated = parseBackup(text);
+    if (pageClosed) return;
     validationCompleted = true;
     let statusResponse;
     try {
@@ -1736,17 +1777,25 @@ importInput.addEventListener("change", async () => {
         "お気に入りを確認中のため復元を開始しませんでした。確認が終わってから、もう一度バックアップを選んでください。";
       return;
     }
+    if (pageClosed) return;
     const preview = backupSummary(validated);
     const previewName = preview.displayName.replace(/\s+/gu, " ").slice(0, 80);
     const legacyWarning = preview.sourceVersion < 3 ? "\nこの旧形式には非表示・削除済みIDがありません。以前に削除した名前や履歴がファイルに含まれていれば、記録へ戻ります" : "";
+    const imageNotice = archiveBytes === null
+      ? "画像はこのJSONから復元できません。端末に残っている画像は引き続き利用します（削除済みIDの画像を除く）"
+      : `保存済み画像: ${thumbnailCount.toLocaleString("ja-JP")}件\nバックアップにない端末の画像も保持します（削除済みIDの画像を除く）`;
     const approved = globalThis.confirm(
-      `${previewName}（${preview.userId}）の記録を復元します。\nワールド: ${preview.worldCount.toLocaleString("ja-JP")}件 / 履歴: ${preview.eventCount.toLocaleString("ja-JP")}件\n書き出し日時: ${formatDateTime(preview.exportedAt)}\n\n同じユーザーの現在の記録は、このバックアップの内容に置き換わります。\n表示/非表示・削除済みIDの扱いもバックアップの状態へ戻ります${legacyWarning}\n画像はこのJSONから復元できません。端末に残っている画像は引き続き利用します\n\n続けますか？`
+      `${previewName}（${preview.userId}）の記録を復元します。\nワールド: ${preview.worldCount.toLocaleString("ja-JP")}件 / 履歴: ${preview.eventCount.toLocaleString("ja-JP")}件\n書き出し日時: ${formatDateTime(preview.exportedAt)}\n\n同じユーザーの現在の記録は、このバックアップの内容に置き換わります。自動確認・通知の設定も復元します。\n表示/非表示・削除済みIDの扱いもバックアップの状態へ戻ります${legacyWarning}\n${imageNotice}\n\n続けますか？`
     );
     if (!approved) {
       backupMessage.textContent = "復元を取り消しました。現在の記録は変更していません。";
       return;
     }
-    const restored = await restoreBackup(requireRepository(), text);
+    if (pageClosed) return;
+    backupMessage.textContent = "バックアップを復元しています。この画面を閉じずにお待ちください…";
+    const restored = archiveBytes === null
+      ? await restoreBackup(requireRepository(), text)
+      : await restoreImageBackup(requireRepository(), archiveBytes, { signal: restoreController.signal });
     restoreCompleted = true;
     /** @type {ReturnType<typeof classifySettingsUpdateResponse>} */
     let settingsOutcome = SETTINGS_UPDATE_OUTCOMES.unconfirmed;
@@ -1771,7 +1820,8 @@ importInput.addEventListener("change", async () => {
     } catch {
       restoredDataLoaded = false;
     }
-    const restoredSummary = `記録は復元済みです。ワールド${restored.worldCount.toLocaleString("ja-JP")}件、履歴${restored.eventCount.toLocaleString("ja-JP")}件です。`;
+    const imageSummary = archiveBytes === null ? "" : ` 画像${thumbnailCount.toLocaleString("ja-JP")}件も復元しました。`;
+    const restoredSummary = `記録は復元済みです。ワールド${restored.worldCount.toLocaleString("ja-JP")}件、履歴${restored.eventCount.toLocaleString("ja-JP")}件です。${imageSummary}`;
     if (settingsOutcome === SETTINGS_UPDATE_OUTCOMES.scheduleRepairFailed) {
       backupMessage.textContent = `${restoredSummary} 自動確認の予定を更新できませんでした。ブラウザを再起動すると自動で修復を試みます。${restoredDataLoaded ? "" : " この画面も開き直してください。"}`;
     } else if (
@@ -1782,15 +1832,18 @@ importInput.addEventListener("change", async () => {
     } else {
       backupMessage.textContent = `${restoredSummary} 画面または自動確認の設定結果を確認できませんでした。ブラウザを再起動して、この画面で設定を確認してください。`;
     }
-  } catch {
+  } catch (error) {
     backupMessage.textContent = restoreCompleted
       ? "記録は復元済みですが、画面へ反映できませんでした。この画面を開き直してください。"
-      : validationCompleted
-        ? "バックアップの内容は確認できましたが、このブラウザへ保存できませんでした。ブラウザを再起動して、もう一度お試しください。"
-        : "このファイルは復元できません。対応するバックアップJSONか確認してください。別の版で作った場合は、拡張を最新版へ更新してください。";
+      : error instanceof ImageBackupValidationError
+        ? "ZIPの内容または画像が破損しているため復元できません。解凍・再圧縮していない元のバックアップを選んでください。現在の記録や画像は変更していません。"
+        : validationCompleted
+        ? "このブラウザへ復元できませんでした。空き容量を確認し、ブラウザを再起動してお試しください。現在の記録や画像は変更していません。"
+        : "このファイルは復元できません。この拡張で書き出したZIPまたはJSONを選んでください。ZIPを解凍・再圧縮せず、別の版で作った場合は拡張を最新版へ更新してください。現在の記録は変更していません。";
   } finally {
     importInput.value = "";
     restoring = false;
+    restoreController = null;
     renderConnection();
     renderSettings();
   }
@@ -1842,7 +1895,7 @@ purgeUninstallButton.addEventListener("click", async () => {
     return;
   }
   const approved = globalThis.confirm(
-    `このブラウザ内の記録をすべて削除します。\n\nワールド: ${state.worlds.length.toLocaleString("ja-JP")}件\n変更履歴: ${state.events.length.toLocaleString("ja-JP")}件\nお気に入りリスト: ${state.favoriteGroups.length.toLocaleString("ja-JP")}件\n\nこの操作は元に戻せません。必要な記録は先にバックアップしてください。書き出したJSONバックアップ、ダウンロードしたZIP、展開フォルダは自動では削除されません。\n\n続けて拡張を削除しますか？`
+    `このブラウザ内の記録をすべて削除します。\n\nワールド: ${state.worlds.length.toLocaleString("ja-JP")}件\n変更履歴: ${state.events.length.toLocaleString("ja-JP")}件\nお気に入りリスト: ${state.favoriteGroups.length.toLocaleString("ja-JP")}件\n\nこの操作は元に戻せません。必要な記録は先にバックアップしてください。書き出したZIP・JSONバックアップ、ダウンロードした拡張のZIP、展開フォルダは自動では削除されません。\n\n続けて拡張を削除しますか？`
   );
   if (!approved) {
     purgeMessage.textContent = "削除を取り消しました。記録は変更していません。";
@@ -1982,6 +2035,7 @@ window.addEventListener(
   "pagehide",
   () => {
     pageClosed = true;
+    restoreController?.abort();
     closeRecordDialogs(false);
     progressEpoch += 1;
     thumbnailRenderGeneration += 1;

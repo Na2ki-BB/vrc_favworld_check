@@ -749,7 +749,7 @@ test("extension UI sources avoid unsafe HTML and credential APIs", async () => {
   assert.doesNotMatch(dashboard, /設定は変更していません/u);
   assert.match(
     dashboard,
-    /importInput\.disabled = repository === null \|\| state\.status\.syncing \|\| restoring/u
+    /importInput\.disabled = repository === null \|\| state\.status\.syncing \|\| exporting \|\| restoring/u
   );
   assert.match(dashboard, /syncNowButton\.disabled = state\.status\.syncing \|\| restoring/u);
   assert.match(dashboard, /if \(freshStatus\.syncing\)/u);
@@ -1569,7 +1569,7 @@ test("record dialogs show exact target and safety copy, default to cancel and re
   await ui.open(ui.action("PURGE_HIDDEN_WORLD"));
   assert.equal(ui.dialogs[1].dialog.open, true);
   assert.match(ui.dialogs[1].description.textContent, /この操作は取り消せません/u);
-  assert.match(ui.dialogs[1].description.textContent, /削除した画像はJSONから戻せません/u);
+  assert.match(ui.dialogs[1].description.textContent, /削除後に新しく書き出したバックアップには含まれません/u);
   assert.match(ui.dialogs[1].description.textContent, /World IDだけを残します/u);
   assert.match(ui.dialogs[1].description.textContent, /現在は利用可能なため/u);
   assert.equal(ui.focus.at(-1), "purge-cancel");
@@ -1754,11 +1754,19 @@ test("backup export limits disclose the exact bounded reason without exposing ar
     /** @param {string} code */
     constructor(code) {super("private diagnostic must not be exposed"); this.code = code;}
   }
-  const present = new Function("BackupExportLimitError", `${dashboardFunction(source, "function backupExportErrorMessage(")}; return backupExportErrorMessage;`)(BackupExportLimitError);
+  class ImageBackupExportError extends Error {
+    /** @param {string} code */
+    constructor(code) {super("private image diagnostic"); this.code = code;}
+  }
+  const present = new Function("BackupExportLimitError", "ImageBackupExportError", `${dashboardFunction(source, "function backupExportErrorMessage(")}; return backupExportErrorMessage;`)(BackupExportLimitError, ImageBackupExportError);
   assert.match(present(new BackupExportLimitError("DISPOSITIONS_LIMIT"), false), /非表示・削除済みIDが10,000件の上限を超える/u);
   assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), false), /25MiBの上限を超える/u);
   assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), false), /記録を自動で省略せず/u);
   assert.match(present(new BackupExportLimitError("SIZE_LIMIT"), true), /ファイルの書き出しを開始しました/u);
+  assert.match(present(new ImageBackupExportError("ARCHIVE_SIZE_LIMIT"), false), /64MiB/u);
+  assert.match(present(new ImageBackupExportError("THUMBNAIL_COUNT_LIMIT"), false), /10,000件/u);
+  assert.match(present(new ImageBackupExportError("INVALID_THUMBNAIL"), false), /読み出せない保存画像/u);
+  assert.doesNotMatch(present(new ImageBackupExportError("INVALID_THUMBNAIL"), false), /private/u);
   assert.doesNotMatch(present(new Error("private diagnostic"), false), /private/u);
   assert.match(source, /backupMessage\.textContent = backupExportErrorMessage\(error, downloadStarted\)/u);
 });
