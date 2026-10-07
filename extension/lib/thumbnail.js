@@ -516,7 +516,7 @@ function isJpegStartOfFrame(marker) {
  * @param {Uint8Array} bytes
  * @returns {{width: number, height: number} | null}
  */
-function readWebpDimensions(bytes) {
+export function readWebpDimensions(bytes) {
   if (
     bytes.byteLength < 20
     || readAscii(bytes, 0, 4) !== "RIFF"
