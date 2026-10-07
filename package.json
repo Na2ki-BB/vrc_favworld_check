@@ -1,6 +1,6 @@
 {
   "name": "vrc_favworld_check",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
   "description": "Local-first VRChat favorite world history for Windows Chrome",
   "type": "module",
