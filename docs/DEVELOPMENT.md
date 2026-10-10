@@ -117,6 +117,18 @@ npm run package
 
 `package` 系コマンドはlint・型検査・全テストを実行しないため、配布前に別途 `npm run verify` を実行します。
 
+### GitHub Actionsで下書きReleaseを作る
+
+`.github/workflows/windows-draft-release.yml` は、`main` の最新コミットに対する手動実行だけを受け付けます。実行画面の `release_version` には `package.json` と同じ `x.y.z`（先頭の `v` なし）を入力します。標準の `windows-2022` GitHub-hosted runner 1台の同一jobで検査、ZIPとEXEの生成、SHA-256一覧の生成、新しい下書きReleaseへの添付までを行います。
+
+- `package-lock.json` に対して `npm ci --ignore-scripts` を使い、Actionは完全なcommit SHA、Node.jsは `22.23.3`、runner組み込みのInno Setupは `6.7.1` を検査して固定します。setup-nodeのpackage-manager cacheも明示的に無効化します。固定値とrunnerの内容が変わった場合は失敗させ、変更をレビューしてから更新します。
+- workflowの権限は通常 `contents: read`、Releaseを作るjobだけ `contents: write` です。追加secretやPATは使わず、checkout後に認証情報を残しません。
+- `upload-artifact` とActions cacheは使いません。成果物は同一jobからReleaseへ直接添付するため、Actions artifact/cacheの保存領域を消費しません。
+- 同時実行を直列化し、入力版、manifest版、`origin/main` の最新SHAを検査します。同じGitタグ、下書き、または公開済みReleaseがあれば、タグ移動・上書き・asset追加をせず失敗します。
+- 作られるReleaseは必ず下書きです。workflowは公開、既存Releaseの編集、assetの `--clobber` を行いません。失敗して不完全な下書きが残った場合は内容を確認し、必要ならその下書きだけを手動で削除してから再実行します。
+
+下書き作成後はEXE、ZIP、`SHA256SUMS.txt`をダウンロードしてハッシュを照合し、次節の実機確認を記録します。問題がないことを確認した担当者だけがGitHub上で手動公開します。workflowの成功は実機確認や公開承認を意味しません。
+
 ## 配布前の実機確認
 
 対象のWindowsとChromeで確認し、実行した環境と結果をレビューに記録します。未実施の項目を合格扱いにしません。
