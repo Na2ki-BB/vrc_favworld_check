@@ -1,5 +1,9 @@
 # 変更履歴
 
+## 0.1.16
+
+- GitHub Actionsの標準Windows runnerでZIPとインストーラーを生成し、新しい下書きReleaseへ直接添付する手順を追加しました。自動公開、既存Releaseの変更、Actions artifact/cacheへの保存は行いません。
+
 ## 0.1.15
 
 - 「バックアップを書き出す」で、記録と保存済みサムネイルを1つのZIPファイルへ保存できるようにしました。

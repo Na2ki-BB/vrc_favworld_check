@@ -13,6 +13,44 @@ import { packageExtension } from "../scripts/package.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+test("Windows release workflow creates only a guarded draft without artifact storage", async () => {
+  const workflow = await readFile(
+    path.join(ROOT, ".github", "workflows", "windows-draft-release.yml"),
+    "utf8"
+  );
+
+  assert.match(workflow, /^  workflow_dispatch:$/mu);
+  assert.doesNotMatch(workflow, /^  (?:push|pull_request|pull_request_target|schedule):/mu);
+  assert.match(workflow, /^  contents: read$/mu);
+  assert.match(workflow, /^      contents: write$/mu);
+  assert.match(workflow, /^    if: github\.ref == 'refs\/heads\/main'$/mu);
+  assert.match(workflow, /^    runs-on: windows-2022$/mu);
+  assert.match(workflow, /^  group: windows-draft-release$/mu);
+  assert.match(workflow, /^  cancel-in-progress: false$/mu);
+  assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v7\.0\.1/u);
+  assert.match(workflow, /actions\/setup-node@[0-9a-f]{40} # v7\.1\.0/u);
+  assert.match(workflow, /persist-credentials: false/u);
+  assert.match(workflow, /node-version: 22\.23\.3/u);
+  assert.match(workflow, /package-manager-cache: false/u);
+  assert.match(workflow, /Expected Inno Setup 6\.7\.1/u);
+  assert.match(workflow, /npm ci --ignore-scripts --no-audit --no-fund/u);
+  assert.match(workflow, /\$PSNativeCommandUseErrorActionPreference = \$true/u);
+  assert.match(workflow, /git fetch --no-tags origin '\+refs\/heads\/main:refs\/remotes\/origin\/main'/u);
+  assert.match(workflow, /gh release create \$env:RELEASE_TAG/u);
+  assert.match(workflow, /^            --draft `$/mu);
+  assert.match(workflow, /git ls-remote --tags origin/u);
+  assert.match(workflow, /"repos\/\$env:GITHUB_REPOSITORY\/git\/refs"/u);
+  assert.match(workflow, /-f "ref=refs\/tags\/\$env:RELEASE_TAG"/u);
+  assert.match(workflow, /-f "sha=\$env:GITHUB_SHA"/u);
+  assert.match(workflow, /^            --verify-tag `$/mu);
+  assert.match(workflow, /tagRef\.object\.sha -ne \$env:GITHUB_SHA/u);
+  assert.match(workflow, /already exists; it will not be overwritten/u);
+  assert.doesNotMatch(
+    workflow,
+    /--clobber|gh release (?:edit|upload)|actions\/(?:upload|download)-artifact|actions\/cache@|^\s+cache:/mu
+  );
+});
+
 test("public source scan detects a current GitHub fine-grained token without echoing it", async (context) => {
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "vrc-public-source-scan-"));
   context.after(async () => {

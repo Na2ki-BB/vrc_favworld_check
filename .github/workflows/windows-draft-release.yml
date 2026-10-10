@@ -1,0 +1,215 @@
+name: Build Windows draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "package.json version to build (for example, 0.1.16)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-draft-release
+  cancel-in-progress: false
+
+jobs:
+  build-draft-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.23.3
+          package-manager-cache: false
+
+      - name: Validate release target
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.release_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          $mainCommit = (git rev-parse origin/main).Trim()
+          if ($mainCommit -ne $env:GITHUB_SHA) {
+            throw "The dispatched commit is not the current origin/main commit. Run the workflow again from main."
+          }
+
+          $package = Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json
+          $version = [string]$package.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'package.json version must use x.y.z format.'
+          }
+          if ($env:REQUESTED_VERSION -ne $version) {
+            throw "Requested version does not match package.json version $version."
+          }
+
+          $manifest = Get-Content -Raw -LiteralPath 'extension/manifest.json' | ConvertFrom-Json
+          if ([string]$manifest.version -ne $version) {
+            throw 'package.json and extension/manifest.json versions do not match.'
+          }
+
+          $releaseTag = "v$version"
+          $existingTag = git ls-remote --tags origin "refs/tags/$releaseTag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not verify whether the Git tag $releaseTag exists."
+          }
+          if ($existingTag) {
+            throw "The Git tag $releaseTag already exists; it will not be moved or reused."
+          }
+          $page = 1
+          do {
+            $releases = @(gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100&page=$page" | ConvertFrom-Json)
+            if ($releases | Where-Object { $_.tag_name -eq $releaseTag }) {
+              throw "A draft or published release for $releaseTag already exists; it will not be overwritten."
+            }
+            $page += 1
+          } while ($releases.Count -eq 100)
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$releaseTag" >> $env:GITHUB_OUTPUT
+
+      - name: Verify pinned Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+            throw 'The windows-2022 image does not contain Inno Setup 6.'
+          }
+          $actualVersion = (Get-Item -LiteralPath $compiler).VersionInfo.ProductVersion
+          if ($actualVersion -notmatch '^6\.7\.1(?:\D|$)') {
+            throw "Expected Inno Setup 6.7.1, found $actualVersion. Review and pin the new runner dependency before releasing."
+          }
+          "INNO_SETUP_COMPILER=$compiler" >> $env:GITHUB_ENV
+
+      - name: Install locked Node.js dependencies
+        shell: pwsh
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify source
+        shell: pwsh
+        run: npm run verify
+
+      - name: Build ZIP and Windows installer
+        shell: pwsh
+        run: npm run package
+
+      - name: Validate release files and write checksums
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedNames = @(
+            "vrc_favworld_check-v$env:RELEASE_VERSION.zip",
+            "vrc_favworld_check-installer-v$env:RELEASE_VERSION.exe"
+          )
+          $files = @(Get-ChildItem -LiteralPath 'artifacts' -File)
+          if ($files.Count -ne $expectedNames.Count) {
+            throw "Expected exactly two release files, found $($files.Count)."
+          }
+          foreach ($name in $expectedNames) {
+            $file = Get-Item -LiteralPath (Join-Path 'artifacts' $name)
+            if ($file.Length -eq 0) {
+              throw "Release file is empty: $name"
+            }
+          }
+          $unexpected = @($files.Name | Where-Object { $_ -notin $expectedNames })
+          if ($unexpected.Count -ne 0) {
+            throw "Unexpected release files: $($unexpected -join ', ')"
+          }
+
+          $checksumLines = foreach ($name in $expectedNames) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path 'artifacts' $name)).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          $checksumLines | Set-Content -LiteralPath 'artifacts/SHA256SUMS.txt' -Encoding ascii
+
+      - name: Create new draft release
+        id: create_release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $createdRef = gh api `
+            --method POST `
+            "repos/$env:GITHUB_REPOSITORY/git/refs" `
+            -f "ref=refs/tags/$env:RELEASE_TAG" `
+            -f "sha=$env:GITHUB_SHA" | ConvertFrom-Json
+          if ($createdRef.ref -ne "refs/tags/$env:RELEASE_TAG" -or $createdRef.object.sha -ne $env:GITHUB_SHA) {
+            throw 'GitHub did not create the expected release tag at this run commit.'
+          }
+
+          $notes = @"
+          Automated Windows build for v$env:RELEASE_VERSION from commit $env:GITHUB_SHA.
+
+          This release is a draft. Download the ZIP and EXE, verify SHA256SUMS.txt, and complete the Windows/Chrome checks in docs/DEVELOPMENT.md before publishing it manually.
+
+          The workflow never publishes a release and never replaces an existing draft or published release.
+          "@
+          $notes | Set-Content -LiteralPath 'release-notes.md' -Encoding utf8
+
+          $releaseUrl = gh release create $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag `
+            --title $env:RELEASE_TAG `
+            --notes-file 'release-notes.md' `
+            --draft `
+            "artifacts/vrc_favworld_check-v$env:RELEASE_VERSION.zip" `
+            "artifacts/vrc_favworld_check-installer-v$env:RELEASE_VERSION.exe" `
+            'artifacts/SHA256SUMS.txt'
+          "url=$releaseUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Verify draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,isPrerelease,tagName,targetCommitish,url,assets | ConvertFrom-Json
+          if (-not $release.isDraft -or $release.isPrerelease) {
+            throw 'The created release is not a non-prerelease draft.'
+          }
+          if ($release.tagName -ne $env:RELEASE_TAG) {
+            throw 'The draft release tag does not match this run.'
+          }
+          $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($tagRef.ref -ne "refs/tags/$env:RELEASE_TAG" -or $tagRef.object.type -ne 'commit' -or $tagRef.object.sha -ne $env:GITHUB_SHA) {
+            throw 'The release tag is not a lightweight tag at this run commit.'
+          }
+          $expectedAssets = @(
+            'SHA256SUMS.txt',
+            "vrc_favworld_check-installer-v$env:RELEASE_VERSION.exe",
+            "vrc_favworld_check-v$env:RELEASE_VERSION.zip"
+          )
+          $actualAssets = @($release.assets.name | Sort-Object)
+          if (Compare-Object $expectedAssets $actualAssets) {
+            throw "Draft release assets do not match: $($actualAssets -join ', ')"
+          }
+          "Draft release: $($release.url)" >> $env:GITHUB_STEP_SUMMARY
