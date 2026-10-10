@@ -32,8 +32,10 @@ test("Windows release workflow creates only a guarded draft without artifact sto
   assert.match(workflow, /persist-credentials: false/u);
   assert.match(workflow, /node-version: 22\.23\.3/u);
   assert.match(workflow, /package-manager-cache: false/u);
-  assert.match(workflow, /VersionInfo\.FileVersion/u);
-  assert.doesNotMatch(workflow, /VersionInfo\.ProductVersion/u);
+  assert.match(workflow, /& \$compiler \/O- \$probeScript/u);
+  assert.match(workflow, /Compiler engine version: Inno Setup/u);
+  assert.doesNotMatch(workflow, /\$compiler --version/u);
+  assert.doesNotMatch(workflow, /VersionInfo\.(?:File|Product)Version/u);
   assert.match(workflow, /Expected Inno Setup 6\.7\.1/u);
   assert.match(workflow, /npm ci --ignore-scripts --no-audit --no-fund/u);
   assert.match(workflow, /\$PSNativeCommandUseErrorActionPreference = \$true/u);
