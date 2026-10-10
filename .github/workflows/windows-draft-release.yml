@@ -94,7 +94,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
             throw 'The windows-2022 image does not contain Inno Setup 6.'
           }
-          $actualVersion = (Get-Item -LiteralPath $compiler).VersionInfo.ProductVersion
+          # ISCC.exe reports ProductVersion as 0.0.0.0 on the hosted image;
+          # FileVersion carries the pinned Inno Setup release number.
+          $actualVersion = (Get-Item -LiteralPath $compiler).VersionInfo.FileVersion
           if ($actualVersion -notmatch '^6\.7\.1(?:\D|$)') {
             throw "Expected Inno Setup 6.7.1, found $actualVersion. Review and pin the new runner dependency before releasing."
           }
