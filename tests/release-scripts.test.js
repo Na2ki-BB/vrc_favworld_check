@@ -19,14 +19,14 @@ test("Windows release workflow creates only a guarded draft without artifact sto
     "utf8"
   );
 
-  assert.match(workflow, /^  workflow_dispatch:$/mu);
-  assert.doesNotMatch(workflow, /^  (?:push|pull_request|pull_request_target|schedule):/mu);
-  assert.match(workflow, /^  contents: read$/mu);
-  assert.match(workflow, /^      contents: write$/mu);
-  assert.match(workflow, /^    if: github\.ref == 'refs\/heads\/main'$/mu);
-  assert.match(workflow, /^    runs-on: windows-2022$/mu);
-  assert.match(workflow, /^  group: windows-draft-release$/mu);
-  assert.match(workflow, /^  cancel-in-progress: false$/mu);
+  assert.match(workflow, /^ {2}workflow_dispatch:$/mu);
+  assert.doesNotMatch(workflow, /^ {2}(?:push|pull_request|pull_request_target|schedule):/mu);
+  assert.match(workflow, /^ {2}contents: read$/mu);
+  assert.match(workflow, /^ {6}contents: write$/mu);
+  assert.match(workflow, /^ {4}if: github\.ref == 'refs\/heads\/main'$/mu);
+  assert.match(workflow, /^ {4}runs-on: windows-2022$/mu);
+  assert.match(workflow, /^ {2}group: windows-draft-release$/mu);
+  assert.match(workflow, /^ {2}cancel-in-progress: false$/mu);
   assert.match(workflow, /actions\/checkout@[0-9a-f]{40} # v7\.0\.1/u);
   assert.match(workflow, /actions\/setup-node@[0-9a-f]{40} # v7\.1\.0/u);
   assert.match(workflow, /persist-credentials: false/u);
@@ -41,12 +41,12 @@ test("Windows release workflow creates only a guarded draft without artifact sto
   assert.match(workflow, /\$PSNativeCommandUseErrorActionPreference = \$true/u);
   assert.match(workflow, /git fetch --no-tags origin '\+refs\/heads\/main:refs\/remotes\/origin\/main'/u);
   assert.match(workflow, /gh release create \$env:RELEASE_TAG/u);
-  assert.match(workflow, /^            --draft `$/mu);
+  assert.match(workflow, /^ {12}--draft `$/mu);
   assert.match(workflow, /git ls-remote --tags origin/u);
   assert.match(workflow, /"repos\/\$env:GITHUB_REPOSITORY\/git\/refs"/u);
   assert.match(workflow, /-f "ref=refs\/tags\/\$env:RELEASE_TAG"/u);
   assert.match(workflow, /-f "sha=\$env:GITHUB_SHA"/u);
-  assert.match(workflow, /^            --verify-tag `$/mu);
+  assert.match(workflow, /^ {12}--verify-tag `$/mu);
   assert.match(workflow, /tagRef\.object\.sha -ne \$env:GITHUB_SHA/u);
   assert.match(workflow, /already exists; it will not be overwritten/u);
   assert.doesNotMatch(
