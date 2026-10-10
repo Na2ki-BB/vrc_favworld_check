@@ -39,6 +39,11 @@ test("Windows release workflow creates only a guarded draft without artifact sto
   assert.match(workflow, /gh release create \$env:RELEASE_TAG/u);
   assert.match(workflow, /^            --draft `$/mu);
   assert.match(workflow, /git ls-remote --tags origin/u);
+  assert.match(workflow, /"repos\/\$env:GITHUB_REPOSITORY\/git\/refs"/u);
+  assert.match(workflow, /-f "ref=refs\/tags\/\$env:RELEASE_TAG"/u);
+  assert.match(workflow, /-f "sha=\$env:GITHUB_SHA"/u);
+  assert.match(workflow, /^            --verify-tag `$/mu);
+  assert.match(workflow, /tagRef\.object\.sha -ne \$env:GITHUB_SHA/u);
   assert.match(workflow, /already exists; it will not be overwritten/u);
   assert.doesNotMatch(
     workflow,

@@ -124,8 +124,8 @@ npm run package
 - `package-lock.json` に対して `npm ci --ignore-scripts` を使い、Actionは完全なcommit SHA、Node.jsは `22.23.3`、runner組み込みのInno Setupは `6.7.1` を検査して固定します。setup-nodeのpackage-manager cacheも明示的に無効化します。固定値とrunnerの内容が変わった場合は失敗させ、変更をレビューしてから更新します。
 - workflowの権限は通常 `contents: read`、Releaseを作るjobだけ `contents: write` です。追加secretやPATは使わず、checkout後に認証情報を残しません。
 - `upload-artifact` とActions cacheは使いません。成果物は同一jobからReleaseへ直接添付するため、Actions artifact/cacheの保存領域を消費しません。
-- 同時実行を直列化し、入力版、manifest版、`origin/main` の最新SHAを検査します。同じGitタグ、下書き、または公開済みReleaseがあれば、タグ移動・上書き・asset追加をせず失敗します。
-- 作られるReleaseは必ず下書きです。workflowは公開、既存Releaseの編集、assetの `--clobber` を行いません。失敗して不完全な下書きが残った場合は内容を確認し、必要ならその下書きだけを手動で削除してから再実行します。
+- 同時実行を直列化し、入力版、manifest版、`origin/main` の最新SHAを検査します。Release作成の直前にGitHub APIで対象SHAの軽量タグを原子的に新規作成し、同じGitタグ、下書き、または公開済みReleaseがあれば、タグ移動・再利用・上書き・asset追加をせず失敗します。
+- 作られるReleaseは必ず下書きです。workflowは公開、既存Releaseの編集、assetの `--clobber` を行いません。失敗して不完全な下書きまたはこの実行が作ったタグだけが残った場合は内容を確認し、必要なものだけを手動で削除してから再実行します。
 
 下書き作成後はEXE、ZIP、`SHA256SUMS.txt`をダウンロードしてハッシュを照合し、次節の実機確認を記録します。問題がないことを確認した担当者だけがGitHub上で手動公開します。workflowの成功は実機確認や公開承認を意味しません。
 

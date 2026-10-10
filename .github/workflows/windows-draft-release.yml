@@ -153,6 +153,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+
+          $createdRef = gh api `
+            --method POST `
+            "repos/$env:GITHUB_REPOSITORY/git/refs" `
+            -f "ref=refs/tags/$env:RELEASE_TAG" `
+            -f "sha=$env:GITHUB_SHA" | ConvertFrom-Json
+          if ($createdRef.ref -ne "refs/tags/$env:RELEASE_TAG" -or $createdRef.object.sha -ne $env:GITHUB_SHA) {
+            throw 'GitHub did not create the expected release tag at this run commit.'
+          }
+
           $notes = @"
           Automated Windows build for v$env:RELEASE_VERSION from commit $env:GITHUB_SHA.
 
@@ -164,7 +174,7 @@ jobs:
 
           $releaseUrl = gh release create $env:RELEASE_TAG `
             --repo $env:GITHUB_REPOSITORY `
-            --target $env:GITHUB_SHA `
+            --verify-tag `
             --title $env:RELEASE_TAG `
             --notes-file 'release-notes.md' `
             --draft `
@@ -186,8 +196,12 @@ jobs:
           if (-not $release.isDraft -or $release.isPrerelease) {
             throw 'The created release is not a non-prerelease draft.'
           }
-          if ($release.tagName -ne $env:RELEASE_TAG -or $release.targetCommitish -ne $env:GITHUB_SHA) {
-            throw 'The draft release tag or target commit does not match this run.'
+          if ($release.tagName -ne $env:RELEASE_TAG) {
+            throw 'The draft release tag does not match this run.'
+          }
+          $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($tagRef.ref -ne "refs/tags/$env:RELEASE_TAG" -or $tagRef.object.type -ne 'commit' -or $tagRef.object.sha -ne $env:GITHUB_SHA) {
+            throw 'The release tag is not a lightweight tag at this run commit.'
           }
           $expectedAssets = @(
             'SHA256SUMS.txt',
