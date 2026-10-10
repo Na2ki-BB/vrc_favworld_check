@@ -121,7 +121,7 @@ npm run package
 
 `.github/workflows/windows-draft-release.yml` は、`main` の最新コミットに対する手動実行だけを受け付けます。実行画面の `release_version` には `package.json` と同じ `x.y.z`（先頭の `v` なし）を入力します。標準の `windows-2022` GitHub-hosted runner 1台の同一jobで検査、ZIPとEXEの生成、SHA-256一覧の生成、新しい下書きReleaseへの添付までを行います。
 
-- `package-lock.json` に対して `npm ci --ignore-scripts` を使い、Actionは完全なcommit SHA、Node.jsは `22.23.3`、runner組み込みのInno Setupは `6.7.1` を検査して固定します。setup-nodeのpackage-manager cacheも明示的に無効化します。固定値とrunnerの内容が変わった場合は失敗させ、変更をレビューしてから更新します。
+- `package-lock.json` に対して `npm ci --ignore-scripts` を使い、Actionは完全なcommit SHA、Node.jsは `22.23.3`、runner組み込みのInno Setupは出力を無効化した最小スクリプトの検査コンパイルでengine version `6.7.1` と確認して固定します。setup-nodeのpackage-manager cacheも明示的に無効化します。固定値とrunnerの内容が変わった場合は失敗させ、変更をレビューしてから更新します。
 - workflowの権限は通常 `contents: read`、Releaseを作るjobだけ `contents: write` です。追加secretやPATは使わず、checkout後に認証情報を残しません。
 - `upload-artifact` とActions cacheは使いません。成果物は同一jobからReleaseへ直接添付するため、Actions artifact/cacheの保存領域を消費しません。
 - 同時実行を直列化し、入力版、manifest版、`origin/main` の最新SHAを検査します。Release作成の直前にGitHub APIで対象SHAの軽量タグを原子的に新規作成し、同じGitタグ、下書き、または公開済みReleaseがあれば、タグ移動・再利用・上書き・asset追加をせず失敗します。

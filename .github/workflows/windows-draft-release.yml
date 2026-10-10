@@ -90,14 +90,29 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
             throw 'The windows-2022 image does not contain Inno Setup 6.'
           }
-          # ISCC.exe reports ProductVersion as 0.0.0.0 on the hosted image;
-          # FileVersion carries the pinned Inno Setup release number.
-          $actualVersion = (Get-Item -LiteralPath $compiler).VersionInfo.FileVersion
-          if ($actualVersion -notmatch '^6\.7\.1(?:\D|$)') {
+          $probeScript = Join-Path $env:RUNNER_TEMP 'inno-version-probe.iss'
+          @'
+          [Setup]
+          AppName=Inno Setup Version Probe
+          AppVersion=1.0.0
+          DefaultDirName={tmp}\InnoSetupVersionProbe
+          Uninstallable=no
+          '@ | Set-Content -LiteralPath $probeScript -Encoding utf8
+          $probeOutput = & $compiler /O- $probeScript | Out-String
+          $versionMatch = [regex]::Match(
+            $probeOutput,
+            '(?m)^Compiler engine version: Inno Setup (?<version>\d+\.\d+\.\d+)\r?$'
+          )
+          if (-not $versionMatch.Success) {
+            throw 'Inno Setup did not report its compiler engine version in the expected format.'
+          }
+          $actualVersion = $versionMatch.Groups['version'].Value
+          if ($actualVersion -ne '6.7.1') {
             throw "Expected Inno Setup 6.7.1, found $actualVersion. Review and pin the new runner dependency before releasing."
           }
           "INNO_SETUP_COMPILER=$compiler" >> $env:GITHUB_ENV
